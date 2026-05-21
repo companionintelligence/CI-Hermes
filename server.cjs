@@ -17,7 +17,7 @@ const DASHBOARD_PORT = 9119;
 let ptyProcess = null;
 
 const TERMINAL_HTML = fs.readFileSync("/app/terminal.html", "utf8");
-const LOGO = fs.readFileSync(path.join(__dirname, "logo.png"));
+const LOGO = fs.readFileSync(path.join(__dirname, "logo.webp"));
 
 function blockHermesUpdate(req, res) {
   res.writeHead(403, { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store" });
@@ -70,8 +70,8 @@ const server = http.createServer((req, res) => {
   }
 
   // Serve static assets for terminal UI
-  if (requestPath === "/logo.png") {
-    res.writeHead(200, { "Content-Type": "image/png", "Cache-Control": "public, max-age=86400" });
+  if (requestPath === "/logo.webp") {
+    res.writeHead(200, { "Content-Type": "image/webp", "Cache-Control": "public, max-age=86400" });
     res.end(LOGO);
     return;
   }
