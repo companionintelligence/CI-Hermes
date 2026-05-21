@@ -5,7 +5,7 @@ on:
       - "*"
   workflow_run:
     workflows:
-      - "Tag Hermes Version On Merge"
+      - "Tag CI-Hermes Version On Merge"
     types:
       - completed
 

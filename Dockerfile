@@ -1,5 +1,5 @@
-# Hermes Agent on Umbrel
-# Web terminal wrapper around the official Hermes Agent image
+# CI-Hermes
+# Web terminal wrapper around the official Hermes Agent image for the CI marketplace
 
 # To update: docker buildx imagetools inspect nousresearch/hermes-agent:v2026.5.16
 FROM nousresearch/hermes-agent:v2026.5.16@sha256:b6e41c155d6bfce5ad83c5d0fec670086db8a43250e4511c9474134be5482d33
@@ -17,13 +17,13 @@ RUN apt-get update && \
 COPY package.json /app/
 RUN cd /app && npm install --omit=dev
 
-# Bundle Umbrel-managed context in the image. Hermes enables the runtime plugin
+# Bundle CI-managed context in the image. Hermes enables the runtime plugin
 # and external skill directory from config.yaml at startup; the files themselves
 # stay outside /opt/data so the agent cannot edit managed instructions.
-COPY server.cjs terminal.html logo.png entrypoint.sh start-hermes.sh bootstrap-umbrel-context.sh /app/
-COPY umbrel-context/skills /app/umbrel-context/skills
-COPY umbrel-context/plugins/umbrel-runtime /opt/hermes/plugins/umbrel-runtime
-RUN chmod +x /app/entrypoint.sh /app/start-hermes.sh /app/bootstrap-umbrel-context.sh
+COPY server.cjs terminal.html logo.png entrypoint.sh start-hermes.sh bootstrap-ci-context.sh /app/
+COPY ci-context/skills /app/ci-context/skills
+COPY ci-context/plugins/ci-runtime /opt/hermes/plugins/ci-runtime
+RUN chmod +x /app/entrypoint.sh /app/start-hermes.sh /app/bootstrap-ci-context.sh
 
 # Ensure hermes venv is in PATH everywhere. The agent's terminal tool spawns
 # subprocesses that may not inherit Docker ENV, so we cover all cases:
@@ -34,7 +34,7 @@ ENV PATH="/opt/hermes/.venv/bin:${PATH}"
 RUN echo 'export PATH="/opt/hermes/.venv/bin:$PATH"' > /etc/profile.d/hermes-venv.sh && \
     ln -s /opt/hermes/.venv/bin/hermes /usr/local/bin/hermes
 
-# Match Umbrel's app UID/GID using the base image's existing hermes user.
+# Match the CI app UID/GID using the base image's existing hermes user.
 # The official Hermes Docker entrypoint also expects this user to exist when
 # the gateway service drops privileges.
 RUN groupmod -o -g 1000 hermes && \

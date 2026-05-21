@@ -1,3 +1,0 @@
-name: umbrel-runtime
-version: "1.0"
-description: Injects compact Umbrel runtime context into each Hermes Agent turn.

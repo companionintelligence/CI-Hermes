@@ -1,0 +1,3 @@
+name: ci-runtime
+version: "1.0"
+description: Injects compact CI marketplace runtime context into each Hermes Agent turn.

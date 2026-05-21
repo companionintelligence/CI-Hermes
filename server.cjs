@@ -7,8 +7,8 @@ const WebSocket = require("/app/node_modules/ws");
 
 const PORT = parseInt(process.env.PORT || "18789");
 // Anti-CSWSH token: browsers don't enforce same-origin on WebSocket upgrades,
-// so without this any site could connect to /umbrel/api/terminal and hijack the PTY.
-// APP_SEED (per-app secret from umbrelOS) is embedded in the served HTML.
+// so without this any site could connect to /ci/api/terminal and hijack the PTY.
+// APP_SEED (per-app secret from CI marketplace) is embedded in the served HTML.
 const SETUP_TOKEN = process.env.APP_SEED || "";
 const DATA_DIR = "/opt/data";
 const DASHBOARD_HOST = "127.0.0.1";
@@ -21,12 +21,12 @@ const LOGO = fs.readFileSync(path.join(__dirname, "logo.png"));
 
 function blockHermesUpdate(req, res) {
   res.writeHead(403, { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store" });
-  res.end("Hermes updates are managed by umbrelOS app updates.");
+  res.end("Hermes updates are managed by CI marketplace app updates.");
 }
 
 function blockGatewayRestart(req, res) {
   res.writeHead(403, { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store" });
-  res.end("Gateway restarts are managed by umbrelOS. Restart Hermes from the umbrelOS homescreen.");
+  res.end("Gateway restarts are managed by CI marketplace. Restart Hermes from the CI marketplace homescreen.");
 }
 
 // Proxy HTTP requests to the dashboard container
@@ -39,7 +39,7 @@ function proxyToDashboard(req, res) {
     headers: {
       ...req.headers,
       // Hermes validates Host against its loopback dashboard bind address.
-      // Rewriting is safe in Umbrel because app_proxy authenticates requests
+      // Rewriting is safe in CI marketplace because app_proxy authenticates requests
       // before they reach this wrapper; direct network exposure is not supported.
       host: DASHBOARD_HOST + ":" + DASHBOARD_PORT,
     },
@@ -62,7 +62,7 @@ const server = http.createServer((req, res) => {
   const requestUrl = new URL(req.url || "/", "http://localhost");
   const requestPath = requestUrl.pathname.replace(/\/+$/, "");
 
-  // Serve terminal page at /terminal (Umbrel app manifest points here)
+  // Serve terminal page at /terminal (CI marketplace app manifest points here)
   if (requestPath === "/terminal") {
     res.writeHead(200, { "Content-Type": "text/html" });
     res.end(TERMINAL_HTML.replace("__SETUP_TOKEN__", SETUP_TOKEN));
@@ -76,7 +76,7 @@ const server = http.createServer((req, res) => {
     return;
   }
 
-  // Block the dashboard's `hermes update` action; Umbrel updates Hermes via app images.
+  // Block the dashboard's `hermes update` action; CI marketplace updates Hermes via app images.
   // Match the parsed pathname so query strings cannot bypass the block.
   if (req.method === "POST" && requestPath === "/api/hermes/update") {
     blockHermesUpdate(req, res);
@@ -84,14 +84,14 @@ const server = http.createServer((req, res) => {
   }
 
   // Upstream documents separate dashboard/gateway containers, but this action
-  // still shells out locally. In Umbrel that would run from the web container
-  // instead of restarting the gateway container managed by umbrelOS/Docker.
+  // still shells out locally. In the CI app that would run from the web container
+  // instead of restarting the gateway container managed by CI marketplace/Docker.
   if (req.method === "POST" && requestPath === "/api/gateway/restart") {
     blockGatewayRestart(req, res);
     return;
   }
 
-  // Everything else proxied to dashboard (behind umbrelOS auth)
+  // Everything else proxied to dashboard (behind CI marketplace auth)
   proxyToDashboard(req, res);
 });
 
@@ -173,7 +173,7 @@ wss.on("connection", (ws) => {
 server.on("upgrade", (req, socket, head) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
 
-  if (url.pathname === "/umbrel/api/terminal") {
+  if (url.pathname === "/ci/api/terminal") {
     // Validate anti-CSWSH token
     const provided = url.searchParams.get("token") || "";
     if (!SETUP_TOKEN || provided.length !== SETUP_TOKEN.length ||

@@ -1,33 +1,33 @@
 ---
-name: umbrel
-description: Use when working with Hermes Agent on umbrelOS, including persistence, paths, container behavior, app updates, gateway/dashboard troubleshooting, networking, ports, or installing tools inside the app sandbox.
+name: ci
+description: Use when working with Hermes Agent on the CI marketplace, including persistence, paths, container behavior, app updates, gateway/dashboard troubleshooting, networking, ports, or installing tools inside the app sandbox.
 version: 1.0.0
 ---
 
-# Umbrel Hermes Runtime
+# CI Hermes Runtime
 
-Hermes is running as an Umbrel app inside a containerized sandbox, not as a normal host Linux install. Use this skill whenever a task touches persistence, paths, installation, networking, app updates, dashboard behavior, gateway behavior, or container lifecycle.
+Hermes is running as a CI marketplace app inside a containerized sandbox, not as a normal host Linux install. Use this skill whenever a task touches persistence, paths, installation, networking, app updates, dashboard behavior, gateway behavior, or container lifecycle.
 
 ## Filesystem
 
-`/opt/data` is the persistent Hermes home for this Umbrel app. Put durable user files, generated artifacts, scripts, and agent-owned state there unless the user asks for another location.
+`/opt/data` is the persistent Hermes home for this CI app. Put durable user files, generated artifacts, scripts, and agent-owned state there unless the user asks for another location.
 
 Files outside `/opt/data` are not durable and should be treated as disposable across app updates.
 
 ## Containers
 
-The Umbrel app uses two services that share `/opt/data`:
+The CI app uses two services that share `/opt/data`:
 
 - `web`: browser terminal, dashboard process, and dashboard proxy
 - `gateway`: Hermes messaging gateway
 
-The dashboard and terminal are behind Umbrel's authenticated app proxy. Services started inside the container are not automatically reachable from umbrelOS or the public network; that exposure is controlled by the Umbrel app packaging/proxy.
+The dashboard and terminal are behind the CI app proxy. Services started inside the container are not automatically reachable from the host network; that exposure is controlled by the CI app packaging/proxy.
 
 ## Updates
 
-Do not run `hermes update` or install a different Hermes version from inside the app. Umbrel updates Hermes by shipping pinned Docker images through app updates.
+Do not run `hermes update` or install a different Hermes version from inside the app. The CI marketplace updates Hermes by shipping pinned Docker images through app updates.
 
-If Hermes reports that an update is available, explain that updates are managed by umbrelOS.
+If Hermes reports that an update is available, explain that updates are managed by the CI marketplace.
 
 ## Persistence Guidelines
 

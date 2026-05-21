@@ -1,15 +1,15 @@
 #!/bin/bash
-# Enable the bundled Umbrel runtime plugin and skill directory in Hermes config.
+# Enable the bundled CI runtime plugin and skill directory in Hermes config.
 # This stays idempotent so web and terminal startup can both run it safely.
 set -euo pipefail
 
 DATA_DIR="${HERMES_HOME:-/opt/data}"
-SKILLS_SOURCE="/app/umbrel-context/skills"
+SKILLS_SOURCE="/app/ci-context/skills"
 CONFIG_FILE="${DATA_DIR}/config.yaml"
-PLUGIN_NAME="umbrel-runtime"
+PLUGIN_NAME="ci-runtime"
 
 if [[ ! -d "${DATA_DIR}" ]]; then
-  echo "Umbrel context: ${DATA_DIR} does not exist; persistent data volume is not mounted" >&2
+  echo "CI context: ${DATA_DIR} does not exist; persistent data volume is not mounted" >&2
   exit 1
 fi
 
@@ -141,7 +141,7 @@ def remove_child_list_item(section: str, child: str, item: str):
 if Path(skills_dir).is_dir():
     ensure_child_list_item("skills", "external_dirs", skills_dir)
 else:
-    print(f"Umbrel context: {skills_dir} not found; skill directory will be reconciled on next startup", file=sys.stderr)
+    print(f"CI context: {skills_dir} not found; skill directory will be reconciled on next startup", file=sys.stderr)
 
 ensure_child_list_item("plugins", "enabled", plugin_name)
 remove_child_list_item("plugins", "disabled", plugin_name)
@@ -150,5 +150,5 @@ new_text = "".join(lines)
 config_path.write_text(new_text, encoding="utf-8")
 PY
 else
-  echo "Umbrel context: ${CONFIG_FILE} not found yet; plugin and skill config will be reconciled on next startup" >&2
+  echo "CI context: ${CONFIG_FILE} not found yet; plugin and skill config will be reconciled on next startup" >&2
 fi

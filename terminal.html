@@ -441,10 +441,10 @@
       </a>
     </div>
     <div class="pro-tip">
-      <strong>Note:</strong> Update Hermes only from the Umbrel App Store. Running <code>hermes update</code> in the terminal may cause issues.
+      <strong>Note:</strong> Update Hermes only from the CI marketplace. Running <code>hermes update</code> in the terminal may cause issues.
     </div>
     <div class="pro-tip">
-      <strong>Tip:</strong> After setting up messaging (Telegram, Discord, WhatsApp, etc.), restart Hermes from your umbrelOS home screen for changes to take effect.
+      <strong>Tip:</strong> After setting up messaging (Telegram, Discord, WhatsApp, etc.), restart Hermes from your CI marketplace home screen for changes to take effect.
     </div>
   </div>
 
@@ -461,7 +461,7 @@
         <span class="titlebar-label">hermes</span>
       </div>
       <div class="terminal-info">
-        <div class="info-heading">Welcome to Hermes Agent on Umbrel</div>
+        <div class="info-heading">Welcome to CI-Hermes</div>
         <div class="info-dim">This terminal drops you into chat with Hermes after initial setup. Press Ctrl+D to exit chat and access the shell for commands like hermes model and hermes doctor.</div>
       </div>
       <div class="terminal-body">
@@ -728,7 +728,7 @@
       });
 
       const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-      ws = new WebSocket(proto + '//' + location.host + '/umbrel/api/terminal?token=__SETUP_TOKEN__');
+      ws = new WebSocket(proto + '//' + location.host + '/ci/api/terminal?token=__SETUP_TOKEN__');
 
       ws.onopen = () => {
         ws.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }));

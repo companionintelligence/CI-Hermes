@@ -1,4 +1,4 @@
-name: Tag Hermes Version On Merge
+name: Tag CI-Hermes Version On Merge
 
 on:
   pull_request_target:
@@ -10,8 +10,8 @@ jobs:
     if: >-
       github.event.pull_request.merged == true &&
       github.event.pull_request.base.ref == github.event.repository.default_branch &&
-      contains(github.event.pull_request.labels.*.name, 'hermes-update') &&
-      startsWith(github.event.pull_request.head.ref, 'bot/hermes-update-')
+      contains(github.event.pull_request.labels.*.name, 'ci-hermes-update') &&
+      startsWith(github.event.pull_request.head.ref, 'bot/ci-hermes-update-')
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -29,7 +29,7 @@ jobs:
           set -euo pipefail
 
           tag="${{ github.event.pull_request.head.ref }}"
-          tag="${tag#bot/hermes-update-}"
+          tag="${tag#bot/ci-hermes-update-}"
 
           echo "tag=${tag}" >> "$GITHUB_OUTPUT"
 

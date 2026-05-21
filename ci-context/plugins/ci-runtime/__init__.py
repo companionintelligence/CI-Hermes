@@ -24,10 +24,10 @@ def _format_context(text):
     return "\n".join(lines).strip()
 
 
-def _inject_umbrel_runtime_context(**kwargs):
+def _inject_ci_runtime_context(**kwargs):
     del kwargs
     return {"context": _load_runtime_context()}
 
 
 def register(ctx):
-    ctx.register_hook("pre_llm_call", _inject_umbrel_runtime_context)
+    ctx.register_hook("pre_llm_call", _inject_ci_runtime_context)
