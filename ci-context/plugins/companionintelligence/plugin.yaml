@@ -1,0 +1,10 @@
+name: companionintelligence
+version: 1.0.0
+description: "Companion Intelligence — passively ingests conversation context into a self-hosted knowledge graph."
+pip_dependencies: []
+requires_env:
+  - CI_SERVER_URL
+  - CI_SERVER_TOKEN
+hooks:
+  - on_session_end
+  - on_pre_compress

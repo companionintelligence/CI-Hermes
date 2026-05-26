@@ -1,5 +1,7 @@
 #!/bin/bash
 # Enable the bundled CI runtime plugin and skill directory in Hermes config.
+# Also installs the Companion Intelligence memory provider plugin so it
+# appears in `hermes memory setup`.
 # This stays idempotent so web and terminal startup can both run it safely.
 set -euo pipefail
 
@@ -7,11 +9,26 @@ DATA_DIR="${HERMES_HOME:-/opt/data}"
 SKILLS_SOURCE="/app/ci-context/skills"
 CONFIG_FILE="${DATA_DIR}/config.yaml"
 PLUGIN_NAME="ci-runtime"
+CI_PLUGIN_SRC="/app/ci-context/plugins/companionintelligence"
+CI_PLUGIN_DEST="${DATA_DIR}/plugins/companionintelligence"
 
 if [[ ! -d "${DATA_DIR}" ]]; then
   echo "CI context: ${DATA_DIR} does not exist; persistent data volume is not mounted" >&2
   exit 1
 fi
+
+# ── Companion Intelligence memory plugin ──────────────────────────────────────
+# Copy into $HERMES_HOME/plugins/ so `hermes memory setup` discovers it.
+# Always sync to pick up image updates; preserve any user-written config.json.
+if [[ -d "${CI_PLUGIN_SRC}" ]]; then
+  mkdir -p "${CI_PLUGIN_DEST}"
+  cp -r "${CI_PLUGIN_SRC}/." "${CI_PLUGIN_DEST}/"
+  echo "CI context: companionintelligence plugin installed → ${CI_PLUGIN_DEST}"
+fi
+
+# Run the CI-Server configurator (MCP registration when credentials are present).
+# Uses CI_SERVER_URL / CI_SERVER_TOKEN / CI_SERVER_ENABLED from the environment.
+python3 /app/configure-ci-server.py 2>&1 || true
 
 if [[ -f "${CONFIG_FILE}" ]]; then
   python3 - "${CONFIG_FILE}" "${SKILLS_SOURCE}" "${PLUGIN_NAME}" <<'PY'
