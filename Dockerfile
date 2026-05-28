@@ -20,11 +20,11 @@ RUN cd /app && npm install --omit=dev
 # Bundle CI-managed context in the image. Hermes enables the runtime plugin
 # and external skill directory from config.yaml at startup; the files themselves
 # stay outside /opt/data so the agent cannot edit managed instructions.
-COPY server.cjs terminal.html logo.webp entrypoint.sh start-hermes.sh bootstrap-ci-context.sh configure-ci-server.py /app/
+COPY server.cjs terminal.html logo.webp entrypoint.sh start-hermes.sh bootstrap-ci-context.sh bootstrap-from-hub.sh configure-ci-server.py /app/
 COPY ci-context/skills /app/ci-context/skills
 COPY ci-context/plugins/ci-runtime /opt/hermes/plugins/ci-runtime
 COPY ci-context/plugins/companionintelligence /app/ci-context/plugins/companionintelligence
-RUN chmod +x /app/entrypoint.sh /app/start-hermes.sh /app/bootstrap-ci-context.sh
+RUN chmod +x /app/entrypoint.sh /app/start-hermes.sh /app/bootstrap-ci-context.sh /app/bootstrap-from-hub.sh
 
 # Ensure hermes venv is in PATH everywhere. The agent's terminal tool spawns
 # subprocesses that may not inherit Docker ENV, so we cover all cases:
