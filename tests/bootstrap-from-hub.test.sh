@@ -93,12 +93,11 @@ fi
 
 # ─── Test 4: Missing data dir → script exits 0 ──────────────────────────────
 echo "test: missing data dir returns exit 0"
-HERMES_HOME="/does/not/exist/$$" "${SCRIPT}" >/dev/null 2>&1
-rc=$?
-if [[ "${rc}" -eq 0 ]]; then
+if HERMES_HOME="/does/not/exist/$$" "${SCRIPT}" >/dev/null 2>&1; then
   echo "  ✓ exits 0 when HERMES_HOME is missing"
   PASS=$((PASS + 1))
 else
+  rc=$?
   echo "  ✗ unexpected non-zero exit (rc=${rc})"
   FAIL=$((FAIL + 1))
 fi

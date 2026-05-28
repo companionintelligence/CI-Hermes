@@ -1,10 +1,15 @@
-"""Companion Intelligence memory plugin — passive context ingestion.
+"""Companion Intelligence memory plugin.
 
-Dumps each conversation turn into the CI-Server knowledge graph via the
-authenticated absorb endpoint.  The server handles deduplication and storage;
-this plugin does not inject any context back into the agent (steel-thread phase).
+Passively ingests each conversation turn into the CI-Server knowledge graph
+and injects relevant context back into the agent at the right moments:
 
-Config (set by configure-ci-server.py or environment):
+  system_prompt_block()  — L0 user profile (name, relationships, preferences)
+                           fetched once at session start, stable for the session
+  prefetch()             — L1 hybrid search results relevant to the current turn
+                           queued as soon as the user message arrives, so the
+                           HTTP call overlaps with other pre-turn processing
+
+Config (set by `hermes memory setup` or environment):
   CI_SERVER_URL    — Base URL of your CI-Server instance (e.g. http://ci-server:8642)
   CI_SERVER_TOKEN  — API key generated from the CI-Server admin panel
 """
@@ -24,7 +29,8 @@ from agent.memory_provider import MemoryProvider
 
 logger = logging.getLogger(__name__)
 
-_ABSORB_TIMEOUT = 10.0  # seconds — give the server time to persist
+_REQUEST_TIMEOUT = 10.0   # seconds for write calls (absorb)
+_PREFETCH_TIMEOUT = 5.0   # seconds to wait for a queued prefetch result
 
 
 # ---------------------------------------------------------------------------
@@ -55,27 +61,61 @@ def _load_config() -> dict:
 # ---------------------------------------------------------------------------
 
 class _CIClient:
-    def __init__(self, base_url: str, token: str, timeout: float = _ABSORB_TIMEOUT):
+    def __init__(self, base_url: str, token: str, timeout: float = _REQUEST_TIMEOUT):
         self._base = base_url.rstrip("/")
         self._token = token
         self._timeout = timeout
 
-    def absorb(self, messages: list, session_id: str = "", platform: str = "") -> dict:
+    # ── Retrieval ────────────────────────────────────────────────────────────
+
+    def context(self) -> dict:
+        """L0 — static user profile block for the system prompt."""
+        return self._get("/api/memory/context")
+
+    def recall(self, query: str, max_results: int = 5) -> dict:
+        """L1 — per-turn hybrid search against the knowledge graph."""
+        return self._post("/api/memory/recall", {"query": query, "maxResults": max_results})
+
+    # ── Ingestion ─────────────────────────────────────────────────────────────
+
+    def turn(self, messages: list, session_id: str = "", platform: str = "") -> dict:
+        """Ingest a conversation turn into the database."""
         payload: dict = {"messages": messages}
         if session_id:
             payload["sessionId"] = session_id
         if platform:
             payload["platform"] = platform
-        return self._post("/api/agent/absorb", payload)
+        return self._post("/api/memory/turn", payload)
+
+    # ── Health ────────────────────────────────────────────────────────────────
 
     def health(self) -> bool:
         try:
             req = urllib.request.Request(f"{self._base}/api/health")
-            req.add_header("Authorization", f"Bearer {self._token}")
+            req.add_header("x-api-key", self._token)
             with urllib.request.urlopen(req, timeout=3.0) as resp:
                 return resp.status == 200
         except Exception:
             return False
+
+    # ── Transport ─────────────────────────────────────────────────────────────
+
+    def _get(self, path: str) -> dict:
+        url = f"{self._base}{path}"
+        req = urllib.request.Request(url, method="GET")
+        req.add_header("x-api-key", self._token)
+        req.add_header("Accept", "application/json")
+        try:
+            with urllib.request.urlopen(req, timeout=self._timeout) as resp:
+                body = resp.read().decode("utf-8", errors="replace")
+                return json.loads(body) if body else {}
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace") if exc.fp else ""
+            logger.debug("CI-Server GET %s → HTTP %s: %s", path, exc.code, body[:200])
+            raise
+        except Exception as exc:
+            logger.debug("CI-Server GET %s failed: %s", path, exc)
+            raise
 
     def _post(self, path: str, payload: dict) -> dict:
         url = f"{self._base}{path}"
@@ -102,13 +142,16 @@ class _CIClient:
 # ---------------------------------------------------------------------------
 
 class CompanionIntelligenceProvider(MemoryProvider):
-    """Passively ingests conversation context into the CI-Server knowledge graph."""
+    """Injects CI-Server knowledge graph context into Hermes agent sessions."""
 
     def __init__(self):
         self._client: Optional[_CIClient] = None
         self._session_id = ""
         self._platform = ""
         self._sync_thread: Optional[threading.Thread] = None
+        # Prefetch state — reset each turn by queue_prefetch
+        self._prefetch_event: Optional[threading.Event] = None
+        self._prefetch_result: Optional[str] = None
 
     @property
     def name(self) -> str:
@@ -296,15 +339,63 @@ class CompanionIntelligenceProvider(MemoryProvider):
         self._client = _CIClient(url, token)
         logger.warning("CI-Server provider ready  url=%s  session=%s", url, self._session_id)
 
+    # ---------------------------------------------------------------------------
+    # Context injection
+    # ---------------------------------------------------------------------------
+
     def system_prompt_block(self) -> str:
-        # No context injection in steel-thread phase
-        return ""
+        """L0 — fetch and return the user profile block for the system prompt.
+
+        Called once at session start. Blocks briefly while the server responds,
+        but this happens before the first user message so latency is invisible.
+        """
+        if not self._client:
+            return ""
+        try:
+            resp = self._client.context()
+            block = resp.get("block", "")
+            logger.debug("CI-Server system_prompt_block: %d chars", len(block))
+            return block
+        except Exception as exc:
+            logger.warning("CI-Server system_prompt_block failed: %s", exc)
+            return ""
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
-        pass  # not active in this phase
+        """Kick off an async L1 search as soon as the user message arrives.
+
+        The HTTP call runs in a background thread so it overlaps with any other
+        pre-turn processing. prefetch() then waits for the result.
+        """
+        if not self._client:
+            return
+
+        self._prefetch_result = None
+        self._prefetch_event = threading.Event()
+
+        def _run() -> None:
+            try:
+                resp = self._client.recall(query)
+                self._prefetch_result = resp.get("block", "") or ""
+            except Exception as exc:
+                logger.debug("CI-Server prefetch failed: %s", exc)
+                self._prefetch_result = ""
+            finally:
+                self._prefetch_event.set()
+
+        t = threading.Thread(target=_run, daemon=True, name="ci-prefetch")
+        t.start()
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
-        return ""  # not active in this phase
+        """Return the L1 search result queued by queue_prefetch().
+
+        Waits up to _PREFETCH_TIMEOUT seconds for the background request to
+        finish. Returns an empty string if the client is not ready or the
+        request timed out / failed.
+        """
+        if not self._client or self._prefetch_event is None:
+            return ""
+        self._prefetch_event.wait(timeout=_PREFETCH_TIMEOUT)
+        return self._prefetch_result or ""
 
     # ---------------------------------------------------------------------------
     # Turn sync — non-blocking write after each turn
@@ -315,27 +406,21 @@ class CompanionIntelligenceProvider(MemoryProvider):
         if not self._client:
             return
 
-        logger.warning(
-            "CI-Server sync_turn called  user=%r  assistant=%r",
-            (user_content or "")[:80],
-            (assistant_content or "")[:80],
-        )
-
         messages = [
             {"role": "user",      "content": (user_content or "")[:4000]},
             {"role": "assistant", "content": (assistant_content or "")[:4000]},
         ]
         sid = session_id or self._session_id
 
-        def _run():
+        def _run() -> None:
             try:
-                self._client.absorb(messages, session_id=sid, platform=self._platform)
-                logger.warning("CI-Server sync_turn ok  session=%s", sid)
+                self._client.turn(messages, session_id=sid, platform=self._platform)
+                logger.debug("CI-Server sync_turn ok  session=%s", sid)
             except Exception as exc:
                 logger.warning("CI-Server sync_turn failed: %s", exc)
 
         # Wait for any prior sync to finish before starting a new one
-        # (prevents out-of-order writes to the same session row)
+        # (prevents out-of-order writes to the same session)
         if self._sync_thread and self._sync_thread.is_alive():
             self._sync_thread.join(timeout=5.0)
 
@@ -351,7 +436,7 @@ class CompanionIntelligenceProvider(MemoryProvider):
         if not self._client or not messages:
             return
 
-        # Wait for any in-flight sync before sending the final absorb
+        # Wait for any in-flight sync before sending the final turn
         if self._sync_thread and self._sync_thread.is_alive():
             self._sync_thread.join(timeout=10.0)
 
@@ -364,14 +449,14 @@ class CompanionIntelligenceProvider(MemoryProvider):
             return
 
         try:
-            self._client.absorb(serialized, session_id=self._session_id,
-                                platform=self._platform)
-            logger.info("CI-Server session absorbed (%d messages)", len(serialized))
+            self._client.turn(serialized, session_id=self._session_id,
+                              platform=self._platform)
+            logger.info("CI-Server session flushed (%d messages)", len(serialized))
         except Exception as exc:
             logger.warning("CI-Server on_session_end failed: %s", exc)
 
     def on_pre_compress(self, messages: List[Dict[str, Any]]) -> str:
-        """Absorb messages that are about to be dropped from the context window."""
+        """Flush messages that are about to be dropped from the context window."""
         if not self._client or not messages:
             return ""
 
@@ -383,10 +468,10 @@ class CompanionIntelligenceProvider(MemoryProvider):
         if not serialized:
             return ""
 
-        def _run():
+        def _run() -> None:
             try:
-                self._client.absorb(serialized, session_id=self._session_id,
-                                    platform=self._platform)
+                self._client.turn(serialized, session_id=self._session_id,
+                                  platform=self._platform)
             except Exception as exc:
                 logger.debug("CI-Server on_pre_compress failed: %s", exc)
 
@@ -395,7 +480,7 @@ class CompanionIntelligenceProvider(MemoryProvider):
         return ""
 
     # ---------------------------------------------------------------------------
-    # Tools — disabled in this phase
+    # Tools — not active
     # ---------------------------------------------------------------------------
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
