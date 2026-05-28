@@ -67,7 +67,7 @@ main() {
 
   local tmp
   tmp="$(mktemp)"
-  echo "${body}" | translate_keys > "${tmp}" || { rm -f "${tmp}"; log "ERROR: translate_keys failed"; exit 0; }
+  printf '%s\n' "${body}" | translate_keys > "${tmp}" || { rm -f "${tmp}"; log "ERROR: translate_keys failed"; exit 0; }
 
   mv "${tmp}" "${OUT_ENV}"
   chmod 600 "${OUT_ENV}" 2>/dev/null || true
