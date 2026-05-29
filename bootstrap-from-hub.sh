@@ -1,10 +1,12 @@
-#!/bin/bash
+#!/bin/sh
 # Pull inference config from the Hub and translate Hub's HERMES_* env keys
 # into the OPENAI_* env vars Hermes (and most agent frameworks it wraps) read.
 #
 # Idempotent and failure-tolerant: if the Hub is unreachable the script logs
 # and exits 0 so container start still succeeds — Hermes will fall back to
 # its own setup wizard for credentials.
+#
+# POSIX sh — no bashisms. Runs in any /bin/sh including dash.
 #
 # Inputs:
 #   CI_HUB_URL       Base URL of the Hub backend  (default: http://ci-os-hub:3000)
@@ -14,7 +16,7 @@
 #
 # Outputs:
 #   $HERMES_HOME/.env.hub-bootstrap   sourced by start-hermes.sh
-set -euo pipefail
+set -eu
 
 CI_HUB_URL="${CI_HUB_URL:-http://ci-os-hub:3000}"
 HUB_APP_SLUG="${HUB_APP_SLUG:-hermes-agent}"
@@ -26,11 +28,11 @@ log() {
 }
 
 fetch_bootstrap() {
-  if [[ -n "${BOOTSTRAP_FIXTURE_FILE:-}" ]]; then
+  if [ -n "${BOOTSTRAP_FIXTURE_FILE:-}" ]; then
     cat "${BOOTSTRAP_FIXTURE_FILE}"
     return 0
   fi
-  local url="${CI_HUB_URL}/api/inference/apps/${HUB_APP_SLUG}/bootstrap.env"
+  url="${CI_HUB_URL}/api/inference/apps/${HUB_APP_SLUG}/bootstrap.env"
   curl --silent --show-error --fail --max-time 5 --retry 1 --retry-delay 2 "${url}"
 }
 
@@ -48,26 +50,28 @@ translate_keys() {
 }
 
 main() {
-  if [[ ! -d "${DATA_DIR}" ]]; then
+  if [ ! -d "${DATA_DIR}" ]; then
     log "WARN: ${DATA_DIR} does not exist; skipping"
     exit 0
   fi
 
-  log "fetching ${CI_HUB_URL} → slug=${HUB_APP_SLUG}"
-  local body
+  log "fetching ${CI_HUB_URL} -> slug=${HUB_APP_SLUG}"
   if ! body="$(fetch_bootstrap)"; then
     log "WARN: Hub unreachable or returned error; leaving Hermes provider config alone"
     exit 0
   fi
 
-  if [[ -z "${body}" ]]; then
+  if [ -z "${body}" ]; then
     log "WARN: empty response from Hub; nothing to apply"
     exit 0
   fi
 
-  local tmp
   tmp="$(mktemp)"
-  printf '%s\n' "${body}" | translate_keys > "${tmp}" || { rm -f "${tmp}"; log "ERROR: translate_keys failed"; exit 0; }
+  if ! printf '%s\n' "${body}" | translate_keys > "${tmp}"; then
+    rm -f "${tmp}"
+    log "ERROR: translate_keys failed"
+    exit 0
+  fi
 
   mv "${tmp}" "${OUT_ENV}"
   chmod 600 "${OUT_ENV}" 2>/dev/null || true
