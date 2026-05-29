@@ -32,7 +32,7 @@ fetch_bootstrap() {
     cat "${BOOTSTRAP_FIXTURE_FILE}"
     return 0
   fi
-  url="${CI_HUB_URL}/api/inference/apps/${HUB_APP_SLUG}/bootstrap.env"
+  url="${CI_HUB_URL}/api/inference/apps/${HUB_APP_SLUG}/credentials.env"
   curl --silent --show-error --fail --max-time 5 --retry 1 --retry-delay 2 "${url}"
 }
 
