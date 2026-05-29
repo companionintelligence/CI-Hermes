@@ -7,6 +7,19 @@ source "/opt/hermes/.venv/bin/activate"
 
 /app/bootstrap-ci-context.sh
 
+# Pull inference config from the Hub (idempotent; safe if Hub is unreachable)
+/app/bootstrap-from-hub.sh
+
+# Source the Hub-derived env so OPENAI_API_BASE / OPENAI_MODEL reach the
+# dashboard and the Node server before they spawn agent subprocesses.
+HUB_ENV_FILE="${HERMES_HOME:-/opt/data}/.env.hub-bootstrap"
+if [[ -f "${HUB_ENV_FILE}" ]]; then
+  set -a
+  # shellcheck disable=SC1090
+  source "${HUB_ENV_FILE}"
+  set +a
+fi
+
 # Start dashboard in background.
 # Binds to 127.0.0.1 (not 0.0.0.0) since our Node server proxies it — no
 # direct external access needed, and avoids the "Binding to 0.0.0.0" warning.
