@@ -87,6 +87,15 @@ class _CIClient:
             payload["platform"] = platform
         return self._post("/api/memory/turn", payload)
 
+    def note(self, content: str, source: str = "", title: str = "") -> dict:
+        """Store a raw memory fragment in ci.notes for later graph extraction."""
+        payload: dict = {"content": content}
+        if source:
+            payload["source"] = source
+        if title:
+            payload["title"] = title
+        return self._post("/api/memory/note", payload)
+
     # ── Health ────────────────────────────────────────────────────────────────
 
     def health(self) -> bool:
@@ -478,6 +487,39 @@ class CompanionIntelligenceProvider(MemoryProvider):
         t = threading.Thread(target=_run, daemon=True, name="ci-compress")
         t.start()
         return ""
+
+    # ---------------------------------------------------------------------------
+    # Memory write mirroring
+    # ---------------------------------------------------------------------------
+
+    def on_memory_write(self, action: str, target: str, content: str) -> None:
+        """Mirror Hermes memory writes (MEMORY.md / USER.md) to ci.notes.
+
+        Called by the Hermes framework whenever it writes to one of its built-in
+        memory files.  We store the fragment verbatim so a future extraction job
+        can promote it into structured graph entities.
+
+        Runs in a background thread so the agent is never blocked by the write.
+        """
+        if not self._client or not content.strip():
+            return
+
+        # Skip clears — there is nothing meaningful to store.
+        if action == "clear":
+            return
+
+        client = self._client
+        source = target or "memory"
+
+        def _run() -> None:
+            try:
+                client.note(content, source=source)
+                logger.debug("CI-Server on_memory_write stored  action=%s target=%s", action, target)
+            except Exception as exc:
+                logger.debug("CI-Server on_memory_write failed: %s", exc)
+
+        t = threading.Thread(target=_run, daemon=True, name="ci-memory-write")
+        t.start()
 
     # ---------------------------------------------------------------------------
     # Tools — not active

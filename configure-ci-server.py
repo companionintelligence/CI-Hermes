@@ -116,11 +116,12 @@ def has_ci_mcp_server(config_text: str) -> bool:
 
 def patch_mcp(config_text: str) -> str:
     """Append ci_server MCP entry under mcp_servers:."""
+    mcp_url = CI_URL.rstrip("/") + "/api/mcp"
     lines = [
         "  ci_server:",
-        f'    url: "{CI_URL}"',
+        f'    url: "{mcp_url}"',
         "    headers:",
-        f'      Authorization: "Bearer {CI_TOKEN}"',
+        f'      x-api-key: "{CI_TOKEN}"',
         "    timeout: 180",
         "    connect_timeout: 60",
     ]
