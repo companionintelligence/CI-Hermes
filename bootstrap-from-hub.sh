@@ -9,7 +9,7 @@
 # POSIX sh — no bashisms. Runs in any /bin/sh including dash.
 #
 # Inputs:
-#   CI_HUB_URL       Base URL of the Hub backend  (default: http://ci-os-hub:3000)
+#   CI_HUB_URL       Base URL of the Hub backend  (default: http://ci-os-hub:5002)
 #   HUB_APP_SLUG     App slug to bootstrap as     (default: hermes-agent)
 #   HERMES_HOME      Hermes data dir              (default: /opt/data)
 #   BOOTSTRAP_FIXTURE_FILE   For tests: read body from this file instead of curling
@@ -18,7 +18,7 @@
 #   $HERMES_HOME/.env.hub-bootstrap   sourced by start-hermes.sh
 set -eu
 
-CI_HUB_URL="${CI_HUB_URL:-http://ci-os-hub:3000}"
+CI_HUB_URL="${CI_HUB_URL:-http://ci-os-hub:5002}"
 HUB_APP_SLUG="${HUB_APP_SLUG:-hermes-agent}"
 DATA_DIR="${HERMES_HOME:-/opt/data}"
 OUT_ENV="${DATA_DIR}/.env.hub-bootstrap"
