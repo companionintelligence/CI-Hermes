@@ -1,8 +1,8 @@
 # CI-Hermes
 # Web terminal wrapper around the official Hermes Agent image for the CI marketplace
 
-# To update: docker buildx imagetools inspect nousresearch/hermes-agent:v2026.5.16
-FROM nousresearch/hermes-agent:v2026.5.16@sha256:b6e41c155d6bfce5ad83c5d0fec670086db8a43250e4511c9474134be5482d33
+# To update: docker buildx imagetools inspect nousresearch/hermes-agent:v2026.5.29
+FROM nousresearch/hermes-agent:v2026.5.29@sha256:192a40783e9227b5f162b76af4d133050557adebd46e1c9cb40cb79a1317a9f7
 
 USER root
 
