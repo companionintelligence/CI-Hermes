@@ -174,6 +174,23 @@ function injectTerminalShortcut(html) {
   return out;
 }
 
+function shouldProxyResponseHaveBody(proxyRes, method) {
+  const statusCode = Number(proxyRes.statusCode || 0);
+  if (String(method || "").toUpperCase() === "HEAD") {
+    return false;
+  }
+  if (statusCode === 204 || statusCode === 304) {
+    return false;
+  }
+  if (statusCode >= 100 && statusCode < 200) {
+    return false;
+  }
+  if (statusCode === 205) {
+    return false;
+  }
+  return true;
+}
+
 function blockHermesUpdate(req, res) {
   res.writeHead(403, {
     "Content-Type": "text/plain; charset=utf-8",
@@ -215,6 +232,14 @@ function proxyToDashboard(req, res) {
       proxyRes.headers["content-type"] || "",
     ).toLowerCase();
     const shouldInject = contentType.includes("text/html");
+    const bodyAllowed = shouldProxyResponseHaveBody(proxyRes, req.method);
+
+    if (!bodyAllowed) {
+      res.writeHead(proxyRes.statusCode || 200, proxyRes.headers);
+      proxyRes.resume();
+      res.end();
+      return;
+    }
 
     if (!shouldInject) {
       res.writeHead(proxyRes.statusCode, proxyRes.headers);
@@ -339,15 +364,28 @@ wss.on("connection", (ws) => {
 });
 
 server.on("upgrade", (req, socket, head) => {
-  const url = new URL(req.url, `http://${req.headers.host}`);
+  let url;
+  try {
+    const hostHeader = String(req.headers.host || "");
+    if (!hostHeader) {
+      throw new Error("Missing Host header");
+    }
+    url = new URL(req.url, `http://${hostHeader}`);
+  } catch (e) {
+    socket.write("HTTP/1.1 400 Bad Request\r\n\r\n");
+    socket.destroy();
+    return;
+  }
 
   if (url.pathname === "/ci/api/terminal") {
     // Validate anti-CSWSH token.
     const provided = url.searchParams.get("token") || "";
+    const providedBuffer = Buffer.from(provided);
+    const tokenBuffer = Buffer.from(SETUP_TOKEN);
     const tokenValid =
       !!SETUP_TOKEN &&
-      provided.length === SETUP_TOKEN.length &&
-      crypto.timingSafeEqual(Buffer.from(provided), Buffer.from(SETUP_TOKEN));
+      providedBuffer.length === tokenBuffer.length &&
+      crypto.timingSafeEqual(providedBuffer, tokenBuffer);
 
     let sameOrigin = false;
     try {
