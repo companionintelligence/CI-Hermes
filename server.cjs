@@ -308,6 +308,10 @@ wss.on("connection", (ws) => {
 
   ws.on("message", (msg) => {
     try {
+      // Ignore events from stale/replaced sockets.
+      if (activeWs !== ws) {
+        return;
+      }
       const parsed = JSON.parse(msg);
       if (!ptyProcess) {
         return;
@@ -329,8 +333,8 @@ wss.on("connection", (ws) => {
     console.log("Terminal WebSocket closed");
     if (activeWs === ws) {
       activeWs = null;
+      schedulePtyCleanup();
     }
-    schedulePtyCleanup();
   });
 });
 
