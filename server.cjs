@@ -58,6 +58,17 @@ function stripLeakedOscResponses(data) {
     );
 }
 
+function normalizeHostName(hostValue) {
+  if (!hostValue) {
+    return "";
+  }
+  // Remove optional :port suffix and lowercase for robust same-origin checks.
+  return String(hostValue)
+    .trim()
+    .toLowerCase()
+    .replace(/:\d+$/, "");
+}
+
 function clearPtyCleanupTimer() {
   if (ptyCleanupTimer) {
     clearTimeout(ptyCleanupTimer);
@@ -338,8 +349,10 @@ server.on("upgrade", (req, socket, head) => {
     try {
       const origin = String(req.headers.origin || "");
       if (origin) {
-        const originHost = new URL(origin).host;
-        sameOrigin = originHost === req.headers.host;
+        const originUrl = new URL(origin);
+        const requestHostName = normalizeHostName(req.headers.host || "");
+        const originHostName = normalizeHostName(originUrl.host || "");
+        sameOrigin = !!requestHostName && requestHostName === originHostName;
       }
     } catch (e) {
       sameOrigin = false;
@@ -367,6 +380,12 @@ server.listen(PORT, "0.0.0.0", () => {
 // Graceful shutdown
 process.on("SIGTERM", () => {
   console.log("Received SIGTERM, shutting down...");
+  if (activeWs) {
+    try {
+      activeWs.close(1001, "Server shutting down");
+    } catch (e) {}
+    activeWs = null;
+  }
   clearPtyCleanupTimer();
   killPty();
   server.close();
