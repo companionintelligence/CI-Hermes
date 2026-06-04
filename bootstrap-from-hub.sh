@@ -49,6 +49,30 @@ translate_keys() {
   '
 }
 
+detect_docker_gateway_ip() {
+  # Allow tests/operators to force a known gateway IP.
+  if [ -n "${DOCKER_HOST_GATEWAY_IP:-}" ]; then
+    printf '%s\n' "${DOCKER_HOST_GATEWAY_IP}"
+    return 0
+  fi
+
+  # Linux containers can usually reach the host via the default route gateway.
+  # If detection fails, return empty and keep values unchanged.
+  ip route 2>/dev/null | awk '/^default[[:space:]]/ { print $3; exit }'
+}
+
+rewrite_host_docker_internal() {
+  file_path="$1"
+  gateway_ip="$2"
+
+  if [ -z "${gateway_ip}" ]; then
+    return 0
+  fi
+
+  # Replace only the docker-host alias token, preserving URL scheme/port/path.
+  sed "s/host\.docker\.internal/${gateway_ip}/g" "${file_path}"
+}
+
 main() {
   if [ ! -d "${DATA_DIR}" ]; then
     log "WARN: ${DATA_DIR} does not exist; skipping"
@@ -71,6 +95,18 @@ main() {
     rm -f "${tmp}"
     log "ERROR: translate_keys failed"
     exit 0
+  fi
+
+  gateway_ip="$(detect_docker_gateway_ip || true)"
+  if [ -n "${gateway_ip}" ]; then
+    tmp2="$(mktemp)"
+    if rewrite_host_docker_internal "${tmp}" "${gateway_ip}" > "${tmp2}"; then
+      mv "${tmp2}" "${tmp}"
+      log "normalized host.docker.internal -> ${gateway_ip}"
+    else
+      rm -f "${tmp2}"
+      log "WARN: failed to normalize host.docker.internal values"
+    fi
   fi
 
   mv "${tmp}" "${OUT_ENV}"
