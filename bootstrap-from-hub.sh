@@ -71,7 +71,12 @@ rewrite_host_docker_internal() {
 
   # Escape sed replacement metacharacters so operator/test overrides containing
   # '&', '\\', or '/' remain literal.
-  escaped_gateway_ip="$(printf '%s' "${gateway_ip}" | sed 's/[\\/&]/\\\\&/g')"
+  escaped_gateway_ip="$(
+    printf '%s' "${gateway_ip}" |
+    sed 's/\\/\\\\/g' |
+    sed 's/&/\\\&/g' |
+    sed 's#/#\\/#g'
+  )"
 
   # Replace only the docker-host alias token, preserving URL scheme/port/path.
   sed "s/host\.docker\.internal/${escaped_gateway_ip}/g" "${file_path}"

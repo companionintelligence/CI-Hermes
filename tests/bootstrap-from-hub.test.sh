@@ -101,7 +101,7 @@ assert_contains "OLLAMA_HOST rewritten" "OLLAMA_HOST=http://172.18.0.1:11434" "$
 # ─── Test 2c: gateway override metacharacters are treated literally ─────────
 echo "test: gateway override escapes sed replacement metacharacters"
 fixture=$'HERMES_OPENAI_BASE_URL=http://host.docker.internal:11434/v1\n'
-out="$(run_with_fixture "${fixture}" '10.0.0.1\\&edge')"
+out="$(run_with_fixture "${fixture}" '10.0.0.1\&edge')"
 assert_contains "escaped override remains literal" "OPENAI_API_BASE=http://10.0.0.1\\&edge:11434/v1" "${out}"
 
 # ─── Test 3: Hub unreachable → script exits 0 (does not abort container) ────
