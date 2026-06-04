@@ -13,11 +13,23 @@ const SETUP_TOKEN = process.env.APP_SEED || "";
 const DATA_DIR = "/opt/data";
 const DASHBOARD_HOST = "127.0.0.1";
 const DASHBOARD_PORT = 9119;
-// Default PTY idle grace period in milliseconds.
+const DEFAULT_PTY_IDLE_GRACE_MS = 1800000;
+const ALLOW_SAME_ORIGIN_WS_FALLBACK = ["1", "true", "yes", "on"].includes(
+  String(process.env.ALLOW_SAME_ORIGIN_WS_FALLBACK || "").toLowerCase(),
+);
+
+function parseNonNegativeInt(rawValue, fallbackValue) {
+  const parsed = Number.parseInt(String(rawValue || ""), 10);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    return fallbackValue;
+  }
+  return parsed;
+}
+
 // Keep PTY alive long enough for browser reconnects without resetting chat context.
-const PTY_IDLE_GRACE_MS = parseInt(
-  process.env.PTY_IDLE_GRACE_MS || "1800000",
-  10,
+const PTY_IDLE_GRACE_MS = parseNonNegativeInt(
+  process.env.PTY_IDLE_GRACE_MS,
+  DEFAULT_PTY_IDLE_GRACE_MS,
 );
 
 let ptyProcess = null;
@@ -315,8 +327,7 @@ server.on("upgrade", (req, socket, head) => {
   const url = new URL(req.url, `http://${req.headers.host}`);
 
   if (url.pathname === "/ci/api/terminal") {
-    // Validate anti-CSWSH token. Some reverse proxies drop WS query strings,
-    // so permit same-origin browser upgrades as a fallback.
+    // Validate anti-CSWSH token.
     const provided = url.searchParams.get("token") || "";
     const tokenValid =
       !!SETUP_TOKEN &&
@@ -334,7 +345,8 @@ server.on("upgrade", (req, socket, head) => {
       sameOrigin = false;
     }
 
-    if (!tokenValid && !sameOrigin) {
+    const allowSameOriginFallback = ALLOW_SAME_ORIGIN_WS_FALLBACK && sameOrigin;
+    if (!tokenValid && !allowSameOriginFallback) {
       socket.write("HTTP/1.1 403 Forbidden\r\n\r\n");
       socket.destroy();
       return;
