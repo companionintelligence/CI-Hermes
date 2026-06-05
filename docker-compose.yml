@@ -27,6 +27,8 @@ services:
     image: ci-hermes:v2026.5.29.2
     container_name: hermes-gateway
     restart: unless-stopped
+    init: true
+    user: "1000:1000"
     entrypoint: ["/app/gateway-entrypoint.sh"]
     command: gateway run
     environment:

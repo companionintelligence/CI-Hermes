@@ -1,7 +1,7 @@
 #!/bin/bash
 # Gateway container entrypoint: apply managed CI context and then run
 # Hermes in gateway mode.
-set -e
+set -euo pipefail
 
 source "/opt/hermes/.venv/bin/activate"
 
@@ -13,10 +13,23 @@ source "/opt/hermes/.venv/bin/activate"
 # Export Hub-derived provider env values before launching Hermes.
 HUB_ENV_FILE="${HERMES_HOME:-/opt/data}/.env.hub-bootstrap"
 if [[ -f "${HUB_ENV_FILE}" ]]; then
-  set -a
-  # shellcheck disable=SC1090
-  source "${HUB_ENV_FILE}"
-  set +a
+  # Parse KEY=VALUE pairs without executing file contents as shell code.
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -z "$line" || "$line" =~ ^[[:space:]]*# ]] && continue
+
+    if [[ "$line" =~ ^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
+      key="${BASH_REMATCH[1]}"
+      value="${BASH_REMATCH[2]}"
+
+      if [[ "$value" =~ ^\"(.*)\"$ ]]; then
+        value="${BASH_REMATCH[1]}"
+      elif [[ "$value" =~ ^\'(.*)\'$ ]]; then
+        value="${BASH_REMATCH[1]}"
+      fi
+
+      export "$key=$value"
+    fi
+  done < "${HUB_ENV_FILE}"
 fi
 
 if [[ "$#" -eq 0 ]]; then
