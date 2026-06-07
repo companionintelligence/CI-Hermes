@@ -14,9 +14,11 @@ is_allowed_key() {
 
 load_hub_env_file() {
   local env_file="$1"
+  local line key value
   [[ -f "${env_file}" ]] || return 0
 
   while IFS= read -r line || [[ -n "${line}" ]]; do
+    line="${line%$'\r'}"
     [[ -z "${line}" || "${line}" =~ ^[[:space:]]*# ]] && continue
 
     if [[ "${line}" =~ ^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
