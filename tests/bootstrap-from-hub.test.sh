@@ -81,9 +81,18 @@ assert_contains "CUSTOM_BASE_URL alias present" "CUSTOM_BASE_URL=http://ci-hub-o
 assert_contains "OPENAI_API_KEY present" "OPENAI_API_KEY=ollama" "${out}"
 assert_contains "CUSTOM_API_KEY alias present" "CUSTOM_API_KEY=ollama" "${out}"
 assert_contains "OPENAI_MODEL present" "OPENAI_MODEL=hermes4-70b" "${out}"
+assert_contains "HERMES_INFERENCE_MODEL alias present" "HERMES_INFERENCE_MODEL=hermes4-70b" "${out}"
 assert_contains "OPENAI_EMBEDDINGS_MODEL present" "OPENAI_EMBEDDINGS_MODEL=nomic-embed-text" "${out}"
 assert_contains "original HERMES_ key preserved" "HERMES_DEFAULT_MODEL=hermes4-70b" "${out}"
 assert_contains "BACKEND_ID passthrough preserved" "HERMES_DEFAULT_MODEL_BACKEND_ID=hermes4:70b" "${out}"
+
+# ─── Test 1b: backend id becomes model fallback when plain default model is absent ──
+echo "test: backend id becomes model fallback when plain default model is absent"
+fixture=$'HERMES_OPENAI_BASE_URL=http://ci-hub-ollama:11434/v1\nHERMES_OPENAI_API_KEY=ollama\nHERMES_DEFAULT_MODEL_BACKEND_ID=qwen3.5:9b\n'
+out="$(run_with_fixture "${fixture}")"
+assert_contains "OPENAI_MODEL fallback present" "OPENAI_MODEL=qwen3.5:9b" "${out}"
+assert_contains "HERMES_INFERENCE_MODEL fallback present" "HERMES_INFERENCE_MODEL=qwen3.5:9b" "${out}"
+assert_contains "backend id preserved" "HERMES_DEFAULT_MODEL_BACKEND_ID=qwen3.5:9b" "${out}"
 
 # ─── Test 2: Unrelated env lines pass through untouched ─────────────────────
 echo "test: unrelated env lines pass through"

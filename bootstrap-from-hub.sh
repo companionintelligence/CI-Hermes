@@ -40,7 +40,7 @@ translate_keys() {
   # stdin: HERMES_* and other env lines from Hub
   # stdout: OPENAI_* lines Hermes can read, plus the original keys preserved
   awk '
-    BEGIN { FS="=" }
+    BEGIN { FS="="; emitted_model_aliases=0 }
     /^HERMES_OPENAI_BASE_URL=/ {
       v=$0
       sub(/^HERMES_OPENAI_BASE_URL=/, "OPENAI_API_BASE=", v); print v
@@ -56,7 +56,24 @@ translate_keys() {
       print
       next
     }
-    /^HERMES_DEFAULT_MODEL=/   { v=$0; sub(/^HERMES_DEFAULT_MODEL=/, "OPENAI_MODEL=", v); print v; print; next }
+    /^HERMES_DEFAULT_MODEL=/   {
+      v=$0
+      sub(/^HERMES_DEFAULT_MODEL=/, "OPENAI_MODEL=", v); print v
+      sub(/^OPENAI_MODEL=/, "HERMES_INFERENCE_MODEL=", v); print v
+      emitted_model_aliases=1
+      print
+      next
+    }
+    /^HERMES_DEFAULT_MODEL_BACKEND_ID=/ {
+      if (!emitted_model_aliases) {
+        v=$0
+        sub(/^HERMES_DEFAULT_MODEL_BACKEND_ID=/, "OPENAI_MODEL=", v); print v
+        sub(/^OPENAI_MODEL=/, "HERMES_INFERENCE_MODEL=", v); print v
+        emitted_model_aliases=1
+      }
+      print
+      next
+    }
     /^HERMES_EMBEDDINGS_MODEL=/ { v=$0; sub(/^HERMES_EMBEDDINGS_MODEL=/, "OPENAI_EMBEDDINGS_MODEL=", v); print v; print; next }
     { print }
   '
