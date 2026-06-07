@@ -151,6 +151,32 @@ main() {
   mv "${tmp}" "${OUT_ENV}"
   chmod 600 "${OUT_ENV}" 2>/dev/null || true
   log "wrote ${OUT_ENV} ($(wc -l < "${OUT_ENV}" | tr -d ' ') lines)"
+
+  # Also write minimal config.yaml with model provider set, so Hermes recognizes
+  # that a provider is configured when it starts. This is required for -z oneshot
+  # and interactive chat to work with custom OpenAI-compatible endpoints.
+  OUT_CONFIG="${DATA_DIR}/config.yaml"
+  if grep -q "^HERMES_DEFAULT_MODEL=" "${OUT_ENV}" || grep -q "^HERMES_DEFAULT_MODEL_BACKEND_ID=" "${OUT_ENV}"; then
+    # Extract model name from env file (prefer HERMES_DEFAULT_MODEL)
+    model_name=$(grep "^HERMES_DEFAULT_MODEL=" "${OUT_ENV}" | cut -d= -f2- | head -1)
+    [ -z "${model_name}" ] && model_name=$(grep "^HERMES_DEFAULT_MODEL_BACKEND_ID=" "${OUT_ENV}" | cut -d= -f2- | head -1)
+    
+    if [ -n "${model_name}" ]; then
+      # Only write config.yaml if it doesn't exist or is empty
+      # This ensures user's manual config.yaml is not overwritten
+      if [ ! -s "${OUT_CONFIG}" ]; then
+        cat > "${OUT_CONFIG}" <<EOF
+model:
+  provider: ollama
+  name: ${model_name}
+EOF
+        chmod 600 "${OUT_CONFIG}" 2>/dev/null || true
+        log "wrote ${OUT_CONFIG} with provider=ollama"
+      else
+        log "config.yaml already exists; skipping generation"
+      fi
+    fi
+  fi
 }
 
 main "$@"
