@@ -18,6 +18,19 @@ const ALLOW_SAME_ORIGIN_WS_FALLBACK = ["1", "true", "yes", "on"].includes(
   String(process.env.ALLOW_SAME_ORIGIN_WS_FALLBACK || "").toLowerCase(),
 );
 const HUB_ENV_FILE = path.join(DATA_DIR, ".env.hub-bootstrap");
+const HUB_ENV_PREFIXES = [
+  "OPENAI_",
+  "HERMES_",
+  "CUSTOM_",
+  "ANTHROPIC_",
+  "GEMINI_",
+  "GOOGLE_",
+  "OLLAMA_",
+];
+
+function isAllowedHubEnvKey(key) {
+  return HUB_ENV_PREFIXES.some((prefix) => key.startsWith(prefix));
+}
 
 function loadHubBootstrapEnv() {
   const out = {};
@@ -36,6 +49,9 @@ function loadHubBootstrapEnv() {
         continue;
       }
       const key = line.slice(0, eqIdx).trim();
+      if (!isAllowedHubEnvKey(key)) {
+        continue;
+      }
       let value = line.slice(eqIdx + 1);
       if (
         (value.startsWith('"') && value.endsWith('"')) ||
