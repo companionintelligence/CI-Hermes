@@ -17,6 +17,39 @@ const DEFAULT_PTY_IDLE_GRACE_MS = 1800000;
 const ALLOW_SAME_ORIGIN_WS_FALLBACK = ["1", "true", "yes", "on"].includes(
   String(process.env.ALLOW_SAME_ORIGIN_WS_FALLBACK || "").toLowerCase(),
 );
+const HUB_ENV_FILE = path.join(DATA_DIR, ".env.hub-bootstrap");
+
+function loadHubBootstrapEnv() {
+  const out = {};
+  try {
+    if (!fs.existsSync(HUB_ENV_FILE)) {
+      return out;
+    }
+    const text = fs.readFileSync(HUB_ENV_FILE, "utf8");
+    for (const rawLine of text.split(/\r?\n/)) {
+      const line = rawLine.trim();
+      if (!line || line.startsWith("#")) {
+        continue;
+      }
+      const eqIdx = line.indexOf("=");
+      if (eqIdx <= 0) {
+        continue;
+      }
+      const key = line.slice(0, eqIdx).trim();
+      let value = line.slice(eqIdx + 1);
+      if (
+        (value.startsWith('"') && value.endsWith('"')) ||
+        (value.startsWith("'") && value.endsWith("'"))
+      ) {
+        value = value.slice(1, -1);
+      }
+      out[key] = value;
+    }
+  } catch (e) {
+    console.warn(`Failed to read ${HUB_ENV_FILE}: ${e.message}`);
+  }
+  return out;
+}
 
 function parseNonNegativeInt(rawValue, fallbackValue) {
   const parsed = Number.parseInt(String(rawValue || ""), 10);
@@ -111,6 +144,7 @@ function startPtyIfNeeded() {
     cwd: DATA_DIR,
     env: {
       ...process.env,
+      ...loadHubBootstrapEnv(),
       TERM: "xterm-256color",
       HOME: DATA_DIR,
     },
