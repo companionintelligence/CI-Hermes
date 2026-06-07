@@ -41,8 +41,21 @@ translate_keys() {
   # stdout: OPENAI_* lines Hermes can read, plus the original keys preserved
   awk '
     BEGIN { FS="=" }
-    /^HERMES_OPENAI_BASE_URL=/ { v=$0; sub(/^HERMES_OPENAI_BASE_URL=/, "OPENAI_API_BASE=", v); print v; sub(/^OPENAI_API_BASE=/, "OPENAI_BASE_URL=", v); print v; print; next }
-    /^HERMES_OPENAI_API_KEY=/  { v=$0; sub(/^HERMES_OPENAI_API_KEY=/, "OPENAI_API_KEY=", v); print v; print; next }
+    /^HERMES_OPENAI_BASE_URL=/ {
+      v=$0
+      sub(/^HERMES_OPENAI_BASE_URL=/, "OPENAI_API_BASE=", v); print v
+      sub(/^OPENAI_API_BASE=/, "OPENAI_BASE_URL=", v); print v
+      sub(/^OPENAI_BASE_URL=/, "CUSTOM_BASE_URL=", v); print v
+      print
+      next
+    }
+    /^HERMES_OPENAI_API_KEY=/  {
+      v=$0
+      sub(/^HERMES_OPENAI_API_KEY=/, "OPENAI_API_KEY=", v); print v
+      sub(/^OPENAI_API_KEY=/, "CUSTOM_API_KEY=", v); print v
+      print
+      next
+    }
     /^HERMES_DEFAULT_MODEL=/   { v=$0; sub(/^HERMES_DEFAULT_MODEL=/, "OPENAI_MODEL=", v); print v; print; next }
     /^HERMES_EMBEDDINGS_MODEL=/ { v=$0; sub(/^HERMES_EMBEDDINGS_MODEL=/, "OPENAI_EMBEDDINGS_MODEL=", v); print v; print; next }
     { print }

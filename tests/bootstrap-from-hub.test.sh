@@ -77,7 +77,9 @@ fixture=$'HERMES_OPENAI_BASE_URL=http://ci-hub-ollama:11434/v1\nHERMES_OPENAI_AP
 out="$(run_with_fixture "${fixture}")"
 assert_contains "OPENAI_API_BASE present" "OPENAI_API_BASE=http://ci-hub-ollama:11434/v1" "${out}"
 assert_contains "OPENAI_BASE_URL alias present" "OPENAI_BASE_URL=http://ci-hub-ollama:11434/v1" "${out}"
+assert_contains "CUSTOM_BASE_URL alias present" "CUSTOM_BASE_URL=http://ci-hub-ollama:11434/v1" "${out}"
 assert_contains "OPENAI_API_KEY present" "OPENAI_API_KEY=ollama" "${out}"
+assert_contains "CUSTOM_API_KEY alias present" "CUSTOM_API_KEY=ollama" "${out}"
 assert_contains "OPENAI_MODEL present" "OPENAI_MODEL=hermes4-70b" "${out}"
 assert_contains "OPENAI_EMBEDDINGS_MODEL present" "OPENAI_EMBEDDINGS_MODEL=nomic-embed-text" "${out}"
 assert_contains "original HERMES_ key preserved" "HERMES_DEFAULT_MODEL=hermes4-70b" "${out}"
@@ -95,6 +97,7 @@ fixture=$'HERMES_OPENAI_BASE_URL=http://host.docker.internal:11434/v1\nOLLAMA_HO
 out="$(run_with_fixture "${fixture}" "172.18.0.1")"
 assert_contains "OPENAI_API_BASE rewritten" "OPENAI_API_BASE=http://172.18.0.1:11434/v1" "${out}"
 assert_contains "OPENAI_BASE_URL rewritten" "OPENAI_BASE_URL=http://172.18.0.1:11434/v1" "${out}"
+assert_contains "CUSTOM_BASE_URL rewritten" "CUSTOM_BASE_URL=http://172.18.0.1:11434/v1" "${out}"
 assert_contains "HERMES base URL rewritten" "HERMES_OPENAI_BASE_URL=http://172.18.0.1:11434/v1" "${out}"
 assert_contains "OLLAMA_HOST rewritten" "OLLAMA_HOST=http://172.18.0.1:11434" "${out}"
 
@@ -103,6 +106,7 @@ echo "test: gateway override escapes sed replacement metacharacters"
 fixture=$'HERMES_OPENAI_BASE_URL=http://host.docker.internal:11434/v1\n'
 out="$(run_with_fixture "${fixture}" '10.0.0.1\&edge')"
 assert_contains "escaped override remains literal" "OPENAI_API_BASE=http://10.0.0.1\\&edge:11434/v1" "${out}"
+assert_contains "CUSTOM_BASE_URL escaped override remains literal" "CUSTOM_BASE_URL=http://10.0.0.1\\&edge:11434/v1" "${out}"
 
 # ─── Test 3: Hub unreachable → script exits 0 (does not abort container) ────
 echo "test: unreachable Hub returns exit 0"
