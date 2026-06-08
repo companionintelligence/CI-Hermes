@@ -157,9 +157,21 @@ function defaultPortForProto(proto) {
   return "80";
 }
 
-function resolveRequestPort(req, parsedHost) {
+function resolveRequestPort(req, parsedHost, fallbackPort) {
   if (parsedHost.port) {
     return parsedHost.port;
+  }
+
+  const forwardedProto = String(req.headers["x-forwarded-proto"] || "")
+    .split(",")[0]
+    .trim()
+    .toLowerCase();
+
+  // Some proxies report websocket transport metadata (ws/80) here even when
+  // the browser Origin is https/443. In that case, prefer Origin-derived port
+  // for same-origin validation.
+  if ((forwardedProto === "ws" || forwardedProto === "wss") && fallbackPort) {
+    return String(fallbackPort);
   }
 
   const forwardedPort = String(req.headers["x-forwarded-port"] || "").trim();
@@ -167,9 +179,9 @@ function resolveRequestPort(req, parsedHost) {
     return forwardedPort;
   }
 
-  const forwardedProto = String(req.headers["x-forwarded-proto"] || "")
-    .split(",")[0]
-    .trim();
+  if (!forwardedProto && fallbackPort) {
+    return String(fallbackPort);
+  }
   return defaultPortForProto(forwardedProto || "http");
 }
 
@@ -342,9 +354,10 @@ function isSameOriginUpgrade(req) {
       return false;
     }
 
-    const requestPort = resolveRequestPort(req, requestHost);
     const originPort =
-      originHost.port || defaultPortForProto(originUrl.protocol.replace(":", ""));
+      originHost.port ||
+      defaultPortForProto(originUrl.protocol.replace(":", ""));
+    const requestPort = resolveRequestPort(req, requestHost, originPort);
 
     return requestPort === originPort;
   } catch (e) {
