@@ -230,6 +230,16 @@ assert_contains "model value preserved" "default: 'qwen3.5:9b'" "${config_out}"
 assert_not_contains "carriage return removed" "$(printf '\r')" "${config_out}"
 rm -rf "${data_dir}"
 
+# ─── Test 10: single-quoted model values are unwrapped before YAML quoting ───
+echo "test: single-quoted default model value is normalized"
+data_dir="$(mktemp -d)"
+fixture="$(printf "HERMES_DEFAULT_MODEL='qwen3.5:9b'\n")"
+run_with_fixture_in_dir "${fixture}" "${data_dir}"
+config_out="$(cat "${data_dir}/config.yaml")"
+assert_contains "single-quoted model unwrapped" "default: 'qwen3.5:9b'" "${config_out}"
+assert_not_contains "single-quote wrapper removed" "default: '''qwen3.5:9b'''" "${config_out}"
+rm -rf "${data_dir}"
+
 # ─── Summary ────────────────────────────────────────────────────────────────
 echo
 echo "Results: ${PASS} passed, ${FAIL} failed"

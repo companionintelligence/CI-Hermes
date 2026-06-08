@@ -121,22 +121,17 @@ normalize_env_value() {
   # Strip CR from CRLF files and one matching pair of surrounding quotes.
   value="$1"
   cr_char="$(printf '\r')"
+  dq='"'
+  sq="'"
   value="${value%${cr_char}}"
 
-  case "${value}" in
-    \"*\")
-      if [ "${value%\"}" != "${value}" ]; then
-        value="${value#\"}"
-        value="${value%\"}"
-      fi
-      ;;
-    \'*\')
-      if [ "${value%\'}" != "${value}" ]; then
-        value="${value#\'}"
-        value="${value%\'}"
-      fi
-      ;;
-  esac
+  if [ "${value#"${dq}"}" != "${value}" ] && [ "${value%"${dq}"}" != "${value}" ]; then
+    value="${value#"${dq}"}"
+    value="${value%"${dq}"}"
+  elif [ "${value#"${sq}"}" != "${value}" ] && [ "${value%"${sq}"}" != "${value}" ]; then
+    value="${value#"${sq}"}"
+    value="${value%"${sq}"}"
+  fi
 
   printf '%s' "${value}"
 }
