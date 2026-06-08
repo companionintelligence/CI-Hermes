@@ -36,6 +36,19 @@ assert_contains() {
   fi
 }
 
+assert_not_contains() {
+  local label="$1" needle="$2" haystack="$3"
+  if echo "${haystack}" | grep -qF "${needle}"; then
+    echo "  ✗ ${label}"
+    echo "    expected to NOT contain: ${needle}"
+    echo "    in:                      ${haystack}"
+    FAIL=$((FAIL + 1))
+  else
+    echo "  ✓ ${label}"
+    PASS=$((PASS + 1))
+  fi
+}
+
 run_with_fixture() {
   local fixture_body="$1"
   local gateway_ip_override="${2:-}"
@@ -69,6 +82,28 @@ run_with_no_fixture_and_bad_hub() {
   local rc=$?
   rm -rf "${data_dir}"
   return ${rc}
+}
+
+run_with_fixture_in_dir() {
+  local fixture_body="$1"
+  local data_dir="$2"
+  local gateway_ip_override="${3:-}"
+  local fixture_file
+  fixture_file="$(mktemp)"
+  printf '%s' "${fixture_body}" > "${fixture_file}"
+
+  if [[ -n "${gateway_ip_override}" ]]; then
+    HERMES_HOME="${data_dir}" \
+    BOOTSTRAP_FIXTURE_FILE="${fixture_file}" \
+    DOCKER_HOST_GATEWAY_IP="${gateway_ip_override}" \
+      "${SCRIPT}" >/dev/null 2>&1
+  else
+    HERMES_HOME="${data_dir}" \
+    BOOTSTRAP_FIXTURE_FILE="${fixture_file}" \
+      "${SCRIPT}" >/dev/null 2>&1
+  fi
+
+  rm -f "${fixture_file}"
 }
 
 # ─── Test 1: HERMES_ keys are translated to OPENAI_* and originals kept ─────
@@ -149,6 +184,61 @@ HERMES_HOME="${data_dir}" BOOTSTRAP_FIXTURE_FILE="${fixture_file}" "${SCRIPT}" >
 hash2="$(shasum "${data_dir}/.env.hub-bootstrap" | awk '{print $1}')"
 rm -rf "${data_dir}" "${fixture_file}"
 assert_eq "two runs produce identical output" "${hash1}" "${hash2}"
+
+# ─── Test 6: config.yaml generation uses YAML-safe quoted model name ─────────
+echo "test: config.yaml is generated with quoted YAML-safe model name"
+data_dir="$(mktemp -d)"
+fixture="HERMES_DEFAULT_MODEL=model: foo #bar's"$'\n'
+run_with_fixture_in_dir "${fixture}" "${data_dir}"
+config_out="$(cat "${data_dir}/config.yaml")"
+assert_contains "config provider set" "provider: ollama" "${config_out}"
+assert_contains "config default key used" "default: 'model: foo #bar''s'" "${config_out}"
+rm -rf "${data_dir}"
+
+# ─── Test 7: existing config.yaml is never overwritten ───────────────────────
+echo "test: existing config.yaml is preserved"
+data_dir="$(mktemp -d)"
+cat > "${data_dir}/config.yaml" <<'EOF'
+model:
+  provider: custom
+  default: keep-me
+EOF
+fixture=$'HERMES_DEFAULT_MODEL=qwen3.5:9b\n'
+run_with_fixture_in_dir "${fixture}" "${data_dir}"
+config_out="$(cat "${data_dir}/config.yaml")"
+assert_contains "existing provider preserved" "provider: custom" "${config_out}"
+assert_contains "existing default preserved" "default: keep-me" "${config_out}"
+rm -rf "${data_dir}"
+
+# ─── Test 8: quoted model values are unwrapped before YAML quoting ───────────
+echo "test: quoted default model value is normalized"
+data_dir="$(mktemp -d)"
+fixture=$'HERMES_DEFAULT_MODEL="qwen3.5:9b"\n'
+run_with_fixture_in_dir "${fixture}" "${data_dir}"
+config_out="$(cat "${data_dir}/config.yaml")"
+assert_contains "unwrapped model value" "default: 'qwen3.5:9b'" "${config_out}"
+assert_not_contains "wrapped quotes removed" "default: '\"qwen3.5:9b\"'" "${config_out}"
+rm -rf "${data_dir}"
+
+# ─── Test 9: CRLF model values do not leak carriage returns into YAML ────────
+echo "test: CRLF model values are normalized"
+data_dir="$(mktemp -d)"
+fixture="$(printf 'HERMES_DEFAULT_MODEL=qwen3.5:9b\r\n')"
+run_with_fixture_in_dir "${fixture}" "${data_dir}"
+config_out="$(cat "${data_dir}/config.yaml")"
+assert_contains "model value preserved" "default: 'qwen3.5:9b'" "${config_out}"
+assert_not_contains "carriage return removed" "$(printf '\r')" "${config_out}"
+rm -rf "${data_dir}"
+
+# ─── Test 10: single-quoted model values are unwrapped before YAML quoting ───
+echo "test: single-quoted default model value is normalized"
+data_dir="$(mktemp -d)"
+fixture="$(printf "HERMES_DEFAULT_MODEL='qwen3.5:9b'\n")"
+run_with_fixture_in_dir "${fixture}" "${data_dir}"
+config_out="$(cat "${data_dir}/config.yaml")"
+assert_contains "single-quoted model unwrapped" "default: 'qwen3.5:9b'" "${config_out}"
+assert_not_contains "single-quote wrapper removed" "default: '''qwen3.5:9b'''" "${config_out}"
+rm -rf "${data_dir}"
 
 # ─── Summary ────────────────────────────────────────────────────────────────
 echo

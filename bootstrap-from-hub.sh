@@ -112,6 +112,30 @@ rewrite_host_docker_internal() {
   sed "s/host\.docker\.internal/${escaped_gateway_ip}/g" "${file_path}"
 }
 
+yaml_single_quote() {
+  # YAML single-quoted scalar escaping: single quote is represented as two quotes.
+  printf "%s" "$1" | sed "s/'/''/g"
+}
+
+normalize_env_value() {
+  # Strip CR from CRLF files and one matching pair of surrounding quotes.
+  value="$1"
+  cr_char="$(printf '\r')"
+  dq='"'
+  sq="'"
+  value="${value%${cr_char}}"
+
+  if [ "${value#"${dq}"}" != "${value}" ] && [ "${value%"${dq}"}" != "${value}" ]; then
+    value="${value#"${dq}"}"
+    value="${value%"${dq}"}"
+  elif [ "${value#"${sq}"}" != "${value}" ] && [ "${value%"${sq}"}" != "${value}" ]; then
+    value="${value#"${sq}"}"
+    value="${value%"${sq}"}"
+  fi
+
+  printf '%s' "${value}"
+}
+
 main() {
   if [ ! -d "${DATA_DIR}" ]; then
     log "WARN: ${DATA_DIR} does not exist; skipping"
@@ -151,6 +175,34 @@ main() {
   mv "${tmp}" "${OUT_ENV}"
   chmod 600 "${OUT_ENV}" 2>/dev/null || true
   log "wrote ${OUT_ENV} ($(wc -l < "${OUT_ENV}" | tr -d ' ') lines)"
+
+  # Also write minimal config.yaml with model provider set, so Hermes recognizes
+  # that a provider is configured when it starts. This is required for -z oneshot
+  # and interactive chat to work with custom OpenAI-compatible endpoints.
+  OUT_CONFIG="${DATA_DIR}/config.yaml"
+  if grep -q "^HERMES_DEFAULT_MODEL=" "${OUT_ENV}" || grep -q "^HERMES_DEFAULT_MODEL_BACKEND_ID=" "${OUT_ENV}"; then
+    # Extract model name from env file (prefer HERMES_DEFAULT_MODEL)
+    model_name_raw=$(grep "^HERMES_DEFAULT_MODEL=" "${OUT_ENV}" | cut -d= -f2- | head -n 1)
+    [ -z "${model_name_raw}" ] && model_name_raw=$(grep "^HERMES_DEFAULT_MODEL_BACKEND_ID=" "${OUT_ENV}" | cut -d= -f2- | head -n 1)
+    model_name=$(normalize_env_value "${model_name_raw}")
+    
+    if [ -n "${model_name}" ]; then
+      # Only write config.yaml if it doesn't exist or is empty
+      # This ensures user's manual config.yaml is not overwritten
+      if [ ! -s "${OUT_CONFIG}" ]; then
+        model_name_yaml=$(yaml_single_quote "${model_name}")
+        cat > "${OUT_CONFIG}" <<EOF
+model:
+  provider: ollama
+  default: '${model_name_yaml}'
+EOF
+        chmod 600 "${OUT_CONFIG}" 2>/dev/null || true
+        log "wrote ${OUT_CONFIG} with provider=ollama"
+      else
+        log "config.yaml already exists; skipping generation"
+      fi
+    fi
+  fi
 }
 
 main "$@"

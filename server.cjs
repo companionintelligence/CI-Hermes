@@ -111,11 +111,78 @@ function normalizeHostName(hostValue) {
   if (!hostValue) {
     return "";
   }
-  // Remove optional :port suffix and lowercase for robust same-origin checks.
-  return String(hostValue)
+  // Host/port splitting is handled separately; keep the hostname untouched
+  // (except casing/whitespace) so IPv6 hosts like ::1 are not mangled.
+  return String(hostValue).trim().toLowerCase();
+}
+
+function parseHostAndPort(hostValue) {
+  const raw = String(hostValue || "").trim();
+  if (!raw) {
+    return { hostname: "", port: "" };
+  }
+
+  // Support bracketed IPv6 hosts: [::1]:9119
+  if (raw.startsWith("[")) {
+    const end = raw.indexOf("]");
+    if (end !== -1) {
+      const hostname = raw.slice(1, end).toLowerCase();
+      const rest = raw.slice(end + 1);
+      if (rest.startsWith(":")) {
+        return { hostname, port: rest.slice(1) };
+      }
+      return { hostname, port: "" };
+    }
+  }
+
+  const parts = raw.split(":");
+  if (parts.length > 1) {
+    const maybePort = parts[parts.length - 1];
+    if (/^\d+$/.test(maybePort)) {
+      return {
+        hostname: parts.slice(0, -1).join(":").toLowerCase(),
+        port: maybePort,
+      };
+    }
+  }
+
+  return { hostname: raw.toLowerCase(), port: "" };
+}
+
+function defaultPortForProto(proto) {
+  const value = String(proto || "").toLowerCase();
+  if (value === "https" || value === "wss") {
+    return "443";
+  }
+  return "80";
+}
+
+function resolveRequestPort(req, parsedHost, fallbackPort) {
+  if (parsedHost.port) {
+    return parsedHost.port;
+  }
+
+  const forwardedProto = String(req.headers["x-forwarded-proto"] || "")
+    .split(",")[0]
     .trim()
-    .toLowerCase()
-    .replace(/:\d+$/, "");
+    .toLowerCase();
+
+  // Some proxies report websocket transport metadata (ws/80) here even when
+  // the browser Origin is https/443. In that case, prefer Origin-derived port
+  // for same-origin validation.
+  if ((forwardedProto === "ws" || forwardedProto === "wss") && fallbackPort) {
+    return String(fallbackPort);
+  }
+
+  const forwardedPort = String(req.headers["x-forwarded-port"] || "").trim();
+  if (/^\d+$/.test(forwardedPort)) {
+    return forwardedPort;
+  }
+
+  if (!forwardedProto && fallbackPort) {
+    return String(fallbackPort);
+  }
+  return defaultPortForProto(forwardedProto || "http");
 }
 
 function clearPtyCleanupTimer() {
@@ -206,7 +273,7 @@ function injectTerminalShortcut(html) {
   const styleBlock = `<style id="ci-terminal-shortcut-style">\n.ci-terminal-shortcut {\n  position: fixed;\n  right: 18px;\n  bottom: 18px;\n  z-index: 2147483000;\n  display: inline-flex;\n  align-items: center;\n  gap: 6px;\n  padding: 10px 14px;\n  border-radius: 10px;\n  border: 1px solid rgba(255, 191, 0, 0.35);\n  background: rgba(18, 18, 18, 0.92);\n  color: #FFBF00;\n  text-decoration: none;\n  font-family: system-ui, -apple-system, Segoe UI, sans-serif;\n  font-size: 13px;\n  font-weight: 600;\n  line-height: 1;\n  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);\n}\n.ci-terminal-shortcut:hover {\n  border-color: #FFBF00;\n  color: #FFD75A;\n}\n@media (max-width: 700px) {\n  .ci-terminal-shortcut {\n    right: 12px;\n    bottom: 12px;\n    padding: 9px 12px;\n    font-size: 12px;\n  }\n}\n</style>`;
 
   const buttonMarkup =
-    '<a class="ci-terminal-shortcut" href="/terminal" aria-label="Open Hermes chat terminal">Open Chat</a>';
+    '<a class="ci-terminal-shortcut" href="/terminal" aria-label="Open Hermes terminal">Open Terminal</a>';
 
   let out = html;
   if (/<\/head>/i.test(out)) {
@@ -257,6 +324,45 @@ function blockGatewayRestart(req, res) {
   res.end(
     "Gateway restarts are managed by CI marketplace. Restart Hermes from the CI marketplace homescreen.",
   );
+}
+
+function handleCiAuthMe(req, res) {
+  // Keep dashboard auth semantics unchanged to avoid UI assumptions on a custom
+  // auth payload shape. Access control is still enforced upstream by CI-Hub
+  // forward-auth at Traefik layer.
+  const payload = { detail: "Unauthorized" };
+  res.writeHead(401, {
+    "Content-Type": "application/json; charset=utf-8",
+    "Cache-Control": "no-store",
+  });
+  res.end(JSON.stringify(payload));
+}
+
+function isSameOriginUpgrade(req) {
+  try {
+    const origin = String(req.headers.origin || "").trim();
+    if (!origin) {
+      return false;
+    }
+    const originUrl = new URL(origin);
+    const requestHost = parseHostAndPort(req.headers.host || "");
+    const originHost = parseHostAndPort(originUrl.host || "");
+
+    const requestHostName = normalizeHostName(requestHost.hostname);
+    const originHostName = normalizeHostName(originHost.hostname);
+    if (!requestHostName || requestHostName !== originHostName) {
+      return false;
+    }
+
+    const originPort =
+      originHost.port ||
+      defaultPortForProto(originUrl.protocol.replace(":", ""));
+    const requestPort = resolveRequestPort(req, requestHost, originPort);
+
+    return requestPort === originPort;
+  } catch (e) {
+    return false;
+  }
 }
 
 // Proxy HTTP requests to the dashboard container
@@ -326,6 +432,93 @@ function proxyToDashboard(req, res) {
   req.pipe(proxy);
 }
 
+function writeProxyUpgradeResponse(socket, proxyRes) {
+  const statusCode = proxyRes.statusCode || 101;
+  const statusMessage = proxyRes.statusMessage || "Switching Protocols";
+  socket.write(`HTTP/1.1 ${statusCode} ${statusMessage}\r\n`);
+
+  for (const [key, value] of Object.entries(proxyRes.headers || {})) {
+    if (Array.isArray(value)) {
+      for (const entry of value) {
+        socket.write(`${key}: ${entry}\r\n`);
+      }
+      continue;
+    }
+    if (value !== undefined) {
+      socket.write(`${key}: ${value}\r\n`);
+    }
+  }
+
+  socket.write("\r\n");
+}
+
+function writeUpgradeFailureResponse(socket, statusCode, message) {
+  const status = Number(statusCode) || 502;
+  const text = String(message || "WebSocket upgrade failed.");
+  const body = `${text}\n`;
+  socket.write(`HTTP/1.1 ${status} Bad Gateway\r\n`);
+  socket.write("Content-Type: text/plain; charset=utf-8\r\n");
+  socket.write(`Content-Length: ${Buffer.byteLength(body, "utf8")}\r\n`);
+  socket.write("Connection: close\r\n");
+  socket.write("Cache-Control: no-store\r\n");
+  socket.write("\r\n");
+  socket.end(body);
+}
+
+function proxyDashboardUpgrade(req, socket, head) {
+  const dashboardHostHeader = DASHBOARD_HOST + ":" + DASHBOARD_PORT;
+  const proxy = http.request({
+    hostname: DASHBOARD_HOST,
+    port: DASHBOARD_PORT,
+    path: req.url,
+    method: req.method,
+    headers: {
+      ...req.headers,
+      host: dashboardHostHeader,
+      origin: `http://${dashboardHostHeader}`,
+    },
+  });
+
+  proxy.on("upgrade", (proxyRes, proxySocket, proxyHead) => {
+    writeProxyUpgradeResponse(socket, proxyRes);
+
+    if (head && head.length) {
+      proxySocket.write(head);
+    }
+    if (proxyHead && proxyHead.length) {
+      socket.write(proxyHead);
+    }
+
+    proxySocket.pipe(socket);
+    socket.pipe(proxySocket);
+
+    proxySocket.on("error", () => {
+      socket.destroy();
+    });
+    socket.on("error", () => {
+      proxySocket.destroy();
+    });
+  });
+
+  proxy.on("response", (proxyRes) => {
+    const upstreamStatus = Number(proxyRes.statusCode || 0);
+    proxyRes.resume();
+    writeUpgradeFailureResponse(
+      socket,
+      502,
+      upstreamStatus
+        ? `Upstream returned ${upstreamStatus} instead of switching protocols.`
+        : "Upstream rejected WebSocket upgrade.",
+    );
+  });
+
+  proxy.on("error", () => {
+    socket.end("HTTP/1.1 502 Bad Gateway\r\n\r\n");
+  });
+
+  proxy.end();
+}
+
 const server = http.createServer((req, res) => {
   const requestUrl = new URL(req.url || "/", "http://localhost");
   const requestPath = requestUrl.pathname.replace(/\/+$/, "");
@@ -359,6 +552,14 @@ const server = http.createServer((req, res) => {
   // instead of restarting the gateway container managed by CI marketplace/Docker.
   if (req.method === "POST" && requestPath === "/api/gateway/restart") {
     blockGatewayRestart(req, res);
+    return;
+  }
+
+  // In CI marketplace, request auth is enforced upstream by Traefik forward-auth.
+  // Hermes dashboard's own /api/auth/me can return 401 without dashboard-local
+  // auth state, which triggers noisy browser errors despite valid app access.
+  if (req.method === "GET" && requestPath === "/api/auth/me") {
+    handleCiAuthMe(req, res);
     return;
   }
 
@@ -437,18 +638,7 @@ server.on("upgrade", (req, socket, head) => {
       providedBuffer.length === tokenBuffer.length &&
       crypto.timingSafeEqual(providedBuffer, tokenBuffer);
 
-    let sameOrigin = false;
-    try {
-      const origin = String(req.headers.origin || "");
-      if (origin) {
-        const originUrl = new URL(origin);
-        const requestHostName = normalizeHostName(req.headers.host || "");
-        const originHostName = normalizeHostName(originUrl.host || "");
-        sameOrigin = !!requestHostName && requestHostName === originHostName;
-      }
-    } catch (e) {
-      sameOrigin = false;
-    }
+    const sameOrigin = isSameOriginUpgrade(req);
 
     const allowSameOriginFallback = ALLOW_SAME_ORIGIN_WS_FALLBACK && sameOrigin;
     if (!tokenValid && !allowSameOriginFallback) {
@@ -462,7 +652,13 @@ server.on("upgrade", (req, socket, head) => {
     return;
   }
 
-  socket.end("HTTP/1.1 404 Not Found\r\n\r\n");
+  if (!isSameOriginUpgrade(req)) {
+    socket.write("HTTP/1.1 403 Forbidden\r\n\r\n");
+    socket.destroy();
+    return;
+  }
+
+  proxyDashboardUpgrade(req, socket, head);
 });
 
 server.listen(PORT, "0.0.0.0", () => {
