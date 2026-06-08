@@ -111,8 +111,9 @@ function normalizeHostName(hostValue) {
   if (!hostValue) {
     return "";
   }
-  // Remove optional :port suffix and lowercase for robust same-origin checks.
-  return String(hostValue).trim().toLowerCase().replace(/:\d+$/, "");
+  // Host/port splitting is handled separately; keep the hostname untouched
+  // (except casing/whitespace) so IPv6 hosts like ::1 are not mangled.
+  return String(hostValue).trim().toLowerCase();
 }
 
 function parseHostAndPort(hostValue) {
