@@ -256,82 +256,31 @@ function blockGatewayRestart(req, res) {
   );
 }
 
-function buildCiAuthMePayload(req) {
-  const rawUserHeader = String(req.headers["x-ci-hub-user"] || "").trim();
-  let user = {
-    id: "ci-user",
-    username: "ci-user",
-    name: "CI User",
-    email: "",
-    roles: [],
-    permissions: [],
-    identities: [],
-    organizations: [],
-  };
-
-  if (rawUserHeader) {
-    if (rawUserHeader.startsWith("{")) {
-      try {
-        const parsed = JSON.parse(rawUserHeader);
-        if (parsed && typeof parsed === "object") {
-          user = {
-            ...user,
-            ...parsed,
-            roles: Array.isArray(parsed.roles) ? parsed.roles : [],
-            permissions: Array.isArray(parsed.permissions)
-              ? parsed.permissions
-              : [],
-            identities: Array.isArray(parsed.identities)
-              ? parsed.identities
-              : [],
-            organizations: Array.isArray(parsed.organizations)
-              ? parsed.organizations
-              : [],
-          };
-        }
-      } catch (e) {
-        user = {
-          ...user,
-          id: rawUserHeader,
-          username: rawUserHeader,
-          name: rawUserHeader,
-        };
-      }
-    }
-
-    if (rawUserHeader && !rawUserHeader.startsWith("{")) {
-      user = {
-        ...user,
-        id: rawUserHeader,
-        username: rawUserHeader,
-        name: rawUserHeader,
-      };
-    }
-  }
-
-  return {
-    authenticated: false,
-    auth_required: false,
-    login_url: "/login",
-    providers: [],
-    auth_providers: [],
-    oauth_providers: [],
-    methods: [],
-    identities: [],
-    organizations: [],
-    sessions: [],
-    source: "ci-hub-forwardauth",
-    user,
-  };
-}
-
 function handleCiAuthMe(req, res) {
+  // Keep dashboard auth semantics unchanged to avoid UI assumptions on a custom
+  // auth payload shape. Access control is still enforced upstream by CI-Hub
+  // forward-auth at Traefik layer.
   const payload = { detail: "Unauthorized" };
   res.writeHead(401, {
     "Content-Type": "application/json; charset=utf-8",
     "Cache-Control": "no-store",
   });
   res.end(JSON.stringify(payload));
+}
+
+function isSameOriginUpgrade(req) {
+  try {
+    const origin = String(req.headers.origin || "").trim();
+    if (!origin) {
+      return false;
+    }
+    const originUrl = new URL(origin);
+    const requestHostName = normalizeHostName(req.headers.host || "");
+    const originHostName = normalizeHostName(originUrl.host || "");
+    return !!requestHostName && requestHostName === originHostName;
+  } catch (e) {
+    return false;
+  }
 }
 
 // Proxy HTTP requests to the dashboard container
@@ -587,18 +536,7 @@ server.on("upgrade", (req, socket, head) => {
       providedBuffer.length === tokenBuffer.length &&
       crypto.timingSafeEqual(providedBuffer, tokenBuffer);
 
-    let sameOrigin = false;
-    try {
-      const origin = String(req.headers.origin || "");
-      if (origin) {
-        const originUrl = new URL(origin);
-        const requestHostName = normalizeHostName(req.headers.host || "");
-        const originHostName = normalizeHostName(originUrl.host || "");
-        sameOrigin = !!requestHostName && requestHostName === originHostName;
-      }
-    } catch (e) {
-      sameOrigin = false;
-    }
+    const sameOrigin = isSameOriginUpgrade(req);
 
     const allowSameOriginFallback = ALLOW_SAME_ORIGIN_WS_FALLBACK && sameOrigin;
     if (!tokenValid && !allowSameOriginFallback) {
@@ -609,6 +547,12 @@ server.on("upgrade", (req, socket, head) => {
     wss.handleUpgrade(req, socket, head, (ws) => {
       wss.emit("connection", ws, req);
     });
+    return;
+  }
+
+  if (!isSameOriginUpgrade(req)) {
+    socket.write("HTTP/1.1 403 Forbidden\r\n\r\n");
+    socket.destroy();
     return;
   }
 
