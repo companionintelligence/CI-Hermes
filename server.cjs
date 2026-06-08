@@ -115,6 +115,63 @@ function normalizeHostName(hostValue) {
   return String(hostValue).trim().toLowerCase().replace(/:\d+$/, "");
 }
 
+function parseHostAndPort(hostValue) {
+  const raw = String(hostValue || "").trim();
+  if (!raw) {
+    return { hostname: "", port: "" };
+  }
+
+  // Support bracketed IPv6 hosts: [::1]:9119
+  if (raw.startsWith("[")) {
+    const end = raw.indexOf("]");
+    if (end !== -1) {
+      const hostname = raw.slice(1, end).toLowerCase();
+      const rest = raw.slice(end + 1);
+      if (rest.startsWith(":")) {
+        return { hostname, port: rest.slice(1) };
+      }
+      return { hostname, port: "" };
+    }
+  }
+
+  const parts = raw.split(":");
+  if (parts.length > 1) {
+    const maybePort = parts[parts.length - 1];
+    if (/^\d+$/.test(maybePort)) {
+      return {
+        hostname: parts.slice(0, -1).join(":").toLowerCase(),
+        port: maybePort,
+      };
+    }
+  }
+
+  return { hostname: raw.toLowerCase(), port: "" };
+}
+
+function defaultPortForProto(proto) {
+  const value = String(proto || "").toLowerCase();
+  if (value === "https" || value === "wss") {
+    return "443";
+  }
+  return "80";
+}
+
+function resolveRequestPort(req, parsedHost) {
+  if (parsedHost.port) {
+    return parsedHost.port;
+  }
+
+  const forwardedPort = String(req.headers["x-forwarded-port"] || "").trim();
+  if (/^\d+$/.test(forwardedPort)) {
+    return forwardedPort;
+  }
+
+  const forwardedProto = String(req.headers["x-forwarded-proto"] || "")
+    .split(",")[0]
+    .trim();
+  return defaultPortForProto(forwardedProto || "http");
+}
+
 function clearPtyCleanupTimer() {
   if (ptyCleanupTimer) {
     clearTimeout(ptyCleanupTimer);
@@ -275,9 +332,20 @@ function isSameOriginUpgrade(req) {
       return false;
     }
     const originUrl = new URL(origin);
-    const requestHostName = normalizeHostName(req.headers.host || "");
-    const originHostName = normalizeHostName(originUrl.host || "");
-    return !!requestHostName && requestHostName === originHostName;
+    const requestHost = parseHostAndPort(req.headers.host || "");
+    const originHost = parseHostAndPort(originUrl.host || "");
+
+    const requestHostName = normalizeHostName(requestHost.hostname);
+    const originHostName = normalizeHostName(originHost.hostname);
+    if (!requestHostName || requestHostName !== originHostName) {
+      return false;
+    }
+
+    const requestPort = resolveRequestPort(req, requestHost);
+    const originPort =
+      originHost.port || defaultPortForProto(originUrl.protocol.replace(":", ""));
+
+    return requestPort === originPort;
   } catch (e) {
     return false;
   }
