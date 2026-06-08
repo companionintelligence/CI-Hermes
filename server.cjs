@@ -439,6 +439,19 @@ function writeProxyUpgradeResponse(socket, proxyRes) {
   socket.write("\r\n");
 }
 
+function writeUpgradeFailureResponse(socket, statusCode, message) {
+  const status = Number(statusCode) || 502;
+  const text = String(message || "WebSocket upgrade failed.");
+  const body = `${text}\n`;
+  socket.write(`HTTP/1.1 ${status} Bad Gateway\r\n`);
+  socket.write("Content-Type: text/plain; charset=utf-8\r\n");
+  socket.write(`Content-Length: ${Buffer.byteLength(body, "utf8")}\r\n`);
+  socket.write("Connection: close\r\n");
+  socket.write("Cache-Control: no-store\r\n");
+  socket.write("\r\n");
+  socket.end(body);
+}
+
 function proxyDashboardUpgrade(req, socket, head) {
   const dashboardHostHeader = DASHBOARD_HOST + ":" + DASHBOARD_PORT;
   const proxy = http.request({
@@ -475,8 +488,15 @@ function proxyDashboardUpgrade(req, socket, head) {
   });
 
   proxy.on("response", (proxyRes) => {
-    writeProxyUpgradeResponse(socket, proxyRes);
-    proxyRes.pipe(socket);
+    const upstreamStatus = Number(proxyRes.statusCode || 0);
+    proxyRes.resume();
+    writeUpgradeFailureResponse(
+      socket,
+      502,
+      upstreamStatus
+        ? `Upstream returned ${upstreamStatus} instead of switching protocols.`
+        : "Upstream rejected WebSocket upgrade.",
+    );
   });
 
   proxy.on("error", () => {

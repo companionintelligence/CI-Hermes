@@ -117,6 +117,30 @@ yaml_single_quote() {
   printf "%s" "$1" | sed "s/'/''/g"
 }
 
+normalize_env_value() {
+  # Strip CR from CRLF files and one matching pair of surrounding quotes.
+  value="$1"
+  cr_char="$(printf '\r')"
+  value="${value%${cr_char}}"
+
+  case "${value}" in
+    \"*\")
+      if [ "${value%\"}" != "${value}" ]; then
+        value="${value#\"}"
+        value="${value%\"}"
+      fi
+      ;;
+    \'*\')
+      if [ "${value%\'}" != "${value}" ]; then
+        value="${value#\'}"
+        value="${value%\'}"
+      fi
+      ;;
+  esac
+
+  printf '%s' "${value}"
+}
+
 main() {
   if [ ! -d "${DATA_DIR}" ]; then
     log "WARN: ${DATA_DIR} does not exist; skipping"
@@ -163,8 +187,9 @@ main() {
   OUT_CONFIG="${DATA_DIR}/config.yaml"
   if grep -q "^HERMES_DEFAULT_MODEL=" "${OUT_ENV}" || grep -q "^HERMES_DEFAULT_MODEL_BACKEND_ID=" "${OUT_ENV}"; then
     # Extract model name from env file (prefer HERMES_DEFAULT_MODEL)
-    model_name=$(grep "^HERMES_DEFAULT_MODEL=" "${OUT_ENV}" | cut -d= -f2- | head -n 1)
-    [ -z "${model_name}" ] && model_name=$(grep "^HERMES_DEFAULT_MODEL_BACKEND_ID=" "${OUT_ENV}" | cut -d= -f2- | head -n 1)
+    model_name_raw=$(grep "^HERMES_DEFAULT_MODEL=" "${OUT_ENV}" | cut -d= -f2- | head -n 1)
+    [ -z "${model_name_raw}" ] && model_name_raw=$(grep "^HERMES_DEFAULT_MODEL_BACKEND_ID=" "${OUT_ENV}" | cut -d= -f2- | head -n 1)
+    model_name=$(normalize_env_value "${model_name_raw}")
     
     if [ -n "${model_name}" ]; then
       # Only write config.yaml if it doesn't exist or is empty
