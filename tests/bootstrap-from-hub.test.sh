@@ -217,7 +217,7 @@ fixture=$'HERMES_DEFAULT_MODEL="qwen3.5:9b"\n'
 run_with_fixture_in_dir "${fixture}" "${data_dir}"
 config_out="$(cat "${data_dir}/config.yaml")"
 assert_contains "unwrapped model value" "default: 'qwen3.5:9b'" "${config_out}"
-assert_not_contains "wrapped quotes removed" "default: '"'"'qwen3.5:9b'"'"''" "${config_out}"
+assert_not_contains "wrapped quotes removed" "default: '\"qwen3.5:9b\"'" "${config_out}"
 rm -rf "${data_dir}"
 
 # ─── Test 9: CRLF model values do not leak carriage returns into YAML ────────
