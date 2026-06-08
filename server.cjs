@@ -112,10 +112,7 @@ function normalizeHostName(hostValue) {
     return "";
   }
   // Remove optional :port suffix and lowercase for robust same-origin checks.
-  return String(hostValue)
-    .trim()
-    .toLowerCase()
-    .replace(/:\d+$/, "");
+  return String(hostValue).trim().toLowerCase().replace(/:\d+$/, "");
 }
 
 function clearPtyCleanupTimer() {
@@ -259,6 +256,84 @@ function blockGatewayRestart(req, res) {
   );
 }
 
+function buildCiAuthMePayload(req) {
+  const rawUserHeader = String(req.headers["x-ci-hub-user"] || "").trim();
+  let user = {
+    id: "ci-user",
+    username: "ci-user",
+    name: "CI User",
+    email: "",
+    roles: [],
+    permissions: [],
+    identities: [],
+    organizations: [],
+  };
+
+  if (rawUserHeader) {
+    if (rawUserHeader.startsWith("{")) {
+      try {
+        const parsed = JSON.parse(rawUserHeader);
+        if (parsed && typeof parsed === "object") {
+          user = {
+            ...user,
+            ...parsed,
+            roles: Array.isArray(parsed.roles) ? parsed.roles : [],
+            permissions: Array.isArray(parsed.permissions)
+              ? parsed.permissions
+              : [],
+            identities: Array.isArray(parsed.identities)
+              ? parsed.identities
+              : [],
+            organizations: Array.isArray(parsed.organizations)
+              ? parsed.organizations
+              : [],
+          };
+        }
+      } catch (e) {
+        user = {
+          ...user,
+          id: rawUserHeader,
+          username: rawUserHeader,
+          name: rawUserHeader,
+        };
+      }
+    }
+
+    if (rawUserHeader && !rawUserHeader.startsWith("{")) {
+      user = {
+        ...user,
+        id: rawUserHeader,
+        username: rawUserHeader,
+        name: rawUserHeader,
+      };
+    }
+  }
+
+  return {
+    authenticated: false,
+    auth_required: false,
+    login_url: "/login",
+    providers: [],
+    auth_providers: [],
+    oauth_providers: [],
+    methods: [],
+    identities: [],
+    organizations: [],
+    sessions: [],
+    source: "ci-hub-forwardauth",
+    user,
+  };
+}
+
+function handleCiAuthMe(req, res) {
+  const payload = { detail: "Unauthorized" };
+  res.writeHead(401, {
+    "Content-Type": "application/json; charset=utf-8",
+    "Cache-Control": "no-store",
+  });
+  res.end(JSON.stringify(payload));
+}
+
 // Proxy HTTP requests to the dashboard container
 function proxyToDashboard(req, res) {
   const options = {
@@ -326,6 +401,73 @@ function proxyToDashboard(req, res) {
   req.pipe(proxy);
 }
 
+function writeProxyUpgradeResponse(socket, proxyRes) {
+  const statusCode = proxyRes.statusCode || 101;
+  const statusMessage = proxyRes.statusMessage || "Switching Protocols";
+  socket.write(`HTTP/1.1 ${statusCode} ${statusMessage}\r\n`);
+
+  for (const [key, value] of Object.entries(proxyRes.headers || {})) {
+    if (Array.isArray(value)) {
+      for (const entry of value) {
+        socket.write(`${key}: ${entry}\r\n`);
+      }
+      continue;
+    }
+    if (value !== undefined) {
+      socket.write(`${key}: ${value}\r\n`);
+    }
+  }
+
+  socket.write("\r\n");
+}
+
+function proxyDashboardUpgrade(req, socket, head) {
+  const dashboardHostHeader = DASHBOARD_HOST + ":" + DASHBOARD_PORT;
+  const proxy = http.request({
+    hostname: DASHBOARD_HOST,
+    port: DASHBOARD_PORT,
+    path: req.url,
+    method: req.method,
+    headers: {
+      ...req.headers,
+      host: dashboardHostHeader,
+      origin: `http://${dashboardHostHeader}`,
+    },
+  });
+
+  proxy.on("upgrade", (proxyRes, proxySocket, proxyHead) => {
+    writeProxyUpgradeResponse(socket, proxyRes);
+
+    if (head && head.length) {
+      proxySocket.write(head);
+    }
+    if (proxyHead && proxyHead.length) {
+      socket.write(proxyHead);
+    }
+
+    proxySocket.pipe(socket);
+    socket.pipe(proxySocket);
+
+    proxySocket.on("error", () => {
+      socket.destroy();
+    });
+    socket.on("error", () => {
+      proxySocket.destroy();
+    });
+  });
+
+  proxy.on("response", (proxyRes) => {
+    writeProxyUpgradeResponse(socket, proxyRes);
+    proxyRes.pipe(socket);
+  });
+
+  proxy.on("error", () => {
+    socket.end("HTTP/1.1 502 Bad Gateway\r\n\r\n");
+  });
+
+  proxy.end();
+}
+
 const server = http.createServer((req, res) => {
   const requestUrl = new URL(req.url || "/", "http://localhost");
   const requestPath = requestUrl.pathname.replace(/\/+$/, "");
@@ -359,6 +501,14 @@ const server = http.createServer((req, res) => {
   // instead of restarting the gateway container managed by CI marketplace/Docker.
   if (req.method === "POST" && requestPath === "/api/gateway/restart") {
     blockGatewayRestart(req, res);
+    return;
+  }
+
+  // In CI marketplace, request auth is enforced upstream by Traefik forward-auth.
+  // Hermes dashboard's own /api/auth/me can return 401 without dashboard-local
+  // auth state, which triggers noisy browser errors despite valid app access.
+  if (req.method === "GET" && requestPath === "/api/auth/me") {
+    handleCiAuthMe(req, res);
     return;
   }
 
@@ -462,7 +612,7 @@ server.on("upgrade", (req, socket, head) => {
     return;
   }
 
-  socket.end("HTTP/1.1 404 Not Found\r\n\r\n");
+  proxyDashboardUpgrade(req, socket, head);
 });
 
 server.listen(PORT, "0.0.0.0", () => {
