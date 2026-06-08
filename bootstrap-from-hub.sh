@@ -168,7 +168,7 @@ main() {
         cat > "${OUT_CONFIG}" <<EOF
 model:
   provider: ollama
-  name: ${model_name}
+  default: ${model_name}
 EOF
         chmod 600 "${OUT_CONFIG}" 2>/dev/null || true
         log "wrote ${OUT_CONFIG} with provider=ollama"
