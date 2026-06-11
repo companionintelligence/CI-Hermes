@@ -87,13 +87,15 @@ class _CIClient:
             payload["platform"] = platform
         return self._post("/api/memory/turn", payload)
 
-    def note(self, content: str, source: str = "", title: str = "") -> dict:
-        """Store a raw memory fragment in ci.notes for later graph extraction."""
+    def note(self, content: str, source: str = "", title: str = "", session_id: str = "") -> dict:
+        """Store a raw agent memory fragment in ci.agent_memory for later graph extraction."""
         payload: dict = {"content": content}
         if source:
             payload["source"] = source
         if title:
             payload["title"] = title
+        if session_id:
+            payload["sessionId"] = session_id
         return self._post("/api/memory/note", payload)
 
     # ── Health ────────────────────────────────────────────────────────────────
@@ -493,11 +495,11 @@ class CompanionIntelligenceProvider(MemoryProvider):
     # ---------------------------------------------------------------------------
 
     def on_memory_write(self, action: str, target: str, content: str) -> None:
-        """Mirror Hermes memory writes (MEMORY.md / USER.md) to ci.notes.
+        """Mirror Hermes memory writes (MEMORY.md / USER.md) to ci.agent_memory.
 
         Called by the Hermes framework whenever it writes to one of its built-in
-        memory files.  We store the fragment verbatim so a future extraction job
-        can promote it into structured graph entities.
+        memory files.  We store the fragment verbatim so the compaction cron can
+        promote it into structured graph entities.
 
         Runs in a background thread so the agent is never blocked by the write.
         """
@@ -510,11 +512,14 @@ class CompanionIntelligenceProvider(MemoryProvider):
 
         client = self._client
         source = target or "memory"
+        # Capture session_id before spawning the thread (instance attr may change).
+        session_id = self._session_id
 
         def _run() -> None:
             try:
-                client.note(content, source=source)
-                logger.debug("CI-Server on_memory_write stored  action=%s target=%s", action, target)
+                client.note(content, source=source, session_id=session_id)
+                logger.debug("CI-Server on_memory_write stored  action=%s target=%s session=%s",
+                             action, target, session_id)
             except Exception as exc:
                 logger.debug("CI-Server on_memory_write failed: %s", exc)
 
