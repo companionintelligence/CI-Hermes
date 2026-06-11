@@ -33,6 +33,7 @@ On startup, `/app/bootstrap-ci-context.sh` idempotently:
 - Enables the bundled `ci-runtime` plugin in `/opt/data/config.yaml`, so Hermes injects compact CI runtime context before LLM calls through the official `pre_llm_call` hook.
 - Adds the managed skills directory to `skills.external_dirs` in `/opt/data/config.yaml` when the config exists.
 
+To use it, simply enable it like any other hermes memory system by running `hermes memory setup` and following the instructions. You can get your API key for authentication from the CI-Server settings page.
 ## License
 
 MIT
