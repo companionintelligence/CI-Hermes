@@ -22,6 +22,7 @@ import shutil
 import sys
 import time
 from pathlib import Path
+from typing import Optional
 
 # ---------------------------------------------------------------------------
 # Env
@@ -36,7 +37,10 @@ CI_ENABLED = os.environ.get("CI_SERVER_ENABLED", "false").lower() in ("true", "1
 # ---------------------------------------------------------------------------
 
 _SCRIPT_DIR = Path(__file__).parent
-_PLUGIN_SRC = _SCRIPT_DIR / "companionintelligence"
+_PLUGIN_SRC_CANDIDATES = [
+    _SCRIPT_DIR / "companionintelligence",
+    _SCRIPT_DIR / "ci-context" / "plugins" / "companionintelligence",
+]
 
 CONFIG_PATHS = [
     os.path.expanduser("~/.hermes/config.yaml"),
@@ -81,6 +85,13 @@ def backup_config(path: str) -> None:
         shutil.copy(path, backup)
 
 
+def find_plugin_src() -> Optional[Path]:
+    for candidate in _PLUGIN_SRC_CANDIDATES:
+        if candidate.is_dir():
+            return candidate
+    return None
+
+
 # ---------------------------------------------------------------------------
 # Step 1 — Install the MemoryProvider plugin (always runs)
 # ---------------------------------------------------------------------------
@@ -90,7 +101,9 @@ def install_plugin(hermes_home: Path) -> bool:
 
     Returns True if the plugin was installed or updated, False if skipped.
     """
-    if not _PLUGIN_SRC.is_dir():
+    plugin_src = find_plugin_src()
+
+    if not plugin_src:
         print("[CI-Server] Plugin source not found — skipping plugin installation.")
         return False
 
@@ -101,7 +114,7 @@ def install_plugin(hermes_home: Path) -> bool:
     if dest.exists():
         shutil.rmtree(dest)
 
-    shutil.copytree(str(_PLUGIN_SRC), str(dest))
+    shutil.copytree(str(plugin_src), str(dest))
     print(f"[CI-Server] Plugin installed → {dest}")
     return True
 
@@ -116,7 +129,8 @@ def has_ci_mcp_server(config_text: str) -> bool:
 
 def patch_mcp(config_text: str) -> str:
     """Append ci_server MCP entry under mcp_servers:."""
-    mcp_url = CI_URL.rstrip("/") + "/api/mcp"
+    ci_url = CI_URL.rstrip("/")
+    mcp_url = ci_url if ci_url.endswith("/api/mcp") else ci_url + "/api/mcp"
     lines = [
         "  ci_server:",
         f'    url: "{mcp_url}"',

@@ -56,13 +56,21 @@ def _load_config() -> dict:
     return config
 
 
+def _normalize_base_url(base_url: str) -> str:
+    """Return the CI-Server gateway base URL, accepting the old MCP URL value."""
+    base = base_url.strip().rstrip("/")
+    if base.endswith("/api/mcp"):
+        return base[: -len("/api/mcp")]
+    return base
+
+
 # ---------------------------------------------------------------------------
 # HTTP client — urllib only, zero extra dependencies
 # ---------------------------------------------------------------------------
 
 class _CIClient:
     def __init__(self, base_url: str, token: str, timeout: float = _REQUEST_TIMEOUT):
-        self._base = base_url.rstrip("/")
+        self._base = _normalize_base_url(base_url)
         self._token = token
         self._timeout = timeout
 
@@ -87,7 +95,7 @@ class _CIClient:
             payload["platform"] = platform
         return self._post("/api/memory/turn", payload)
 
-    def note(self, content: str, source: str = "", title: str = "", session_id: str = "") -> dict:
+    def write(self, content: str, source: str = "", title: str = "", session_id: str = "") -> dict:
         """Store a raw agent memory fragment in ci.agent_memory for later graph extraction."""
         payload: dict = {"content": content}
         if source:
@@ -96,7 +104,7 @@ class _CIClient:
             payload["title"] = title
         if session_id:
             payload["sessionId"] = session_id
-        return self._post("/api/memory/note", payload)
+        return self._post("/api/memory/write", payload)
 
     # ── Health ────────────────────────────────────────────────────────────────
 
@@ -517,7 +525,7 @@ class CompanionIntelligenceProvider(MemoryProvider):
 
         def _run() -> None:
             try:
-                client.note(content, source=source, session_id=session_id)
+                client.write(content, source=source, session_id=session_id)
                 logger.debug("CI-Server on_memory_write stored  action=%s target=%s session=%s",
                              action, target, session_id)
             except Exception as exc:
