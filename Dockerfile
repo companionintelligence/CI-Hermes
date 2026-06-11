@@ -1,8 +1,8 @@
 # CI-Hermes
 # Web terminal wrapper around the official Hermes Agent image for the CI marketplace
 
-# To update: docker buildx imagetools inspect nousresearch/hermes-agent:v2026.5.16
-FROM nousresearch/hermes-agent:v2026.5.16@sha256:b6e41c155d6bfce5ad83c5d0fec670086db8a43250e4511c9474134be5482d33
+# To update: docker buildx imagetools inspect nousresearch/hermes-agent:v2026.6.5
+FROM nousresearch/hermes-agent:v2026.6.5@sha256:9ad3b04ec916ea2c2da22358fd43b024c788d74073210695af88bfc2e63869b4
 
 USER root
 
@@ -20,11 +20,11 @@ RUN cd /app && npm install --omit=dev
 # Bundle CI-managed context in the image. Hermes enables the runtime plugin
 # and external skill directory from config.yaml at startup; the files themselves
 # stay outside /opt/data so the agent cannot edit managed instructions.
-COPY server.cjs terminal.html logo.webp entrypoint.sh start-hermes.sh bootstrap-ci-context.sh bootstrap-from-hub.sh configure-ci-server.py /app/
+COPY server.cjs terminal.html logo.webp entrypoint.sh gateway-entrypoint.sh start-hermes.sh bootstrap-ci-context.sh bootstrap-from-hub.sh configure-ci-server.py /app/
 COPY ci-context/skills /app/ci-context/skills
 COPY ci-context/plugins/ci-runtime /opt/hermes/plugins/ci-runtime
 COPY ci-context/plugins/companionintelligence /app/ci-context/plugins/companionintelligence
-RUN chmod +x /app/entrypoint.sh /app/start-hermes.sh /app/bootstrap-ci-context.sh /app/bootstrap-from-hub.sh
+RUN chmod +x /app/entrypoint.sh /app/gateway-entrypoint.sh /app/start-hermes.sh /app/bootstrap-ci-context.sh /app/bootstrap-from-hub.sh
 
 # Ensure hermes venv is in PATH everywhere. The agent's terminal tool spawns
 # subprocesses that may not inherit Docker ENV, so we cover all cases:

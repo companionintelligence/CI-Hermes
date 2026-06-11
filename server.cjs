@@ -13,20 +13,356 @@ const SETUP_TOKEN = process.env.APP_SEED || "";
 const DATA_DIR = "/opt/data";
 const DASHBOARD_HOST = "127.0.0.1";
 const DASHBOARD_PORT = 9119;
+const DEFAULT_PTY_IDLE_GRACE_MS = 1800000;
+const ALLOW_SAME_ORIGIN_WS_FALLBACK = ["1", "true", "yes", "on"].includes(
+  String(process.env.ALLOW_SAME_ORIGIN_WS_FALLBACK || "").toLowerCase(),
+);
+const HUB_ENV_FILE = path.join(DATA_DIR, ".env.hub-bootstrap");
+const HUB_ENV_PREFIXES = [
+  "OPENAI_",
+  "HERMES_",
+  "CUSTOM_",
+  "ANTHROPIC_",
+  "GEMINI_",
+  "GOOGLE_",
+  "OLLAMA_",
+];
+
+function isAllowedHubEnvKey(key) {
+  return HUB_ENV_PREFIXES.some((prefix) => key.startsWith(prefix));
+}
+
+function loadHubBootstrapEnv() {
+  const out = {};
+  try {
+    if (!fs.existsSync(HUB_ENV_FILE)) {
+      return out;
+    }
+    const text = fs.readFileSync(HUB_ENV_FILE, "utf8");
+    for (const rawLine of text.split(/\r?\n/)) {
+      const line = rawLine.trim();
+      if (!line || line.startsWith("#")) {
+        continue;
+      }
+      const eqIdx = line.indexOf("=");
+      if (eqIdx <= 0) {
+        continue;
+      }
+      const key = line.slice(0, eqIdx).trim();
+      if (!isAllowedHubEnvKey(key)) {
+        continue;
+      }
+      let value = line.slice(eqIdx + 1);
+      if (
+        (value.startsWith('"') && value.endsWith('"')) ||
+        (value.startsWith("'") && value.endsWith("'"))
+      ) {
+        value = value.slice(1, -1);
+      }
+      out[key] = value;
+    }
+  } catch (e) {
+    console.warn(`Failed to read ${HUB_ENV_FILE}: ${e.message}`);
+  }
+  return out;
+}
+
+function parseNonNegativeInt(rawValue, fallbackValue) {
+  const parsed = Number.parseInt(String(rawValue || ""), 10);
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    return fallbackValue;
+  }
+  return parsed;
+}
+
+// Keep PTY alive long enough for browser reconnects without resetting chat context.
+const PTY_IDLE_GRACE_MS = parseNonNegativeInt(
+  process.env.PTY_IDLE_GRACE_MS,
+  DEFAULT_PTY_IDLE_GRACE_MS,
+);
 
 let ptyProcess = null;
+let activeWs = null;
+let ptyCleanupTimer = null;
 
 const TERMINAL_HTML = fs.readFileSync("/app/terminal.html", "utf8");
 const LOGO = fs.readFileSync(path.join(__dirname, "logo.webp"));
 
+function stripLeakedOscResponses(data) {
+  if (typeof data !== "string" || !data) {
+    return data;
+  }
+
+  // Some shells/plugins query OSC 11 (background color). In web terminals this
+  // can occasionally leak back into stdin as literal text like
+  // "]11;rgb:1111/1111/1313". Strip those fragments before they hit the PTY.
+  return data
+    .replace(
+      /\u001b\]11;rgb:[0-9a-fA-F]{2,4}\/[0-9a-fA-F]{2,4}\/[0-9a-fA-F]{2,4}(?:\u0007|\u001b\\)/g,
+      "",
+    )
+    .replace(
+      /\]11;rgb:[0-9a-fA-F]{2,4}\/[0-9a-fA-F]{2,4}\/[0-9a-fA-F]{2,4}/g,
+      "",
+    );
+}
+
+function normalizeHostName(hostValue) {
+  if (!hostValue) {
+    return "";
+  }
+  // Host/port splitting is handled separately; keep the hostname untouched
+  // (except casing/whitespace) so IPv6 hosts like ::1 are not mangled.
+  return String(hostValue).trim().toLowerCase();
+}
+
+function parseHostAndPort(hostValue) {
+  const raw = String(hostValue || "").trim();
+  if (!raw) {
+    return { hostname: "", port: "" };
+  }
+
+  // Support bracketed IPv6 hosts: [::1]:9119
+  if (raw.startsWith("[")) {
+    const end = raw.indexOf("]");
+    if (end !== -1) {
+      const hostname = raw.slice(1, end).toLowerCase();
+      const rest = raw.slice(end + 1);
+      if (rest.startsWith(":")) {
+        return { hostname, port: rest.slice(1) };
+      }
+      return { hostname, port: "" };
+    }
+  }
+
+  const parts = raw.split(":");
+  if (parts.length > 1) {
+    const maybePort = parts[parts.length - 1];
+    if (/^\d+$/.test(maybePort)) {
+      return {
+        hostname: parts.slice(0, -1).join(":").toLowerCase(),
+        port: maybePort,
+      };
+    }
+  }
+
+  return { hostname: raw.toLowerCase(), port: "" };
+}
+
+function defaultPortForProto(proto) {
+  const value = String(proto || "").toLowerCase();
+  if (value === "https" || value === "wss") {
+    return "443";
+  }
+  return "80";
+}
+
+function resolveRequestPort(req, parsedHost, fallbackPort) {
+  if (parsedHost.port) {
+    return parsedHost.port;
+  }
+
+  const forwardedProto = String(req.headers["x-forwarded-proto"] || "")
+    .split(",")[0]
+    .trim()
+    .toLowerCase();
+
+  // Some proxies report websocket transport metadata (ws/80) here even when
+  // the browser Origin is https/443. In that case, prefer Origin-derived port
+  // for same-origin validation.
+  if ((forwardedProto === "ws" || forwardedProto === "wss") && fallbackPort) {
+    return String(fallbackPort);
+  }
+
+  const forwardedPort = String(req.headers["x-forwarded-port"] || "").trim();
+  if (/^\d+$/.test(forwardedPort)) {
+    return forwardedPort;
+  }
+
+  if (!forwardedProto && fallbackPort) {
+    return String(fallbackPort);
+  }
+  return defaultPortForProto(forwardedProto || "http");
+}
+
+function clearPtyCleanupTimer() {
+  if (ptyCleanupTimer) {
+    clearTimeout(ptyCleanupTimer);
+    ptyCleanupTimer = null;
+  }
+}
+
+function killPty() {
+  if (ptyProcess) {
+    try {
+      ptyProcess.kill();
+    } catch (e) {}
+    ptyProcess = null;
+  }
+}
+
+function schedulePtyCleanup() {
+  clearPtyCleanupTimer();
+  ptyCleanupTimer = setTimeout(() => {
+    const hasActiveClient = activeWs && activeWs.readyState === WebSocket.OPEN;
+    if (!hasActiveClient) {
+      killPty();
+      console.log(
+        "No active terminal client; PTY closed after idle grace period",
+      );
+    }
+    ptyCleanupTimer = null;
+  }, PTY_IDLE_GRACE_MS);
+}
+
+function startPtyIfNeeded() {
+  if (ptyProcess) {
+    return;
+  }
+
+  const sessionPty = pty.spawn("/app/start-hermes.sh", [], {
+    name: "xterm-256color",
+    cols: 80,
+    rows: 24,
+    cwd: DATA_DIR,
+    env: {
+      ...process.env,
+      ...loadHubBootstrapEnv(),
+      TERM: "xterm-256color",
+      HOME: DATA_DIR,
+    },
+  });
+
+  ptyProcess = sessionPty;
+
+  sessionPty.onData((data) => {
+    try {
+      if (activeWs && activeWs.readyState === WebSocket.OPEN) {
+        activeWs.send(JSON.stringify({ type: "output", data }));
+      }
+    } catch (e) {
+      console.error("Error sending PTY output:", e.message);
+    }
+  });
+
+  sessionPty.onExit(({ exitCode }) => {
+    console.log(`PTY exited with code ${exitCode}`);
+    const wasActiveSession = ptyProcess === sessionPty;
+    try {
+      if (activeWs && activeWs.readyState === WebSocket.OPEN) {
+        activeWs.send(JSON.stringify({ type: "exit", code: exitCode }));
+      }
+    } catch (e) {
+      console.error("Error sending exit message:", e.message);
+    }
+    if (wasActiveSession) {
+      ptyProcess = null;
+    }
+  });
+}
+
+function injectTerminalShortcut(html) {
+  if (
+    !html ||
+    typeof html !== "string" ||
+    html.includes("ci-terminal-shortcut")
+  ) {
+    return html;
+  }
+
+  const styleBlock = `<style id="ci-terminal-shortcut-style">\n.ci-terminal-shortcut {\n  position: fixed;\n  right: 18px;\n  bottom: 18px;\n  z-index: 2147483000;\n  display: inline-flex;\n  align-items: center;\n  gap: 6px;\n  padding: 10px 14px;\n  border-radius: 10px;\n  border: 1px solid rgba(255, 191, 0, 0.35);\n  background: rgba(18, 18, 18, 0.92);\n  color: #FFBF00;\n  text-decoration: none;\n  font-family: system-ui, -apple-system, Segoe UI, sans-serif;\n  font-size: 13px;\n  font-weight: 600;\n  line-height: 1;\n  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);\n}\n.ci-terminal-shortcut:hover {\n  border-color: #FFBF00;\n  color: #FFD75A;\n}\n@media (max-width: 700px) {\n  .ci-terminal-shortcut {\n    right: 12px;\n    bottom: 12px;\n    padding: 9px 12px;\n    font-size: 12px;\n  }\n}\n</style>`;
+
+  const buttonMarkup =
+    '<a class="ci-terminal-shortcut" href="/terminal" aria-label="Open Hermes terminal">Open Terminal</a>';
+
+  let out = html;
+  if (/<\/head>/i.test(out)) {
+    out = out.replace(/<\/head>/i, `${styleBlock}</head>`);
+  } else {
+    out = styleBlock + out;
+  }
+
+  if (/<body[^>]*>/i.test(out)) {
+    out = out.replace(/<body[^>]*>/i, (match) => `${match}${buttonMarkup}`);
+  } else {
+    out += buttonMarkup;
+  }
+
+  return out;
+}
+
+function shouldProxyResponseHaveBody(proxyRes, method) {
+  const statusCode = Number(proxyRes.statusCode || 0);
+  if (String(method || "").toUpperCase() === "HEAD") {
+    return false;
+  }
+  if (statusCode === 204 || statusCode === 304) {
+    return false;
+  }
+  if (statusCode >= 100 && statusCode < 200) {
+    return false;
+  }
+  if (statusCode === 205) {
+    return false;
+  }
+  return true;
+}
+
 function blockHermesUpdate(req, res) {
-  res.writeHead(403, { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store" });
+  res.writeHead(403, {
+    "Content-Type": "text/plain; charset=utf-8",
+    "Cache-Control": "no-store",
+  });
   res.end("Hermes updates are managed by CI marketplace app updates.");
 }
 
 function blockGatewayRestart(req, res) {
-  res.writeHead(403, { "Content-Type": "text/plain; charset=utf-8", "Cache-Control": "no-store" });
-  res.end("Gateway restarts are managed by CI marketplace. Restart Hermes from the CI marketplace homescreen.");
+  res.writeHead(403, {
+    "Content-Type": "text/plain; charset=utf-8",
+    "Cache-Control": "no-store",
+  });
+  res.end(
+    "Gateway restarts are managed by CI marketplace. Restart Hermes from the CI marketplace homescreen.",
+  );
+}
+
+function handleCiAuthMe(req, res) {
+  // Keep dashboard auth semantics unchanged to avoid UI assumptions on a custom
+  // auth payload shape. Access control is still enforced upstream by CI-Hub
+  // forward-auth at Traefik layer.
+  const payload = { detail: "Unauthorized" };
+  res.writeHead(401, {
+    "Content-Type": "application/json; charset=utf-8",
+    "Cache-Control": "no-store",
+  });
+  res.end(JSON.stringify(payload));
+}
+
+function isSameOriginUpgrade(req) {
+  try {
+    const origin = String(req.headers.origin || "").trim();
+    if (!origin) {
+      return false;
+    }
+    const originUrl = new URL(origin);
+    const requestHost = parseHostAndPort(req.headers.host || "");
+    const originHost = parseHostAndPort(originUrl.host || "");
+
+    const requestHostName = normalizeHostName(requestHost.hostname);
+    const originHostName = normalizeHostName(originHost.hostname);
+    if (!requestHostName || requestHostName !== originHostName) {
+      return false;
+    }
+
+    const originPort =
+      originHost.port ||
+      defaultPortForProto(originUrl.protocol.replace(":", ""));
+    const requestPort = resolveRequestPort(req, requestHost, originPort);
+
+    return requestPort === originPort;
+  } catch (e) {
+    return false;
+  }
 }
 
 // Proxy HTTP requests to the dashboard container
@@ -38,6 +374,8 @@ function proxyToDashboard(req, res) {
     method: req.method,
     headers: {
       ...req.headers,
+      // Keep responses uncompressed so we can inject lightweight CI UI affordances.
+      "accept-encoding": "identity",
       // Hermes validates Host against its loopback dashboard bind address.
       // Rewriting is safe in CI marketplace because app_proxy authenticates requests
       // before they reach this wrapper; direct network exposure is not supported.
@@ -46,16 +384,139 @@ function proxyToDashboard(req, res) {
   };
 
   const proxy = http.request(options, (proxyRes) => {
-    res.writeHead(proxyRes.statusCode, proxyRes.headers);
-    proxyRes.pipe(res);
+    const contentType = String(
+      proxyRes.headers["content-type"] || "",
+    ).toLowerCase();
+    const shouldInject = contentType.includes("text/html");
+    const bodyAllowed = shouldProxyResponseHaveBody(proxyRes, req.method);
+
+    if (!bodyAllowed) {
+      res.writeHead(proxyRes.statusCode || 200, proxyRes.headers);
+      proxyRes.resume();
+      res.end();
+      return;
+    }
+
+    if (!shouldInject) {
+      res.writeHead(proxyRes.statusCode, proxyRes.headers);
+      proxyRes.pipe(res);
+      return;
+    }
+
+    let body = "";
+    proxyRes.setEncoding("utf8");
+    proxyRes.on("data", (chunk) => {
+      body += chunk;
+    });
+    proxyRes.on("end", () => {
+      const modified = injectTerminalShortcut(body);
+      const headers = { ...proxyRes.headers };
+      delete headers["content-length"];
+      delete headers["content-encoding"];
+      delete headers.etag;
+      res.writeHead(proxyRes.statusCode || 200, headers);
+      res.end(modified);
+    });
   });
 
   proxy.on("error", () => {
-    res.writeHead(502, { "Content-Type": "text/html", "Cache-Control": "no-store" });
-    res.end("<html><body><h2>Dashboard is starting...</h2><p>Please wait a moment and refresh.</p></body></html>");
+    res.writeHead(502, {
+      "Content-Type": "text/html",
+      "Cache-Control": "no-store",
+    });
+    res.end(
+      "<html><body><h2>Dashboard is starting...</h2><p>Please wait a moment and refresh.</p></body></html>",
+    );
   });
 
   req.pipe(proxy);
+}
+
+function writeProxyUpgradeResponse(socket, proxyRes) {
+  const statusCode = proxyRes.statusCode || 101;
+  const statusMessage = proxyRes.statusMessage || "Switching Protocols";
+  socket.write(`HTTP/1.1 ${statusCode} ${statusMessage}\r\n`);
+
+  for (const [key, value] of Object.entries(proxyRes.headers || {})) {
+    if (Array.isArray(value)) {
+      for (const entry of value) {
+        socket.write(`${key}: ${entry}\r\n`);
+      }
+      continue;
+    }
+    if (value !== undefined) {
+      socket.write(`${key}: ${value}\r\n`);
+    }
+  }
+
+  socket.write("\r\n");
+}
+
+function writeUpgradeFailureResponse(socket, statusCode, message) {
+  const status = Number(statusCode) || 502;
+  const text = String(message || "WebSocket upgrade failed.");
+  const body = `${text}\n`;
+  socket.write(`HTTP/1.1 ${status} Bad Gateway\r\n`);
+  socket.write("Content-Type: text/plain; charset=utf-8\r\n");
+  socket.write(`Content-Length: ${Buffer.byteLength(body, "utf8")}\r\n`);
+  socket.write("Connection: close\r\n");
+  socket.write("Cache-Control: no-store\r\n");
+  socket.write("\r\n");
+  socket.end(body);
+}
+
+function proxyDashboardUpgrade(req, socket, head) {
+  const dashboardHostHeader = DASHBOARD_HOST + ":" + DASHBOARD_PORT;
+  const proxy = http.request({
+    hostname: DASHBOARD_HOST,
+    port: DASHBOARD_PORT,
+    path: req.url,
+    method: req.method,
+    headers: {
+      ...req.headers,
+      host: dashboardHostHeader,
+      origin: `http://${dashboardHostHeader}`,
+    },
+  });
+
+  proxy.on("upgrade", (proxyRes, proxySocket, proxyHead) => {
+    writeProxyUpgradeResponse(socket, proxyRes);
+
+    if (head && head.length) {
+      proxySocket.write(head);
+    }
+    if (proxyHead && proxyHead.length) {
+      socket.write(proxyHead);
+    }
+
+    proxySocket.pipe(socket);
+    socket.pipe(proxySocket);
+
+    proxySocket.on("error", () => {
+      socket.destroy();
+    });
+    socket.on("error", () => {
+      proxySocket.destroy();
+    });
+  });
+
+  proxy.on("response", (proxyRes) => {
+    const upstreamStatus = Number(proxyRes.statusCode || 0);
+    proxyRes.resume();
+    writeUpgradeFailureResponse(
+      socket,
+      502,
+      upstreamStatus
+        ? `Upstream returned ${upstreamStatus} instead of switching protocols.`
+        : "Upstream rejected WebSocket upgrade.",
+    );
+  });
+
+  proxy.on("error", () => {
+    socket.end("HTTP/1.1 502 Bad Gateway\r\n\r\n");
+  });
+
+  proxy.end();
 }
 
 const server = http.createServer((req, res) => {
@@ -71,7 +532,10 @@ const server = http.createServer((req, res) => {
 
   // Serve static assets for terminal UI
   if (requestPath === "/logo.webp") {
-    res.writeHead(200, { "Content-Type": "image/webp", "Cache-Control": "public, max-age=86400" });
+    res.writeHead(200, {
+      "Content-Type": "image/webp",
+      "Cache-Control": "public, max-age=86400",
+    });
     res.end(LOGO);
     return;
   }
@@ -91,6 +555,14 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // In CI marketplace, request auth is enforced upstream by Traefik forward-auth.
+  // Hermes dashboard's own /api/auth/me can return 401 without dashboard-local
+  // auth state, which triggers noisy browser errors despite valid app access.
+  if (req.method === "GET" && requestPath === "/api/auth/me") {
+    handleCiAuthMe(req, res);
+    return;
+  }
+
   // Everything else proxied to dashboard (behind CI marketplace auth)
   proxyToDashboard(req, res);
 });
@@ -101,60 +573,32 @@ const wss = new WebSocket.Server({ noServer: true });
 wss.on("connection", (ws) => {
   console.log("Terminal WebSocket connected");
 
-  // One session at a time — kill any existing PTY (e.g. stale tab)
-  if (ptyProcess) {
-    try { ptyProcess.kill(); } catch (e) {}
-    ptyProcess = null;
+  clearPtyCleanupTimer();
+  if (activeWs && activeWs !== ws && activeWs.readyState === WebSocket.OPEN) {
+    try {
+      activeWs.close(1000, "Replaced by a newer terminal tab");
+    } catch (e) {}
   }
-
-  const sessionPty = pty.spawn("/app/start-hermes.sh", [], {
-    name: "xterm-256color",
-    cols: 80,
-    rows: 24,
-    cwd: DATA_DIR,
-    env: {
-      ...process.env,
-      TERM: "xterm-256color",
-      HOME: DATA_DIR,
-    },
-  });
-  ptyProcess = sessionPty;
-
-  sessionPty.onData((data) => {
-    try {
-      if (ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({ type: "output", data }));
-      }
-    } catch (e) {
-      console.error("Error sending PTY output:", e.message);
-    }
-  });
-
-  sessionPty.onExit(({ exitCode }) => {
-    console.log(`PTY exited with code ${exitCode}`);
-    const wasActiveSession = ptyProcess === sessionPty;
-    try {
-      if (ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({ type: "exit", code: exitCode }));
-      }
-    } catch (e) {
-      console.error("Error sending exit message:", e.message);
-    }
-    if (wasActiveSession) {
-      ptyProcess = null;
-    }
-  });
+  activeWs = ws;
+  startPtyIfNeeded();
 
   ws.on("message", (msg) => {
     try {
+      // Ignore events from stale/replaced sockets.
+      if (activeWs !== ws) {
+        return;
+      }
       const parsed = JSON.parse(msg);
-      if (ptyProcess !== sessionPty) {
+      if (!ptyProcess) {
         return;
       }
       if (parsed.type === "input") {
-        sessionPty.write(parsed.data);
+        const cleaned = stripLeakedOscResponses(parsed.data);
+        if (cleaned) {
+          ptyProcess.write(cleaned);
+        }
       } else if (parsed.type === "resize") {
-        sessionPty.resize(parsed.cols, parsed.rows);
+        ptyProcess.resize(parsed.cols, parsed.rows);
       }
     } catch (e) {
       console.error("Error processing terminal input:", e.message);
@@ -163,21 +607,41 @@ wss.on("connection", (ws) => {
 
   ws.on("close", () => {
     console.log("Terminal WebSocket closed");
-    if (ptyProcess === sessionPty) {
-      try { sessionPty.kill(); } catch (e) {}
-      ptyProcess = null;
+    if (activeWs === ws) {
+      activeWs = null;
+      schedulePtyCleanup();
     }
   });
 });
 
 server.on("upgrade", (req, socket, head) => {
-  const url = new URL(req.url, `http://${req.headers.host}`);
+  let url;
+  try {
+    const hostHeader = String(req.headers.host || "");
+    if (!hostHeader) {
+      throw new Error("Missing Host header");
+    }
+    url = new URL(req.url, `http://${hostHeader}`);
+  } catch (e) {
+    socket.write("HTTP/1.1 400 Bad Request\r\n\r\n");
+    socket.destroy();
+    return;
+  }
 
   if (url.pathname === "/ci/api/terminal") {
-    // Validate anti-CSWSH token
+    // Validate anti-CSWSH token.
     const provided = url.searchParams.get("token") || "";
-    if (!SETUP_TOKEN || provided.length !== SETUP_TOKEN.length ||
-        !crypto.timingSafeEqual(Buffer.from(provided), Buffer.from(SETUP_TOKEN))) {
+    const providedBuffer = Buffer.from(provided);
+    const tokenBuffer = Buffer.from(SETUP_TOKEN);
+    const tokenValid =
+      !!SETUP_TOKEN &&
+      providedBuffer.length === tokenBuffer.length &&
+      crypto.timingSafeEqual(providedBuffer, tokenBuffer);
+
+    const sameOrigin = isSameOriginUpgrade(req);
+
+    const allowSameOriginFallback = ALLOW_SAME_ORIGIN_WS_FALLBACK && sameOrigin;
+    if (!tokenValid && !allowSameOriginFallback) {
       socket.write("HTTP/1.1 403 Forbidden\r\n\r\n");
       socket.destroy();
       return;
@@ -188,7 +652,13 @@ server.on("upgrade", (req, socket, head) => {
     return;
   }
 
-  socket.end("HTTP/1.1 404 Not Found\r\n\r\n");
+  if (!isSameOriginUpgrade(req)) {
+    socket.write("HTTP/1.1 403 Forbidden\r\n\r\n");
+    socket.destroy();
+    return;
+  }
+
+  proxyDashboardUpgrade(req, socket, head);
 });
 
 server.listen(PORT, "0.0.0.0", () => {
@@ -198,8 +668,13 @@ server.listen(PORT, "0.0.0.0", () => {
 // Graceful shutdown
 process.on("SIGTERM", () => {
   console.log("Received SIGTERM, shutting down...");
-  if (ptyProcess) {
-    try { ptyProcess.kill(); } catch (e) {}
+  if (activeWs) {
+    try {
+      activeWs.close(1001, "Server shutting down");
+    } catch (e) {}
+    activeWs = null;
   }
+  clearPtyCleanupTimer();
+  killPty();
   server.close();
 });

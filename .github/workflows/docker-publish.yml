@@ -15,7 +15,7 @@ jobs:
     name: Build and push to GitHub Container Registry
     runs-on: ubuntu-22.04
     permissions:
-      contents: read
+      contents: write
       packages: write
     steps:
       - name: Checkout (workflow_run)
@@ -85,6 +85,16 @@ jobs:
         run: |
           set -euo pipefail
           docker buildx build \
-            --platform linux/amd64 \
+            --platform linux/amd64,linux/arm64 \
             --tag "${IMAGE_NAME}:${TAG}" \
             --push .
+
+      - name: Create or update GitHub Release
+        if: github.event_name == 'push'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG }}
+          name: ${{ env.TAG }}
+          generate_release_notes: true
+          draft: false
+          prerelease: false
