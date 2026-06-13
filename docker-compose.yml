@@ -10,6 +10,7 @@ services:
     user: "1000:1000"
     environment:
       APP_SEED: ${APP_SEED:-dev} # Provided by CI marketplace; fallback for local dev
+      GATEWAY_ALLOWED_USERS: ${GATEWAY_ALLOWED_USERS:-} # Set to your messaging user ID(s) to avoid default-deny gateway auth
       # Tells the dashboard to probe the gateway via HTTP instead of local PID detection
       GATEWAY_HEALTH_URL: http://hermes-gateway:8642
     ports:
@@ -34,6 +35,7 @@ services:
     environment:
       HERMES_UID: "1000"
       HERMES_GID: "1000"
+      GATEWAY_ALLOWED_USERS: ${GATEWAY_ALLOWED_USERS:-}
       # API server exposes the health endpoint the dashboard probes via GATEWAY_HEALTH_URL.
       # Must bind to 0.0.0.0 (not default 127.0.0.1) to be reachable from the web container.
       # Binding to 0.0.0.0 requires an API key — we reuse APP_SEED since the port is
