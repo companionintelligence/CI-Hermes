@@ -1,6 +1,32 @@
-# CI-Hermes
+<img width="512" height="512" alt="logo" src="https://github.com/user-attachments/assets/85774db5-bd25-4b82-88b2-05d0a58c0b28" />
+
+# Hermes - Companion Memory Edition
+
 
 > Web terminal and [official Hermes dashboard](https://hermes-agent.nousresearch.com/docs/user-guide/features/web-dashboard) for running [Hermes Agent](https://hermes-agent.nousresearch.com) on the Companion Intelligence (CI) marketplace.
+
+<img width="225" height="224" alt="logo-alt" src="https://github.com/user-attachments/assets/b4c0ae9d-9efc-43a1-986c-e829fd22add2" />
+
+## [Designed to run with Companion Memory](https://hub.ci.computer/store/ci-memory)
+
+### STANDALONE SETUP
+
+```
+hermes memory setup
+```
+### Point to running Companion Memory Server URL
+
+<img height="150" alt="434image" src="https://github.com/user-attachments/assets/ba285919-36cd-435f-946c-912dfbbad034" />
+
+Automatic Setup
+
+<img height="350" alt="2image" src="https://github.com/user-attachments/assets/e85091a4-3169-40c4-933a-5deabff679ca" />
+
+Select Memory provider
+
+<img height="300" alt="5image" src="https://github.com/user-attachments/assets/aba17970-b2d2-4842-b268-495bffdde2c8" />
+
+
 
 ⚠️ WARNING: Running this on systems other than the CI marketplace is likely very insecure. This configuration is only secure when running behind the CI app proxy.
 
