@@ -9,11 +9,82 @@
 
 ## [Designed to run with Companion Memory](https://hub.ci.computer/store/ci-memory)
 
-### STANDALONE SETUP
+### Connect Hermes to CI Memory
 
-```
-hermes memory setup
-```
+Hermes ships with the Companion Intelligence memory provider already installed,
+so you only need to run the interactive setup once and point it at your
+Companion Memory Server.
+
+#### Step 1 — Install Companion Memory and generate an API key (do this first)
+
+Hermes connects *to* a running Companion Memory Server, so set that up before
+touching the Hermes terminal:
+
+1. In the **CI marketplace**, install the **[Companion Memory](https://hub.ci.computer/store/ci-memory)**
+   app and wait for it to finish starting.
+2. **Open the Companion Memory app** and complete its onboarding if prompted.
+3. Go to **Settings → API Keys**, click the **`+`** button, give the key a name
+   (e.g. `Hermes`), optionally set an expiry, and click **Create**.
+4. **Copy the key immediately** — it is shown only once and cannot be retrieved
+   later. Keep it handy for Step 2.
+
+#### Step 2 — Run memory setup in the Hermes terminal
+
+> **Important — chat mode vs. CLI mode.** When you open the Hermes terminal (the
+> CI marketplace app, e.g.
+> `https://<your-host>.companionintelligence.com/terminal`), it drops you
+> straight into **chat with Hermes**. `hermes memory setup` is a command-line
+> command, **not** a chat message — if you type it at the chat prompt (`❯`)
+> Hermes just answers it like a question and nothing gets configured. You must
+> switch to the shell first.
+
+1. **Open the Hermes terminal** from the CI marketplace (the `/terminal` path).
+   You'll land in chat mode by default.
+2. **Press `Ctrl+D`** to exit chat and drop into the underlying shell (CLI mode).
+   You'll see a normal shell prompt instead of the `❯` chat prompt.
+3. Have the **API key from Step 1** ready — the wizard cancels if it's left
+   blank.
+4. At the shell, run:
+
+   ```
+   hermes memory setup
+   ```
+
+   If `companionintelligence` is the only memory provider, the wizard starts its
+   setup directly; otherwise **select `companionintelligence`** from the list (it
+   is pre-installed — no extra install step needed).
+5. **CI-Server URL** — at the `CI-Server URL [http://127.0.0.1:8642]:` prompt,
+   enter:
+
+   ```
+   http://host.docker.internal:8642
+   ```
+
+   > ⚠️ **Do not accept the `http://127.0.0.1:8642` default.** Inside the Hermes
+   > container `127.0.0.1` is Hermes itself, not the Memory Server. The Companion
+   > Memory app publishes its gateway on the **host** at port `8642`, and Hermes
+   > reaches the host via `host.docker.internal` (the same way it reaches the CI
+   > Hub). So use `http://host.docker.internal:8642`.
+   >
+   > If host-gateway access is ever blocked, the Memory gateway also joins the
+   > shared CI network — `http://gateway:8642` works as a fallback.
+
+6. **API key** — paste the key from **Step 1** and press Enter. This is
+   **required**; leaving it blank prints `✗ Both URL and API key are required.
+   Setup cancelled.` and exits without saving.
+7. The wizard runs a **connection test** (`GET /api/health`) against the URL with
+   your key. **Nothing is saved unless it succeeds** — if you see an error, fix
+   the URL/key and run `hermes memory setup` again. On success it saves the key
+   to `.env`, the URL to `companionintelligence/config.json`, and sets
+   `memory.provider: companionintelligence` in `config.yaml`.
+8. **Start a new Hermes session to activate** — run `hermes` again, click
+   **New session**, or reload the terminal page. Hermes now reads and writes
+   long-term memory through Companion Memory.
+
+> **Tip:** While in CLI mode you can also run other admin commands such as
+> `hermes model` and `hermes doctor`. Press `Ctrl+D` from chat any time you need
+> the shell.
+
 ### Point to running Companion Memory Server URL
 
 <img height="150" alt="434image" src="https://github.com/user-attachments/assets/ba285919-36cd-435f-946c-912dfbbad034" />
