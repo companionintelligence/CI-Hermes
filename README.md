@@ -42,8 +42,8 @@ touching the Hermes terminal:
    You'll land in chat mode by default.
 2. **Press `Ctrl+D`** to exit chat and drop into the underlying shell (CLI mode).
    You'll see a normal shell prompt instead of the `❯` chat prompt.
-3. Have the **API key from Step 1** ready — the wizard cancels if it's left
-   blank.
+3. Have the **API key from Step 1** ready — if you leave it blank and no key is
+   already set in `CI_SERVER_TOKEN`, the wizard cancels.
 4. At the shell, run:
 
    ```
