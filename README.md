@@ -69,9 +69,9 @@ touching the Hermes terminal:
    > If host-gateway access is ever blocked, the Memory gateway also joins the
    > shared CI network — `http://gateway:8642` works as a fallback.
 
-6. **API key** — paste the key from **Step 1** and press Enter. This is
-   **required**; leaving it blank prints `✗ Both URL and API key are required.
-   Setup cancelled.` and exits without saving.
+6. **API key** — paste the key from **Step 1** and press Enter. If a key is
+   already set in `CI_SERVER_TOKEN`, leaving this blank keeps the current key;
+   otherwise leaving it blank prints `✗ Both URL and API key are required. Setup cancelled.` and exits without saving.
 7. The wizard runs a **connection test** (`GET /api/health`) against the URL with
    your key. **Nothing is saved unless it succeeds** — if you see an error, fix
    the URL/key and run `hermes memory setup` again. On success it saves the key
