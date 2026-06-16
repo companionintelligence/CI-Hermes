@@ -77,25 +77,12 @@ touching the Hermes terminal:
    the URL/key and run `hermes memory setup` again. On success it saves the key
    to `.env`, the URL to `companionintelligence/config.json`, and sets
    `memory.provider: companionintelligence` in `config.yaml`.
-8. **Start a new Hermes session to activate** — run `hermes` again, click
-   **New session**, or reload the terminal page. Hermes now reads and writes
-   long-term memory through Companion Memory.
+8. Open the Hermes **`/plugins`** page and **enable the `companionintelligence` plugin** from the list.
+9. **Restart the Hermes app** from the CI marketplace. Memory is now active in both the terminal (`/terminal`) and the web chat (`/chat`).
 
 > **Tip:** While in CLI mode you can also run other admin commands such as
 > `hermes model` and `hermes doctor`. Press `Ctrl+D` from chat any time you need
 > the shell.
-
-### Point to running Companion Memory Server URL
-
-<img height="150" alt="434image" src="https://github.com/user-attachments/assets/ba285919-36cd-435f-946c-912dfbbad034" />
-
-Automatic Setup
-
-<img height="350" alt="2image" src="https://github.com/user-attachments/assets/e85091a4-3169-40c4-933a-5deabff679ca" />
-
-Select Memory provider
-
-<img height="300" alt="5image" src="https://github.com/user-attachments/assets/aba17970-b2d2-4842-b268-495bffdde2c8" />
 
 
 
