@@ -240,6 +240,25 @@ assert_contains "single-quoted model unwrapped" "default: 'qwen3.5:9b'" "${confi
 assert_not_contains "single-quote wrapper removed" "default: '''qwen3.5:9b'''" "${config_out}"
 rm -rf "${data_dir}"
 
+# ─── Test 11: numeric HERMES_NUM_CTX is written as model.num_ctx ─────────────
+echo "test: numeric HERMES_NUM_CTX is written under model in config.yaml"
+data_dir="$(mktemp -d)"
+fixture="$(printf 'HERMES_DEFAULT_MODEL=qwen3.5:9b\nHERMES_NUM_CTX=32768\n')"
+run_with_fixture_in_dir "${fixture}" "${data_dir}"
+config_out="$(cat "${data_dir}/config.yaml")"
+assert_contains "model.num_ctx written from HERMES_NUM_CTX" "num_ctx: 32768" "${config_out}"
+rm -rf "${data_dir}"
+
+# ─── Test 12: non-numeric HERMES_NUM_CTX is ignored ─────────────────────────
+echo "test: non-numeric HERMES_NUM_CTX is ignored (no num_ctx line)"
+data_dir="$(mktemp -d)"
+fixture="$(printf 'HERMES_DEFAULT_MODEL=qwen3.5:9b\nHERMES_NUM_CTX=not-a-number\n')"
+run_with_fixture_in_dir "${fixture}" "${data_dir}"
+config_out="$(cat "${data_dir}/config.yaml")"
+assert_not_contains "no num_ctx line for non-numeric value" "num_ctx:" "${config_out}"
+assert_contains "model still configured" "default: 'qwen3.5:9b'" "${config_out}"
+rm -rf "${data_dir}"
+
 # ─── Summary ────────────────────────────────────────────────────────────────
 echo
 echo "Results: ${PASS} passed, ${FAIL} failed"
