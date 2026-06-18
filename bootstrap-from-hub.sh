@@ -196,6 +196,17 @@ model:
   provider: ollama
   default: '${model_name_yaml}'
 EOF
+        # Hardware-aware context size from the Hub (HERMES_NUM_CTX). Sets the
+        # native Ollama num_ctx so Hermes doesn't inherit Ollama's oversized
+        # memory-based default (e.g. 262144 on unified-memory APUs). The host
+        # OLLAMA_CONTEXT_LENGTH remains authoritative for the OpenAI-compatible
+        # surface; this covers the native ollama provider path.
+        num_ctx_raw=$(grep "^HERMES_NUM_CTX=" "${OUT_ENV}" | cut -d= -f2- | head -n 1)
+        num_ctx=$(normalize_env_value "${num_ctx_raw}")
+        if printf '%s' "${num_ctx}" | grep -qE '^[0-9]+$'; then
+          printf '  num_ctx: %s\n' "${num_ctx}" >> "${OUT_CONFIG}"
+          log "set model.num_ctx=${num_ctx} in ${OUT_CONFIG}"
+        fi
         chmod 600 "${OUT_CONFIG}" 2>/dev/null || true
         log "wrote ${OUT_CONFIG} with provider=ollama"
       else
