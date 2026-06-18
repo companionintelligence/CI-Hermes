@@ -342,34 +342,34 @@ function handleCiAuthMe(req, res) {
 // routing name (e.g. <app>.ci.lan) while the browser Origin stays the public
 // host (e.g. <app>.companionintelligence.com), so Host will never equal Origin
 // behind the proxy. CI injects the app's public host via these env vars; accept
-// them as same-origin. Without this, WebSocket upgrades from the real browser
-// Origin are rejected (403) whenever the app runs behind the marketplace proxy.
-function computeAllowedOriginHosts() {
-  const hosts = new Set();
+// the matching full origin (scheme + host + port) as same-origin. Without this,
+// WebSocket upgrades from the real browser Origin are rejected (403) whenever
+// the app runs behind the marketplace proxy.
+function computeAllowedOrigins() {
+  const origins = new Set();
   const add = (value) => {
     if (!value) return;
-    let raw = String(value).trim();
+    const raw = String(value).trim();
     if (!raw) return;
-    if (raw.includes("://")) {
-      try {
-        raw = new URL(raw).host;
-      } catch (e) {
-        return;
-      }
+    // Bare hosts are served publicly over HTTPS. Parsing through the URL API
+    // normalizes case, brackets IPv6 literals, and yields a scheme+host+port
+    // origin so the comparison stays exact and port-aware.
+    try {
+      const url = new URL(raw.includes("://") ? raw : `https://${raw}`);
+      origins.add(url.origin);
+    } catch (e) {
+      // Ignore values that are not a valid host/URL.
     }
-    const { hostname } = parseHostAndPort(raw);
-    const normalized = normalizeHostName(hostname);
-    if (normalized) hosts.add(normalized);
   };
   add(process.env.APP_HOST);
   add(process.env.APP_DOMAIN);
   add(process.env.APP_EXPOSED_DOMAIN);
   add(process.env.APP_URL);
   add(process.env.APP_PUBLIC_URL);
-  return hosts;
+  return origins;
 }
 
-const ALLOWED_ORIGIN_HOSTS = computeAllowedOriginHosts();
+const ALLOWED_ORIGINS = computeAllowedOrigins();
 
 function isSameOriginUpgrade(req) {
   try {
@@ -378,18 +378,22 @@ function isSameOriginUpgrade(req) {
       return false;
     }
     const originUrl = new URL(origin);
+
+    // Behind the CI marketplace proxy the Host header is rewritten to an
+    // internal routing name, so it never matches the public browser Origin.
+    // Accept when the full Origin (scheme + host + port) matches a configured
+    // public origin — this still enforces scheme and port, unlike a
+    // hostname-only check.
+    if (ALLOWED_ORIGINS.has(originUrl.origin)) {
+      return true;
+    }
+
     const requestHost = parseHostAndPort(req.headers.host || "");
     const originHost = parseHostAndPort(originUrl.host || "");
 
     const requestHostName = normalizeHostName(requestHost.hostname);
     const originHostName = normalizeHostName(originHost.hostname);
     if (!requestHostName || requestHostName !== originHostName) {
-      // Behind the CI marketplace proxy the Host header is rewritten to an
-      // internal routing name, so it never matches the public browser Origin.
-      // Accept the Origin when it matches a configured public host.
-      if (originHostName && ALLOWED_ORIGIN_HOSTS.has(originHostName)) {
-        return true;
-      }
       return false;
     }
 
