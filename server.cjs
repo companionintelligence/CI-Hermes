@@ -338,6 +338,39 @@ function handleCiAuthMe(req, res) {
   res.end(JSON.stringify(payload));
 }
 
+// The CI marketplace app proxy rewrites the inbound Host header to an internal
+// routing name (e.g. <app>.ci.lan) while the browser Origin stays the public
+// host (e.g. <app>.companionintelligence.com), so Host will never equal Origin
+// behind the proxy. CI injects the app's public host via these env vars; accept
+// them as same-origin. Without this, WebSocket upgrades from the real browser
+// Origin are rejected (403) whenever the app runs behind the marketplace proxy.
+function computeAllowedOriginHosts() {
+  const hosts = new Set();
+  const add = (value) => {
+    if (!value) return;
+    let raw = String(value).trim();
+    if (!raw) return;
+    if (raw.includes("://")) {
+      try {
+        raw = new URL(raw).host;
+      } catch (e) {
+        return;
+      }
+    }
+    const { hostname } = parseHostAndPort(raw);
+    const normalized = normalizeHostName(hostname);
+    if (normalized) hosts.add(normalized);
+  };
+  add(process.env.APP_HOST);
+  add(process.env.APP_DOMAIN);
+  add(process.env.APP_EXPOSED_DOMAIN);
+  add(process.env.APP_URL);
+  add(process.env.APP_PUBLIC_URL);
+  return hosts;
+}
+
+const ALLOWED_ORIGIN_HOSTS = computeAllowedOriginHosts();
+
 function isSameOriginUpgrade(req) {
   try {
     const origin = String(req.headers.origin || "").trim();
@@ -351,6 +384,12 @@ function isSameOriginUpgrade(req) {
     const requestHostName = normalizeHostName(requestHost.hostname);
     const originHostName = normalizeHostName(originHost.hostname);
     if (!requestHostName || requestHostName !== originHostName) {
+      // Behind the CI marketplace proxy the Host header is rewritten to an
+      // internal routing name, so it never matches the public browser Origin.
+      // Accept the Origin when it matches a configured public host.
+      if (originHostName && ALLOWED_ORIGIN_HOSTS.has(originHostName)) {
+        return true;
+      }
       return false;
     }
 
