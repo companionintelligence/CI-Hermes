@@ -338,6 +338,39 @@ function handleCiAuthMe(req, res) {
   res.end(JSON.stringify(payload));
 }
 
+// The CI marketplace app proxy rewrites the inbound Host header to an internal
+// routing name (e.g. <app>.ci.lan) while the browser Origin stays the public
+// host (e.g. <app>.companionintelligence.com), so Host will never equal Origin
+// behind the proxy. CI injects the app's public host via these env vars; accept
+// the matching full origin (scheme + host + port) as same-origin. Without this,
+// WebSocket upgrades from the real browser Origin are rejected (403) whenever
+// the app runs behind the marketplace proxy.
+function computeAllowedOrigins() {
+  const origins = new Set();
+  const add = (value) => {
+    if (!value) return;
+    const raw = String(value).trim();
+    if (!raw) return;
+    // Bare hosts are served publicly over HTTPS. Parsing through the URL API
+    // normalizes case, brackets IPv6 literals, and yields a scheme+host+port
+    // origin so the comparison stays exact and port-aware.
+    try {
+      const url = new URL(raw.includes("://") ? raw : `https://${raw}`);
+      origins.add(url.origin);
+    } catch (e) {
+      // Ignore values that are not a valid host/URL.
+    }
+  };
+  add(process.env.APP_HOST);
+  add(process.env.APP_DOMAIN);
+  add(process.env.APP_EXPOSED_DOMAIN);
+  add(process.env.APP_URL);
+  add(process.env.APP_PUBLIC_URL);
+  return origins;
+}
+
+const ALLOWED_ORIGINS = computeAllowedOrigins();
+
 function isSameOriginUpgrade(req) {
   try {
     const origin = String(req.headers.origin || "").trim();
@@ -345,6 +378,16 @@ function isSameOriginUpgrade(req) {
       return false;
     }
     const originUrl = new URL(origin);
+
+    // Behind the CI marketplace proxy the Host header is rewritten to an
+    // internal routing name, so it never matches the public browser Origin.
+    // Accept when the full Origin (scheme + host + port) matches a configured
+    // public origin — this still enforces scheme and port, unlike a
+    // hostname-only check.
+    if (ALLOWED_ORIGINS.has(originUrl.origin)) {
+      return true;
+    }
+
     const requestHost = parseHostAndPort(req.headers.host || "");
     const originHost = parseHostAndPort(originUrl.host || "");
 
