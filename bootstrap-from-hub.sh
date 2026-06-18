@@ -203,7 +203,7 @@ EOF
         # surface; this covers the native ollama provider path.
         num_ctx_raw=$(grep "^HERMES_NUM_CTX=" "${OUT_ENV}" | cut -d= -f2- | head -n 1)
         num_ctx=$(normalize_env_value "${num_ctx_raw}")
-        if printf '%s' "${num_ctx}" | grep -qE '^[0-9]+$'; then
+        if printf '%s' "${num_ctx}" | grep -q -E '^[0-9]+$'; then
           printf '  num_ctx: %s\n' "${num_ctx}" >> "${OUT_CONFIG}"
           log "set model.num_ctx=${num_ctx} in ${OUT_CONFIG}"
         fi
