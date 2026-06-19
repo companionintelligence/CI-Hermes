@@ -6,15 +6,16 @@ Installs the Companion Intelligence MemoryProvider plugin into
 $HERMES_HOME/plugins/companionintelligence/ so it appears in
 `hermes memory setup`.
 
-After running this script, complete the setup interactively:
+The memory provider itself is activated by bootstrap-ci-context.sh when
+credentials are present; you can also configure it interactively:
 
     hermes memory setup
     → pick "companionintelligence"
     → enter your CI-Server URL and API key
 
-Optionally, if CI_SERVER_ENABLED=true and both CI_SERVER_URL and
-CI_SERVER_TOKEN are set, also registers CI-Server as an MCP server
-in config.yaml (for agents that use the MCP tools directly).
+Additionally, whenever both CI_SERVER_URL and CI_SERVER_TOKEN are set (and
+CI_SERVER_ENABLED is not "false"), this script registers CI-Server as an MCP
+server in config.yaml (for agents that use the MCP tools directly).
 """
 
 import os
@@ -30,7 +31,11 @@ from typing import Optional
 
 CI_URL = os.environ.get("CI_SERVER_URL", "").strip()
 CI_TOKEN = os.environ.get("CI_SERVER_TOKEN", "").strip()
-CI_ENABLED = os.environ.get("CI_SERVER_ENABLED", "false").lower() in ("true", "1", "yes", "on")
+# Enabled by default; enablement is really gated by URL + token presence below
+# (no credentials → nothing is configured). Setting CI_SERVER_ENABLED=false is
+# an explicit off-switch even when credentials happen to be present. Mirrors
+# CI-OpenClaw, which treats any value other than "false" as enabled.
+CI_ENABLED = os.environ.get("CI_SERVER_ENABLED", "true").strip().lower() != "false"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -195,8 +200,10 @@ def main() -> None:
 
         configure_mcp(config_path)
         print("[CI-Server] MCP configuration complete.")
-    elif CI_ENABLED:
-        print("[CI-Server] CI_SERVER_ENABLED=true but URL or token missing — MCP skipped.")
+    elif CI_ENABLED and (CI_URL or CI_TOKEN):
+        # Only warn on a partial/incomplete config (one of URL/token present).
+        # With no credentials at all, MCP simply isn't requested — stay quiet.
+        print("[CI-Server] Incomplete config — set both CI_SERVER_URL and CI_SERVER_TOKEN to enable MCP; skipped.")
 
 
 if __name__ == "__main__":

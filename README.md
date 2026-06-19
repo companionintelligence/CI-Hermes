@@ -11,9 +11,21 @@
 
 ### Connect Hermes to CI Memory
 
-Hermes ships with the Companion Intelligence memory provider already installed,
-so you only need to run the interactive setup once and point it at your
-Companion Memory Server.
+Hermes ships with the Companion Intelligence memory provider already installed.
+There are two ways to connect it to your Companion Memory Server:
+
+- **Automatic (recommended)** — first generate an API key (**Step 1** below),
+  then enter the URL (`http://host.docker.internal:8642`) and that key into the
+  **Companion Memory URL** and **Companion Memory API Key** fields of the Hermes
+  **install dialog**. The provider is enabled and selected as your active
+  memory backend automatically — no terminal step needed. On a brand-new
+  install it activates on the **first restart after install** (the app needs
+  one startup to generate its config before the provider can be selected), so
+  restart the Hermes app once from the CI marketplace if memory isn't active
+  yet. If you later switch providers by hand, your choice is preserved across
+  restarts.
+- **Manual** — leave those install fields blank and run the interactive
+  `hermes memory setup` wizard later, as described in **Step 2**.
 
 #### Step 1 — Install Companion Memory and generate an API key (do this first)
 
@@ -117,7 +129,8 @@ On startup, `/app/bootstrap-ci-context.sh` idempotently:
 - Enables the bundled `ci-runtime` plugin in `/opt/data/config.yaml`, so Hermes injects compact CI runtime context before LLM calls through the official `pre_llm_call` hook.
 - Adds the managed skills directory to `skills.external_dirs` in `/opt/data/config.yaml` when the config exists.
 
-To use it, simply enable it like any other hermes memory system by running `hermes memory setup` and following the instructions. You can get your API key for authentication from the CI-Server settings page.
+To connect it to Companion Memory you have two options (see *Connect Hermes to CI Memory* above for the full walkthrough): enter the **Companion Memory URL** and **API Key** in the app's install dialog and it activates automatically on startup, or run `hermes memory setup` in the terminal and follow the instructions. Either way, generate your API key from the CI-Server settings page.
+
 ## License
 
 MIT
