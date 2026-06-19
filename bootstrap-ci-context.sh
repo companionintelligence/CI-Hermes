@@ -23,10 +23,12 @@ CI_MEMORY_PLUGIN="companionintelligence"
 # Activate the bundled provider only when both credentials are present, matching
 # the memory plugin's own is_available() check (URL + token required). The
 # plugin's _load_config() .strip()s these env vars, so a whitespace-only value
-# counts as missing — strip here too, otherwise we'd select a non-functional
-# provider. An explicit CI_SERVER_ENABLED=false is honoured as an off-switch
-# (mirrors CI-OpenClaw), normalized the same way configure-ci-server.py does
-# (trim + lowercase) so FALSE / "false " also disable.
+# counts as missing — we remove whitespace here too before the emptiness check,
+# otherwise we'd select a non-functional provider. (URLs/tokens carry no internal
+# whitespace, so removing all of it is equivalent to a strip for this purpose.)
+# An explicit CI_SERVER_ENABLED=false is honoured as an off-switch (mirrors
+# CI-OpenClaw), lowercased and whitespace-removed so FALSE / "false " also
+# disable.
 ci_url_norm="$(printf '%s' "${CI_SERVER_URL:-}" | tr -d '[:space:]')"
 ci_token_norm="$(printf '%s' "${CI_SERVER_TOKEN:-}" | tr -d '[:space:]')"
 ci_enabled_norm="$(printf '%s' "${CI_SERVER_ENABLED:-true}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"

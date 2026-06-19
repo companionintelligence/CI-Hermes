@@ -200,8 +200,10 @@ def main() -> None:
 
         configure_mcp(config_path)
         print("[CI-Server] MCP configuration complete.")
-    elif CI_ENABLED:
-        print("[CI-Server] CI_SERVER_ENABLED not false, but URL or token missing — MCP skipped.")
+    elif CI_ENABLED and (CI_URL or CI_TOKEN):
+        # Only warn on a partial/incomplete config (one of URL/token present).
+        # With no credentials at all, MCP simply isn't requested — stay quiet.
+        print("[CI-Server] Incomplete config — set both CI_SERVER_URL and CI_SERVER_TOKEN to enable MCP; skipped.")
 
 
 if __name__ == "__main__":
