@@ -67,12 +67,16 @@ python3 /app/configure-ci-server.py 2>&1 || true
 HUB_ENV_FILE="${DATA_DIR}/.env.hub-bootstrap"
 ci_num_ctx=""
 if [[ -f "${HUB_ENV_FILE}" ]]; then
-  ci_num_ctx="$(grep '^HERMES_NUM_CTX=' "${HUB_ENV_FILE}" 2>/dev/null | cut -d= -f2- | head -n 1 | tr -d '[:space:]')"
+  ci_num_ctx="$(grep '^HERMES_NUM_CTX=' "${HUB_ENV_FILE}" 2>/dev/null | cut -d= -f2- | head -n 1)"
 fi
 # Fall back to the process env in case the value is exported rather than file-only.
-[[ -z "${ci_num_ctx}" ]] && ci_num_ctx="$(printf '%s' "${HERMES_NUM_CTX:-}" | tr -d '[:space:]')"
-# Only a positive integer is meaningful; treat anything else as "unset".
-if ! printf '%s' "${ci_num_ctx}" | grep -qE '^[0-9]+$'; then
+[[ -z "${ci_num_ctx}" ]] && ci_num_ctx="${HERMES_NUM_CTX:-}"
+# Normalize: strip whitespace, a stray CR (CRLF env files), and surrounding quotes
+# (a PyYAML/dotenv re-dump may emit HERMES_NUM_CTX="65536"). The value is numeric,
+# so deleting all of these characters is equivalent to a strip.
+ci_num_ctx="$(printf '%s' "${ci_num_ctx}" | tr -d "[:space:]\"'")"
+# Only a POSITIVE integer is a meaningful context window; treat 0 / garbage as unset.
+if ! printf '%s' "${ci_num_ctx}" | grep -qE '^[1-9][0-9]*$'; then
   ci_num_ctx=""
 fi
 

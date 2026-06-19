@@ -128,6 +128,77 @@ out="$(cat "${data_dir}/${CONFIG_REL}")"
 assert_not_contains "no ci_server block" "ci_server:" "${out}"
 rm -rf "${data_dir}"
 
+line_no() {
+  local file="$1" pattern="$2"
+  grep -nE "${pattern}" "${file}" | head -1 | cut -d: -f1
+}
+
+# ─── Test 5: mcp_servers not last → block stays nested under the section ─────
+# After Hermes re-dumps config.yaml, mcp_servers may be followed by other
+# top-level keys. The block must be inserted inside the section, not at EOF.
+echo "test: ci_server is nested under mcp_servers even when it is not the last key"
+data_dir="$(mktemp -d)"
+mkdir -p "${data_dir}/.hermes"
+cat > "${data_dir}/${CONFIG_REL}" <<'EOF'
+model:
+  provider: ollama
+mcp_servers:
+  existing:
+    url: "http://other/api/mcp"
+agent:
+  max_turns: 90
+EOF
+run_configure "${data_dir}" CI_SERVER_URL=http://host.docker.internal:8642 CI_SERVER_TOKEN=sk-test-123
+out="$(cat "${data_dir}/${CONFIG_REL}")"
+assert_contains "ci_server registered" 'url: "http://host.docker.internal:8642/api/mcp"' "${out}"
+assert_contains "existing server preserved" "http://other/api/mcp" "${out}"
+assert_contains "agent section intact" "max_turns: 90" "${out}"
+mcp_line="$(line_no "${data_dir}/${CONFIG_REL}" '^mcp_servers:')"
+ci_line="$(line_no "${data_dir}/${CONFIG_REL}" '^  ci_server:')"
+agent_line="$(line_no "${data_dir}/${CONFIG_REL}" '^agent:')"
+nested="$([[ -n "${ci_line}" && "${mcp_line}" -lt "${ci_line}" && "${ci_line}" -lt "${agent_line}" ]] && echo yes || echo no)"
+assert_eq "ci_server sits between mcp_servers and agent (correctly nested)" "yes" "${nested}"
+rm -rf "${data_dir}"
+
+# ─── Test 6: a comment mentioning ci_server is not mistaken for a block ──────
+echo "test: a 'ci_server:' inside a comment does not block real registration"
+data_dir="$(mktemp -d)"
+mkdir -p "${data_dir}/.hermes"
+cat > "${data_dir}/${CONFIG_REL}" <<'EOF'
+model:
+  provider: ollama
+# mcp_servers.ci_server: configured by the Hub at install time
+EOF
+run_configure "${data_dir}" CI_SERVER_URL=http://host.docker.internal:8642 CI_SERVER_TOKEN=sk-test-123
+out="$(cat "${data_dir}/${CONFIG_REL}")"
+assert_contains "real block registered" 'url: "http://host.docker.internal:8642/api/mcp"' "${out}"
+assert_contains "real ci_server key present" "ci_server:" "${out}"
+rm -rf "${data_dir}"
+
+# ─── Test 7: a re-indented existing block is still reconciled ────────────────
+# A different YAML emitter may use 4-space indentation. Detection keys off the
+# actual indentation of the ci_server line, so reconcile must still apply.
+echo "test: a 4-space-indented ci_server block is reconciled, not skipped"
+data_dir="$(mktemp -d)"
+mkdir -p "${data_dir}/.hermes"
+cat > "${data_dir}/${CONFIG_REL}" <<'EOF'
+model:
+    provider: ollama
+mcp_servers:
+    ci_server:
+        url: "http://old-host:1111/api/mcp"
+        headers:
+            x-api-key: "sk-old-key"
+        timeout: 180
+        connect_timeout: 60
+EOF
+run_configure "${data_dir}" CI_SERVER_URL=http://new-host:8642 CI_SERVER_TOKEN=sk-new-key
+out="$(cat "${data_dir}/${CONFIG_REL}")"
+assert_contains "re-indented url updated" 'url: "http://new-host:8642/api/mcp"' "${out}"
+assert_contains "re-indented key updated" 'x-api-key: "sk-new-key"' "${out}"
+assert_not_contains "old key gone" "sk-old-key" "${out}"
+rm -rf "${data_dir}"
+
 # ─── Summary ────────────────────────────────────────────────────────────────
 echo
 echo "Results: ${PASS} passed, ${FAIL} failed"

@@ -129,8 +129,44 @@ def install_plugin(hermes_home: Path) -> bool:
 # Step 2 — MCP server registration (only when URL + TOKEN are available)
 # ---------------------------------------------------------------------------
 
+_CI_SERVER_RE = re.compile(r"^(\s*)ci_server:\s*(?:#.*)?$")
+_MCP_SERVERS_RE = re.compile(r"^(\s*)mcp_servers:\s*(?:#.*)?$")
+
+
+def _indent_of(line: str) -> int:
+    return len(line) - len(line.lstrip(" "))
+
+
+def _is_blank_or_comment(line: str) -> bool:
+    stripped = line.strip()
+    return stripped == "" or stripped.startswith("#")
+
+
+def _block_end(lines: list, start: int, indent: int) -> int:
+    """Index just past the mapping block opened at `start` (whose key sits at
+    `indent`): the first later line that has content and is indented <= indent."""
+    for i in range(start + 1, len(lines)):
+        if _is_blank_or_comment(lines[i]):
+            continue
+        if _indent_of(lines[i]) <= indent:
+            return i
+    return len(lines)
+
+
+def _find_ci_server(lines: list):
+    """Return (index, indent) of the `ci_server:` mapping line, or (None, None).
+    Line-anchored (not a substring scan) so a comment or string mentioning
+    `ci_server:` is not mistaken for a real block."""
+    for i, line in enumerate(lines):
+        match = _CI_SERVER_RE.match(line)
+        if match:
+            return i, len(match.group(1))
+    return None, None
+
+
 def has_ci_mcp_server(config_text: str) -> bool:
-    return "ci_server:" in config_text
+    index, _ = _find_ci_server(config_text.splitlines())
+    return index is not None
 
 
 def desired_mcp_url() -> str:
@@ -139,50 +175,75 @@ def desired_mcp_url() -> str:
     return ci_url if ci_url.endswith("/api/mcp") else ci_url + "/api/mcp"
 
 
-def patch_mcp(config_text: str) -> str:
-    """Append ci_server MCP entry under mcp_servers:."""
-    lines = [
-        "  ci_server:",
-        f'    url: "{desired_mcp_url()}"',
-        "    headers:",
-        f'      x-api-key: "{CI_TOKEN}"',
-        "    timeout: 180",
-        "    connect_timeout: 60",
+def _ci_server_lines(indent: int) -> list:
+    """The ci_server block, with its key at `indent` spaces."""
+    key = " " * indent
+    child = " " * (indent + 2)
+    grand = " " * (indent + 4)
+    return [
+        f"{key}ci_server:\n",
+        f'{child}url: "{desired_mcp_url()}"\n',
+        f"{child}headers:\n",
+        f'{grand}x-api-key: "{CI_TOKEN}"\n',
+        f"{child}timeout: 180\n",
+        f"{child}connect_timeout: 60\n",
     ]
-    block = "\n".join(lines)
 
-    if "mcp_servers:" in config_text:
-        config_text = config_text.rstrip() + "\n" + block + "\n"
-    else:
-        config_text = config_text.rstrip() + "\nmcp_servers:\n" + block + "\n"
 
-    return config_text
+def patch_mcp(config_text: str) -> str:
+    """Insert a ci_server entry *inside* the mcp_servers section, creating that
+    section if it is absent. Inserting at the end of the section (rather than at
+    EOF) keeps the block correctly nested even when mcp_servers is not the last
+    top-level key — e.g. after Hermes re-dumps config.yaml and reorders keys."""
+    lines = config_text.splitlines(keepends=True)
+    if lines and not lines[-1].endswith("\n"):
+        lines[-1] += "\n"
+
+    mcp_index = None
+    mcp_indent = 0
+    for i, line in enumerate(lines):
+        match = _MCP_SERVERS_RE.match(line)
+        if match:
+            mcp_index = i
+            mcp_indent = len(match.group(1))
+            break
+
+    if mcp_index is None:
+        # No section yet — create it at the top level with a 2-space child.
+        return "".join(lines) + "mcp_servers:\n" + "".join(_ci_server_lines(2))
+
+    # Nest under the existing section: reuse an existing child's indent if there
+    # is one, otherwise the section indent + 2.
+    end = _block_end(lines, mcp_index, mcp_indent)
+    child_indent = mcp_indent + 2
+    for i in range(mcp_index + 1, end):
+        if not _is_blank_or_comment(lines[i]):
+            child_indent = _indent_of(lines[i])
+            break
+
+    # Insert right after the last content line of the section (before trailing
+    # blank lines) so the block stays within mcp_servers.
+    insert_at = end
+    while insert_at - 1 > mcp_index and _is_blank_or_comment(lines[insert_at - 1]):
+        insert_at -= 1
+
+    lines[insert_at:insert_at] = _ci_server_lines(child_indent)
+    return "".join(lines)
 
 
 def reconcile_mcp_block(config_text: str) -> "tuple[str, bool]":
     """Update url + x-api-key in an existing ci_server block to the current
-    credentials. Returns (new_text, changed). The block structure is the one
-    patch_mcp() writes, so we only rewrite the two credential-bearing lines and
-    leave everything else (timeouts, indentation, ordering) untouched — keeping
-    repeated runs byte-identical when nothing changed.
-    """
+    credentials. Returns (new_text, changed). Only the two credential-bearing
+    lines are rewritten; timeouts, indentation and ordering are left untouched,
+    so repeated runs stay byte-identical when nothing changed. The block bounds
+    are derived from the actual indentation of the `ci_server:` line, so a
+    re-indented config (different YAML emitter) is still reconciled."""
     lines = config_text.splitlines(keepends=True)
-
-    start = next(
-        (i for i, line in enumerate(lines) if re.match(r"^  ci_server:\s*(?:#.*)?$", line)),
-        None,
-    )
+    start, indent = _find_ci_server(lines)
     if start is None:
         return config_text, False
 
-    # The block runs until the next line indented two spaces or less with content
-    # (a sibling MCP server or a top-level key); blanks/comments stay inside it.
-    end = len(lines)
-    for i in range(start + 1, len(lines)):
-        if re.match(r"^ {0,2}\S", lines[i]):
-            end = i
-            break
-
+    end = _block_end(lines, start, indent)
     mcp_url = desired_mcp_url()
     changed = False
     for i in range(start + 1, end):

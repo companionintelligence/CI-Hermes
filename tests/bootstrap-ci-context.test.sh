@@ -249,6 +249,27 @@ out="$(cat "${data_dir}/config.yaml")"
 assert_not_contains "garbage num_ctx not written" "num_ctx:" "${out}"
 rm -rf "${data_dir}"
 
+# ─── Test 13: a quoted HERMES_NUM_CTX value is still applied ─────────────────
+echo "test: HERMES_NUM_CTX=\"65536\" (quoted) is normalized and applied"
+data_dir="$(mktemp -d)"
+printf 'model:\n  provider: ollama\n' > "${data_dir}/config.yaml"
+printf 'HERMES_NUM_CTX="65536"\n' > "${data_dir}/.env.hub-bootstrap"
+run_bootstrap "${data_dir}"
+out="$(cat "${data_dir}/config.yaml")"
+assert_contains "quoted num_ctx applied" "num_ctx: 65536" "${out}"
+assert_not_contains "no stray quotes in value" 'num_ctx: "' "${out}"
+rm -rf "${data_dir}"
+
+# ─── Test 14: HERMES_NUM_CTX=0 is rejected (not a meaningful window) ──────────
+echo "test: HERMES_NUM_CTX=0 is treated as unset"
+data_dir="$(mktemp -d)"
+printf 'model:\n  provider: ollama\n' > "${data_dir}/config.yaml"
+printf 'HERMES_NUM_CTX=0\n' > "${data_dir}/.env.hub-bootstrap"
+run_bootstrap "${data_dir}"
+out="$(cat "${data_dir}/config.yaml")"
+assert_not_contains "zero num_ctx not written" "num_ctx:" "${out}"
+rm -rf "${data_dir}"
+
 # ─── Summary ────────────────────────────────────────────────────────────────
 echo
 echo "Results: ${PASS} passed, ${FAIL} failed"
