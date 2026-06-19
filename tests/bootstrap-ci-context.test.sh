@@ -1,7 +1,8 @@
 #!/bin/bash
 # Tests for bootstrap-ci-context.sh — focused on the config.yaml reconcile:
-# inline `child: []` handling, Companion Memory auto-activation, the marker
-# guard, and the CI_SERVER_ENABLED off-switch.
+# inline `child: []` handling, Companion Memory auto-activation, never
+# clobbering an existing non-empty memory.provider, and the CI_SERVER_ENABLED
+# off-switch.
 #
 # The script hard-codes a few /app paths (plugin source, skills dir, the
 # configure-ci-server.py call). None exist in a test checkout, but each is
@@ -54,8 +55,9 @@ assert_not_contains() {
   fi
 }
 
-# Count occurrences of a 2-space-indented child key (e.g. `  enabled:`) so we
-# can prove no duplicate mapping keys are emitted under a section.
+# Count occurrences of a 2-space-indented child key (e.g. `  enabled:`) across
+# the whole file. The fixtures only ever have one section containing a given
+# key, so a count > 1 means a duplicate mapping key was emitted.
 count_child_key() {
   local file="$1" key="$2"
   grep -cE "^  ${key}:" "${file}" || true
