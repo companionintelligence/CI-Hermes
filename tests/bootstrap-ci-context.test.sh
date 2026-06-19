@@ -62,11 +62,14 @@ count_child_key() {
 }
 
 # Run the bootstrap with HERMES_HOME pointed at data_dir; remaining args are
-# extra KEY=VALUE env assignments (e.g. CI_SERVER_URL=...).
+# extra KEY=VALUE env assignments (e.g. CI_SERVER_URL=...). The bootstrap is
+# expected to exit 0 in these fixtures; we do NOT swallow a non-zero exit so a
+# real bootstrap failure aborts the run (set -e) instead of letting assertions
+# pass against a partially-updated config.
 run_bootstrap() {
   local data_dir="$1"; shift
   env -i PATH="${PATH}" HERMES_HOME="${data_dir}" "$@" \
-    bash "${SCRIPT}" >/dev/null 2>&1 || true
+    bash "${SCRIPT}" >/dev/null 2>&1
 }
 
 CREDS=(CI_SERVER_URL=http://host.docker.internal:8642 CI_SERVER_TOKEN=sk-test-123)
@@ -150,6 +153,16 @@ echo "test: CI_SERVER_ENABLED=false disables activation even with creds"
 data_dir="$(mktemp -d)"
 printf 'model:\n  provider: ollama\n' > "${data_dir}/config.yaml"
 run_bootstrap "${data_dir}" "${CREDS[@]}" CI_SERVER_ENABLED=false
+out="$(cat "${data_dir}/config.yaml")"
+assert_not_contains "memory provider not selected" "provider: companionintelligence" "${out}"
+assert_eq "no marker file" "no" "$([[ -f "${data_dir}/companionintelligence/.ci-auto-activated" ]] && echo yes || echo no)"
+rm -rf "${data_dir}"
+
+# ─── Test 6b: off-switch is case-insensitive and whitespace-tolerant ─────────
+echo "test: CI_SERVER_ENABLED='FALSE ' (mixed case + space) also disables"
+data_dir="$(mktemp -d)"
+printf 'model:\n  provider: ollama\n' > "${data_dir}/config.yaml"
+run_bootstrap "${data_dir}" "${CREDS[@]}" "CI_SERVER_ENABLED=FALSE "
 out="$(cat "${data_dir}/config.yaml")"
 assert_not_contains "memory provider not selected" "provider: companionintelligence" "${out}"
 assert_eq "no marker file" "no" "$([[ -f "${data_dir}/companionintelligence/.ci-auto-activated" ]] && echo yes || echo no)"

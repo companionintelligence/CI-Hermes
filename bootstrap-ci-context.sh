@@ -28,8 +28,11 @@ CI_MEMORY_MARKER="${DATA_DIR}/companionintelligence/.ci-auto-activated"
 # the memory plugin's own is_available() check (URL + token required). An
 # explicit CI_SERVER_ENABLED=false is honoured as an off-switch (mirrors
 # CI-OpenClaw); any other value (or unset) leaves activation gated on the creds.
+# Normalize the flag the same way configure-ci-server.py does — trim whitespace
+# and lowercase — so FALSE / "false " also disable it.
+ci_enabled_norm="$(printf '%s' "${CI_SERVER_ENABLED:-true}" | tr '[:upper:]' '[:lower:]' | tr -d '[:space:]')"
 if [[ -n "${CI_SERVER_URL:-}" && -n "${CI_SERVER_TOKEN:-}" \
-      && "${CI_SERVER_ENABLED:-true}" != "false" ]]; then
+      && "${ci_enabled_norm}" != "false" ]]; then
   CI_MEMORY_PROVIDER="${CI_MEMORY_PLUGIN}"
 else
   CI_MEMORY_PROVIDER=""
