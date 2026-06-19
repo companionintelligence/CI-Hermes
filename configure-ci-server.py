@@ -30,7 +30,11 @@ from typing import Optional
 
 CI_URL = os.environ.get("CI_SERVER_URL", "").strip()
 CI_TOKEN = os.environ.get("CI_SERVER_TOKEN", "").strip()
-CI_ENABLED = os.environ.get("CI_SERVER_ENABLED", "false").lower() in ("true", "1", "yes", "on")
+# Enabled by default; enablement is really gated by URL + token presence below
+# (no credentials → nothing is configured). Setting CI_SERVER_ENABLED=false is
+# an explicit off-switch even when credentials happen to be present. Mirrors
+# CI-OpenClaw, which treats any value other than "false" as enabled.
+CI_ENABLED = os.environ.get("CI_SERVER_ENABLED", "true").strip().lower() != "false"
 
 # ---------------------------------------------------------------------------
 # Helpers

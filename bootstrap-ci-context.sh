@@ -25,8 +25,11 @@ CI_MEMORY_PLUGIN="companionintelligence"
 CI_MEMORY_MARKER="${DATA_DIR}/companionintelligence/.ci-auto-activated"
 
 # Activate the bundled provider only when both credentials are present, matching
-# the memory plugin's own is_available() check (URL + token required).
-if [[ -n "${CI_SERVER_URL:-}" && -n "${CI_SERVER_TOKEN:-}" ]]; then
+# the memory plugin's own is_available() check (URL + token required). An
+# explicit CI_SERVER_ENABLED=false is honoured as an off-switch (mirrors
+# CI-OpenClaw); any other value (or unset) leaves activation gated on the creds.
+if [[ -n "${CI_SERVER_URL:-}" && -n "${CI_SERVER_TOKEN:-}" \
+      && "${CI_SERVER_ENABLED:-true}" != "false" ]]; then
   CI_MEMORY_PROVIDER="${CI_MEMORY_PLUGIN}"
 else
   CI_MEMORY_PROVIDER=""

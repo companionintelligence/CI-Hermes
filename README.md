@@ -17,9 +17,13 @@ There are two ways to connect it to your Companion Memory Server:
 - **Automatic (recommended)** — first generate an API key (**Step 1** below),
   then enter the URL (`http://host.docker.internal:8642`) and that key into the
   **Companion Memory URL** and **Companion Memory API Key** fields of the Hermes
-  **install dialog**. On startup the provider is enabled and selected as your
-  active memory backend automatically — no terminal step needed. If you later
-  switch providers by hand, your choice is preserved across restarts.
+  **install dialog**. The provider is enabled and selected as your active
+  memory backend automatically — no terminal step needed. On a brand-new
+  install it activates on the **first restart after install** (the app needs
+  one startup to generate its config before the provider can be selected), so
+  restart the Hermes app once from the CI marketplace if memory isn't active
+  yet. If you later switch providers by hand, your choice is preserved across
+  restarts.
 - **Manual** — leave those install fields blank and run the interactive
   `hermes memory setup` wizard later, as described in **Step 2**.
 

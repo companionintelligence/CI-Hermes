@@ -1,0 +1,161 @@
+#!/bin/bash
+# Tests for bootstrap-ci-context.sh — focused on the config.yaml reconcile:
+# inline `child: []` handling, Companion Memory auto-activation, the marker
+# guard, and the CI_SERVER_ENABLED off-switch.
+#
+# The script hard-codes a few /app paths (plugin source, skills dir, the
+# configure-ci-server.py call). None exist in a test checkout, but each is
+# guarded (`[[ -d ... ]]` / `|| true`), so the script still runs to completion
+# and performs the config.yaml edits we assert on here.
+set -euo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT="${HERE}/../bootstrap-ci-context.sh"
+
+PASS=0
+FAIL=0
+
+assert_eq() {
+  local label="$1" want="$2" got="$3"
+  if [[ "${want}" == "${got}" ]]; then
+    echo "  ✓ ${label}"
+    PASS=$((PASS + 1))
+  else
+    echo "  ✗ ${label}"
+    echo "    want: ${want}"
+    echo "    got:  ${got}"
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+assert_contains() {
+  local label="$1" needle="$2" haystack="$3"
+  if echo "${haystack}" | grep -qF -- "${needle}"; then
+    echo "  ✓ ${label}"
+    PASS=$((PASS + 1))
+  else
+    echo "  ✗ ${label}"
+    echo "    expected to contain: ${needle}"
+    echo "    in:                  ${haystack}"
+    FAIL=$((FAIL + 1))
+  fi
+}
+
+assert_not_contains() {
+  local label="$1" needle="$2" haystack="$3"
+  if echo "${haystack}" | grep -qF -- "${needle}"; then
+    echo "  ✗ ${label}"
+    echo "    expected to NOT contain: ${needle}"
+    echo "    in:                      ${haystack}"
+    FAIL=$((FAIL + 1))
+  else
+    echo "  ✓ ${label}"
+    PASS=$((PASS + 1))
+  fi
+}
+
+# Count occurrences of a 2-space-indented child key (e.g. `  enabled:`) so we
+# can prove no duplicate mapping keys are emitted under a section.
+count_child_key() {
+  local file="$1" key="$2"
+  grep -cE "^  ${key}:" "${file}" || true
+}
+
+# Run the bootstrap with HERMES_HOME pointed at data_dir; remaining args are
+# extra KEY=VALUE env assignments (e.g. CI_SERVER_URL=...).
+run_bootstrap() {
+  local data_dir="$1"; shift
+  env -i PATH="${PATH}" HERMES_HOME="${data_dir}" "$@" \
+    bash "${SCRIPT}" >/dev/null 2>&1 || true
+}
+
+CREDS=(CI_SERVER_URL=http://host.docker.internal:8642 CI_SERVER_TOKEN=sk-test-123)
+
+# ─── Test 1: real first-edit (model-only config) activates cleanly ───────────
+echo "test: model-only config gets clean plugin + provider activation"
+data_dir="$(mktemp -d)"
+cat > "${data_dir}/config.yaml" <<'EOF'
+model:
+  provider: ollama
+  default: 'qwen2.5:7b'
+EOF
+run_bootstrap "${data_dir}" "${CREDS[@]}"
+out="$(cat "${data_dir}/config.yaml")"
+assert_contains "ci-runtime enabled" "- ci-runtime" "${out}"
+assert_contains "companionintelligence enabled" "- companionintelligence" "${out}"
+assert_contains "memory.provider selected" "provider: companionintelligence" "${out}"
+assert_eq "single enabled: key (no duplicate)" "1" "$(count_child_key "${data_dir}/config.yaml" enabled)"
+rm -rf "${data_dir}"
+
+# ─── Test 2: inline `enabled: []` / `disabled: [...]` reconciled w/o dup key ──
+echo "test: inline empty-list form is opened instead of duplicated"
+data_dir="$(mktemp -d)"
+cat > "${data_dir}/config.yaml" <<'EOF'
+model:
+  provider: ollama
+plugins:
+  enabled: []
+  disabled:
+    - companionintelligence
+memory:
+  provider: local
+EOF
+run_bootstrap "${data_dir}" "${CREDS[@]}"
+out="$(cat "${data_dir}/config.yaml")"
+assert_eq "single enabled: key (no duplicate)" "1" "$(count_child_key "${data_dir}/config.yaml" enabled)"
+assert_contains "companionintelligence moved into enabled" "- companionintelligence" "${out}"
+assert_contains "disabled emptied" "disabled: []" "${out}"
+assert_contains "provider overrides default 'local'" "provider: companionintelligence" "${out}"
+assert_not_contains "old default provider gone" "provider: local" "${out}"
+rm -rf "${data_dir}"
+
+# ─── Test 3: idempotent across two runs (marker present on second) ───────────
+echo "test: running twice is idempotent and produces no duplicate keys"
+data_dir="$(mktemp -d)"
+printf 'model:\n  provider: ollama\n' > "${data_dir}/config.yaml"
+run_bootstrap "${data_dir}" "${CREDS[@]}"
+hash1="$(shasum "${data_dir}/config.yaml" | awk '{print $1}')"
+run_bootstrap "${data_dir}" "${CREDS[@]}"
+hash2="$(shasum "${data_dir}/config.yaml" | awk '{print $1}')"
+assert_eq "two runs produce identical config.yaml" "${hash1}" "${hash2}"
+assert_eq "still a single enabled: key" "1" "$(count_child_key "${data_dir}/config.yaml" enabled)"
+assert_eq "marker file written" "yes" "$([[ -f "${data_dir}/companionintelligence/.ci-auto-activated" ]] && echo yes || echo no)"
+rm -rf "${data_dir}"
+
+# ─── Test 4: marker guard preserves a provider the user later chose by hand ──
+echo "test: a hand-picked provider is not clobbered on later runs"
+data_dir="$(mktemp -d)"
+printf 'model:\n  provider: ollama\n' > "${data_dir}/config.yaml"
+run_bootstrap "${data_dir}" "${CREDS[@]}"                       # activates + writes marker
+# user switches provider by hand:
+sed -i 's/provider: companionintelligence/provider: my-custom/' "${data_dir}/config.yaml"
+run_bootstrap "${data_dir}" "${CREDS[@]}"                       # marker present → must not override
+out="$(cat "${data_dir}/config.yaml")"
+assert_contains "user provider preserved" "provider: my-custom" "${out}"
+assert_not_contains "not reverted to companionintelligence provider" "provider: companionintelligence" "${out}"
+rm -rf "${data_dir}"
+
+# ─── Test 5: no credentials → no activation, no marker ───────────────────────
+echo "test: without credentials nothing is activated"
+data_dir="$(mktemp -d)"
+printf 'model:\n  provider: ollama\n' > "${data_dir}/config.yaml"
+run_bootstrap "${data_dir}"
+out="$(cat "${data_dir}/config.yaml")"
+assert_not_contains "no memory provider written" "provider: companionintelligence" "${out}"
+assert_eq "no marker file" "no" "$([[ -f "${data_dir}/companionintelligence/.ci-auto-activated" ]] && echo yes || echo no)"
+rm -rf "${data_dir}"
+
+# ─── Test 6: CI_SERVER_ENABLED=false is an explicit off-switch ───────────────
+echo "test: CI_SERVER_ENABLED=false disables activation even with creds"
+data_dir="$(mktemp -d)"
+printf 'model:\n  provider: ollama\n' > "${data_dir}/config.yaml"
+run_bootstrap "${data_dir}" "${CREDS[@]}" CI_SERVER_ENABLED=false
+out="$(cat "${data_dir}/config.yaml")"
+assert_not_contains "memory provider not selected" "provider: companionintelligence" "${out}"
+assert_eq "no marker file" "no" "$([[ -f "${data_dir}/companionintelligence/.ci-auto-activated" ]] && echo yes || echo no)"
+rm -rf "${data_dir}"
+
+# ─── Summary ────────────────────────────────────────────────────────────────
+echo
+echo "Results: ${PASS} passed, ${FAIL} failed"
+[[ "${FAIL}" -eq 0 ]]
