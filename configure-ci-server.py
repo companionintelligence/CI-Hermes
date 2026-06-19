@@ -19,6 +19,7 @@ server in config.yaml (for agents that use the MCP tools directly).
 """
 
 import os
+import re
 import shutil
 import sys
 import time
@@ -132,13 +133,17 @@ def has_ci_mcp_server(config_text: str) -> bool:
     return "ci_server:" in config_text
 
 
+def desired_mcp_url() -> str:
+    """The /api/mcp URL we want the ci_server entry to point at."""
+    ci_url = CI_URL.rstrip("/")
+    return ci_url if ci_url.endswith("/api/mcp") else ci_url + "/api/mcp"
+
+
 def patch_mcp(config_text: str) -> str:
     """Append ci_server MCP entry under mcp_servers:."""
-    ci_url = CI_URL.rstrip("/")
-    mcp_url = ci_url if ci_url.endswith("/api/mcp") else ci_url + "/api/mcp"
     lines = [
         "  ci_server:",
-        f'    url: "{mcp_url}"',
+        f'    url: "{desired_mcp_url()}"',
         "    headers:",
         f'      x-api-key: "{CI_TOKEN}"',
         "    timeout: 180",
@@ -154,11 +159,64 @@ def patch_mcp(config_text: str) -> str:
     return config_text
 
 
+def reconcile_mcp_block(config_text: str) -> "tuple[str, bool]":
+    """Update url + x-api-key in an existing ci_server block to the current
+    credentials. Returns (new_text, changed). The block structure is the one
+    patch_mcp() writes, so we only rewrite the two credential-bearing lines and
+    leave everything else (timeouts, indentation, ordering) untouched — keeping
+    repeated runs byte-identical when nothing changed.
+    """
+    lines = config_text.splitlines(keepends=True)
+
+    start = next(
+        (i for i, line in enumerate(lines) if re.match(r"^  ci_server:\s*(?:#.*)?$", line)),
+        None,
+    )
+    if start is None:
+        return config_text, False
+
+    # The block runs until the next line indented two spaces or less with content
+    # (a sibling MCP server or a top-level key); blanks/comments stay inside it.
+    end = len(lines)
+    for i in range(start + 1, len(lines)):
+        if re.match(r"^ {0,2}\S", lines[i]):
+            end = i
+            break
+
+    mcp_url = desired_mcp_url()
+    changed = False
+    for i in range(start + 1, end):
+        m_url = re.match(r"^(\s*url:\s*).*$", lines[i])
+        if m_url:
+            new_line = f'{m_url.group(1)}"{mcp_url}"\n'
+            if lines[i] != new_line:
+                lines[i] = new_line
+                changed = True
+            continue
+        m_key = re.match(r"^(\s*x-api-key:\s*).*$", lines[i])
+        if m_key:
+            new_line = f'{m_key.group(1)}"{CI_TOKEN}"\n'
+            if lines[i] != new_line:
+                lines[i] = new_line
+                changed = True
+
+    return "".join(lines), changed
+
+
 def configure_mcp(config_path: str) -> None:
     config_text = read_config(config_path)
 
+    # Reconcile credentials on every run rather than skipping when the block
+    # already exists: the URL/key entered in the install dialog can change, and a
+    # skip-if-exists would otherwise leave the MCP tools pointed at stale creds.
     if has_ci_mcp_server(config_text):
-        print("[CI-Server] MCP server already configured.")
+        new_text, changed = reconcile_mcp_block(config_text)
+        if changed:
+            backup_config(config_path)
+            write_config(config_path, new_text)
+            print(f"[CI-Server] MCP server credentials reconciled in config.yaml  (URL: {CI_URL})")
+        else:
+            print("[CI-Server] MCP server already up to date.")
         return
 
     backup_config(config_path)

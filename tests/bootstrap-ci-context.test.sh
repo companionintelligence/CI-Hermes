@@ -192,6 +192,63 @@ out="$(cat "${data_dir}/config.yaml")"
 assert_not_contains "memory provider not selected" "provider: companionintelligence" "${out}"
 rm -rf "${data_dir}"
 
+# ─── Test 8: HERMES_NUM_CTX from .env.hub-bootstrap is reconciled in ──────────
+# A config generated before the Hub computed a context window has no model.num_ctx;
+# the reconcile must add it from .env.hub-bootstrap so Ollama doesn't load the
+# model at its oversized default.
+echo "test: num_ctx from .env.hub-bootstrap is written into model.num_ctx"
+data_dir="$(mktemp -d)"
+printf 'model:\n  provider: ollama\n  default: qwen3.6:27b\n' > "${data_dir}/config.yaml"
+printf 'HERMES_NUM_CTX=65536\n' > "${data_dir}/.env.hub-bootstrap"
+run_bootstrap "${data_dir}"
+out="$(cat "${data_dir}/config.yaml")"
+assert_contains "model.num_ctx set" "num_ctx: 65536" "${out}"
+assert_eq "single num_ctx key (no duplicate)" "1" "$(count_child_key "${data_dir}/config.yaml" num_ctx)"
+rm -rf "${data_dir}"
+
+# ─── Test 9: a stale num_ctx is corrected to the Hub's current value ──────────
+echo "test: a pre-existing stale model.num_ctx is updated to the Hub value"
+data_dir="$(mktemp -d)"
+printf 'model:\n  provider: ollama\n  num_ctx: 262144\n' > "${data_dir}/config.yaml"
+printf 'HERMES_NUM_CTX=65536\n' > "${data_dir}/.env.hub-bootstrap"
+run_bootstrap "${data_dir}"
+out="$(cat "${data_dir}/config.yaml")"
+assert_contains "stale num_ctx replaced" "num_ctx: 65536" "${out}"
+assert_not_contains "old num_ctx gone" "num_ctx: 262144" "${out}"
+assert_eq "single num_ctx key (no duplicate)" "1" "$(count_child_key "${data_dir}/config.yaml" num_ctx)"
+rm -rf "${data_dir}"
+
+# ─── Test 10: num_ctx reconcile is idempotent across two runs ────────────────
+echo "test: num_ctx reconcile is idempotent (two runs identical)"
+data_dir="$(mktemp -d)"
+printf 'model:\n  provider: ollama\n' > "${data_dir}/config.yaml"
+printf 'HERMES_NUM_CTX=65536\n' > "${data_dir}/.env.hub-bootstrap"
+run_bootstrap "${data_dir}"
+hash1="$(shasum "${data_dir}/config.yaml" | awk '{print $1}')"
+run_bootstrap "${data_dir}"
+hash2="$(shasum "${data_dir}/config.yaml" | awk '{print $1}')"
+assert_eq "two runs produce identical config.yaml" "${hash1}" "${hash2}"
+rm -rf "${data_dir}"
+
+# ─── Test 11: no HERMES_NUM_CTX → model.num_ctx is not touched ────────────────
+echo "test: without HERMES_NUM_CTX no num_ctx is written"
+data_dir="$(mktemp -d)"
+printf 'model:\n  provider: ollama\n' > "${data_dir}/config.yaml"
+run_bootstrap "${data_dir}"
+out="$(cat "${data_dir}/config.yaml")"
+assert_not_contains "no num_ctx written" "num_ctx:" "${out}"
+rm -rf "${data_dir}"
+
+# ─── Test 12: a non-integer HERMES_NUM_CTX is ignored ────────────────────────
+echo "test: a non-integer HERMES_NUM_CTX is ignored (treated as unset)"
+data_dir="$(mktemp -d)"
+printf 'model:\n  provider: ollama\n' > "${data_dir}/config.yaml"
+printf 'HERMES_NUM_CTX=not-a-number\n' > "${data_dir}/.env.hub-bootstrap"
+run_bootstrap "${data_dir}"
+out="$(cat "${data_dir}/config.yaml")"
+assert_not_contains "garbage num_ctx not written" "num_ctx:" "${out}"
+rm -rf "${data_dir}"
+
 # ─── Summary ────────────────────────────────────────────────────────────────
 echo
 echo "Results: ${PASS} passed, ${FAIL} failed"
