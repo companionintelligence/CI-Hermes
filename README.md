@@ -11,9 +11,18 @@
 
 ### Connect Hermes to CI Memory
 
-Hermes ships with the Companion Intelligence memory provider already installed,
-so you only need to run the interactive setup once and point it at your
-Companion Memory Server.
+Hermes ships with the Companion Intelligence memory provider already installed.
+There are two ways to connect it to your Companion Memory Server:
+
+- **Automatic (recommended)** — fill in the **Companion Memory URL** and
+  **Companion Memory API Key** fields in the Hermes **install dialog**. On
+  startup the provider is enabled and selected as the active memory backend for
+  you (no terminal step needed). Generate the API key first using **Step 1**
+  below, then paste the URL (`http://host.docker.internal:8642`) and key into
+  the install form. If you ever switch the provider by hand afterwards, your
+  choice is preserved across restarts.
+- **Manual** — leave those install fields blank and run the interactive
+  `hermes memory setup` wizard later, as described in **Step 2**.
 
 #### Step 1 — Install Companion Memory and generate an API key (do this first)
 
