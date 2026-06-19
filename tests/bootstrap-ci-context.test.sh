@@ -163,6 +163,15 @@ out="$(cat "${data_dir}/config.yaml")"
 assert_not_contains "no memory provider written" "provider: companionintelligence" "${out}"
 rm -rf "${data_dir}"
 
+# ─── Test 6b: whitespace-only credentials count as missing ───────────────────
+echo "test: whitespace-only URL/token do not activate (plugin would strip them)"
+data_dir="$(mktemp -d)"
+printf 'model:\n  provider: ollama\n' > "${data_dir}/config.yaml"
+run_bootstrap "${data_dir}" "CI_SERVER_URL=   " "CI_SERVER_TOKEN=	"
+out="$(cat "${data_dir}/config.yaml")"
+assert_not_contains "no provider for whitespace creds" "provider: companionintelligence" "${out}"
+rm -rf "${data_dir}"
+
 # ─── Test 7: CI_SERVER_ENABLED=false is an explicit off-switch ───────────────
 echo "test: CI_SERVER_ENABLED=false disables activation even with creds"
 data_dir="$(mktemp -d)"
