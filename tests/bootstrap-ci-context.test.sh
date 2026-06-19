@@ -90,7 +90,21 @@ assert_contains "memory.provider selected" "provider: companionintelligence" "${
 assert_eq "single enabled: key (no duplicate)" "1" "$(count_child_key "${data_dir}/config.yaml" enabled)"
 rm -rf "${data_dir}"
 
-# ─── Test 2: inline `enabled: []` / `disabled: [...]` reconciled w/o dup key ──
+# ─── Test 2: empty provider (Hermes' "built-in only" default) is filled ──────
+echo "test: empty memory.provider is treated as unset and gets activated"
+data_dir="$(mktemp -d)"
+cat > "${data_dir}/config.yaml" <<'EOF'
+model:
+  provider: ollama
+memory:
+  provider: ''
+EOF
+run_bootstrap "${data_dir}" "${CREDS[@]}"
+out="$(cat "${data_dir}/config.yaml")"
+assert_contains "empty provider filled with ours" "provider: companionintelligence" "${out}"
+rm -rf "${data_dir}"
+
+# ─── Test 3: inline `enabled: []` / `disabled: [...]` reconciled w/o dup key ──
 echo "test: inline empty-list form is opened instead of duplicated"
 data_dir="$(mktemp -d)"
 cat > "${data_dir}/config.yaml" <<'EOF'
@@ -100,19 +114,16 @@ plugins:
   enabled: []
   disabled:
     - companionintelligence
-memory:
-  provider: local
 EOF
 run_bootstrap "${data_dir}" "${CREDS[@]}"
 out="$(cat "${data_dir}/config.yaml")"
 assert_eq "single enabled: key (no duplicate)" "1" "$(count_child_key "${data_dir}/config.yaml" enabled)"
+assert_contains "ci-runtime enabled" "- ci-runtime" "${out}"
 assert_contains "companionintelligence moved into enabled" "- companionintelligence" "${out}"
 assert_contains "disabled emptied" "disabled: []" "${out}"
-assert_contains "provider overrides default 'local'" "provider: companionintelligence" "${out}"
-assert_not_contains "old default provider gone" "provider: local" "${out}"
 rm -rf "${data_dir}"
 
-# ─── Test 3: idempotent across two runs (marker present on second) ───────────
+# ─── Test 4: idempotent across two runs ──────────────────────────────────────
 echo "test: running twice is idempotent and produces no duplicate keys"
 data_dir="$(mktemp -d)"
 printf 'model:\n  provider: ollama\n' > "${data_dir}/config.yaml"
@@ -122,50 +133,52 @@ run_bootstrap "${data_dir}" "${CREDS[@]}"
 hash2="$(shasum "${data_dir}/config.yaml" | awk '{print $1}')"
 assert_eq "two runs produce identical config.yaml" "${hash1}" "${hash2}"
 assert_eq "still a single enabled: key" "1" "$(count_child_key "${data_dir}/config.yaml" enabled)"
-assert_eq "marker file written" "yes" "$([[ -f "${data_dir}/companionintelligence/.ci-auto-activated" ]] && echo yes || echo no)"
 rm -rf "${data_dir}"
 
-# ─── Test 4: marker guard preserves a provider the user later chose by hand ──
-echo "test: a hand-picked provider is not clobbered on later runs"
+# ─── Test 5: never clobber a non-empty provider (upgrade / hand-picked) ──────
+# A pre-existing install already has another provider set BEFORE the first
+# auto-activation run. With creds present, that provider must be preserved and
+# our plugin must not be force-selected — including on this very first run.
+echo "test: an existing non-empty provider is never clobbered (no marker needed)"
 data_dir="$(mktemp -d)"
-printf 'model:\n  provider: ollama\n' > "${data_dir}/config.yaml"
-run_bootstrap "${data_dir}" "${CREDS[@]}"                       # activates + writes marker
-# user switches provider by hand:
-sed -i 's/provider: companionintelligence/provider: my-custom/' "${data_dir}/config.yaml"
-run_bootstrap "${data_dir}" "${CREDS[@]}"                       # marker present → must not override
+cat > "${data_dir}/config.yaml" <<'EOF'
+model:
+  provider: ollama
+memory:
+  provider: someother-memory
+EOF
+run_bootstrap "${data_dir}" "${CREDS[@]}"
 out="$(cat "${data_dir}/config.yaml")"
-assert_contains "user provider preserved" "provider: my-custom" "${out}"
-assert_not_contains "not reverted to companionintelligence provider" "provider: companionintelligence" "${out}"
+assert_contains "user provider preserved" "provider: someother-memory" "${out}"
+assert_not_contains "our provider not selected" "provider: companionintelligence" "${out}"
+assert_not_contains "our plugin not force-enabled" "- companionintelligence" "${out}"
 rm -rf "${data_dir}"
 
-# ─── Test 5: no credentials → no activation, no marker ───────────────────────
+# ─── Test 6: no credentials → no activation ──────────────────────────────────
 echo "test: without credentials nothing is activated"
 data_dir="$(mktemp -d)"
 printf 'model:\n  provider: ollama\n' > "${data_dir}/config.yaml"
 run_bootstrap "${data_dir}"
 out="$(cat "${data_dir}/config.yaml")"
 assert_not_contains "no memory provider written" "provider: companionintelligence" "${out}"
-assert_eq "no marker file" "no" "$([[ -f "${data_dir}/companionintelligence/.ci-auto-activated" ]] && echo yes || echo no)"
 rm -rf "${data_dir}"
 
-# ─── Test 6: CI_SERVER_ENABLED=false is an explicit off-switch ───────────────
+# ─── Test 7: CI_SERVER_ENABLED=false is an explicit off-switch ───────────────
 echo "test: CI_SERVER_ENABLED=false disables activation even with creds"
 data_dir="$(mktemp -d)"
 printf 'model:\n  provider: ollama\n' > "${data_dir}/config.yaml"
 run_bootstrap "${data_dir}" "${CREDS[@]}" CI_SERVER_ENABLED=false
 out="$(cat "${data_dir}/config.yaml")"
 assert_not_contains "memory provider not selected" "provider: companionintelligence" "${out}"
-assert_eq "no marker file" "no" "$([[ -f "${data_dir}/companionintelligence/.ci-auto-activated" ]] && echo yes || echo no)"
 rm -rf "${data_dir}"
 
-# ─── Test 6b: off-switch is case-insensitive and whitespace-tolerant ─────────
+# ─── Test 7b: off-switch is case-insensitive and whitespace-tolerant ─────────
 echo "test: CI_SERVER_ENABLED='FALSE ' (mixed case + space) also disables"
 data_dir="$(mktemp -d)"
 printf 'model:\n  provider: ollama\n' > "${data_dir}/config.yaml"
 run_bootstrap "${data_dir}" "${CREDS[@]}" "CI_SERVER_ENABLED=FALSE "
 out="$(cat "${data_dir}/config.yaml")"
 assert_not_contains "memory provider not selected" "provider: companionintelligence" "${out}"
-assert_eq "no marker file" "no" "$([[ -f "${data_dir}/companionintelligence/.ci-auto-activated" ]] && echo yes || echo no)"
 rm -rf "${data_dir}"
 
 # ─── Summary ────────────────────────────────────────────────────────────────
