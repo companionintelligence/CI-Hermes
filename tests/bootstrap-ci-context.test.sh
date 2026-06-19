@@ -270,6 +270,33 @@ out="$(cat "${data_dir}/config.yaml")"
 assert_not_contains "zero num_ctx not written" "num_ctx:" "${out}"
 rm -rf "${data_dir}"
 
+# ─── Test 15: .env.hub-bootstrap without HERMES_NUM_CTX must not abort ───────
+# Under `set -euo pipefail` a no-match grep would fail the pipeline and abort the
+# whole bootstrap. run_bootstrap does not swallow a non-zero exit, so a regression
+# here crashes the suite; we also assert the rest of the reconcile still ran.
+echo "test: a hub env file lacking HERMES_NUM_CTX still completes the reconcile"
+data_dir="$(mktemp -d)"
+printf 'model:\n  provider: ollama\n' > "${data_dir}/config.yaml"
+printf 'OPENAI_MODEL=qwen3.6:27b\nOLLAMA_HOST=http://host.docker.internal:11434\n' > "${data_dir}/.env.hub-bootstrap"
+run_bootstrap "${data_dir}" "${CREDS[@]}"
+out="$(cat "${data_dir}/config.yaml")"
+assert_contains "reconcile still ran (ci-runtime enabled)" "- ci-runtime" "${out}"
+assert_not_contains "no num_ctx written without the key" "num_ctx:" "${out}"
+rm -rf "${data_dir}"
+
+# ─── Test 16: a fully-reconciled config is not rewritten (no mtime churn) ─────
+echo "test: a second run does not rewrite an already-reconciled config.yaml"
+data_dir="$(mktemp -d)"
+printf 'model:\n  provider: ollama\n' > "${data_dir}/config.yaml"
+printf 'HERMES_NUM_CTX=65536\n' > "${data_dir}/.env.hub-bootstrap"
+run_bootstrap "${data_dir}" "${CREDS[@]}"
+touch -d '2020-01-01 00:00:00' "${data_dir}/config.yaml"
+before="$(stat -c %Y "${data_dir}/config.yaml")"
+run_bootstrap "${data_dir}" "${CREDS[@]}"
+after="$(stat -c %Y "${data_dir}/config.yaml")"
+assert_eq "config.yaml not rewritten when unchanged (mtime preserved)" "${before}" "${after}"
+rm -rf "${data_dir}"
+
 # ─── Summary ────────────────────────────────────────────────────────────────
 echo
 echo "Results: ${PASS} passed, ${FAIL} failed"

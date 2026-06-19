@@ -67,7 +67,9 @@ python3 /app/configure-ci-server.py 2>&1 || true
 HUB_ENV_FILE="${DATA_DIR}/.env.hub-bootstrap"
 ci_num_ctx=""
 if [[ -f "${HUB_ENV_FILE}" ]]; then
-  ci_num_ctx="$(grep '^HERMES_NUM_CTX=' "${HUB_ENV_FILE}" 2>/dev/null | cut -d= -f2- | head -n 1)"
+  # `|| true`: under `set -euo pipefail` a no-match grep (exit 1) would otherwise
+  # fail the pipeline and abort the whole bootstrap when the key is simply absent.
+  ci_num_ctx="$(grep -m1 '^HERMES_NUM_CTX=' "${HUB_ENV_FILE}" 2>/dev/null | cut -d= -f2- || true)"
 fi
 # Fall back to the process env in case the value is exported rather than file-only.
 [[ -z "${ci_num_ctx}" ]] && ci_num_ctx="${HERMES_NUM_CTX:-}"
@@ -292,7 +294,10 @@ if num_ctx:
         print(f"CI context: set model.num_ctx={num_ctx}")
 
 new_text = "".join(lines)
-config_path.write_text(new_text, encoding="utf-8")
+# Only write when something actually changed, so a fully-reconciled config is a
+# true no-op (no needless mtime churn on every boot).
+if new_text != text:
+    config_path.write_text(new_text, encoding="utf-8")
 PY
 else
   echo "CI context: ${CONFIG_FILE} not found yet; plugin and skill config will be reconciled on next startup" >&2
