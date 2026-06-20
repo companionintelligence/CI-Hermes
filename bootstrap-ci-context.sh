@@ -57,8 +57,33 @@ fi
 # Uses CI_SERVER_URL / CI_SERVER_TOKEN / CI_SERVER_ENABLED from the environment.
 python3 /app/configure-ci-server.py 2>&1 || true
 
+# Hardware-aware context window (num_ctx) the Hub computed for this machine and
+# wrote into .env.hub-bootstrap as HERMES_NUM_CTX. bootstrap-from-hub.sh only
+# stamps model.num_ctx when it FIRST generates config.yaml; once the file exists
+# it skips ("config.yaml already exists; skipping generation"), so a config created
+# before this value existed — or a value that later changes — would keep Ollama's
+# oversized memory-based default (e.g. 262144 on unified-memory APUs). Reconcile it
+# into model.num_ctx on every boot, mirroring how CI-OpenClaw re-patches its config.
+HUB_ENV_FILE="${DATA_DIR}/.env.hub-bootstrap"
+ci_num_ctx=""
+if [[ -f "${HUB_ENV_FILE}" ]]; then
+  # `|| true`: under `set -euo pipefail` a no-match grep (exit 1) would otherwise
+  # fail the pipeline and abort the whole bootstrap when the key is simply absent.
+  ci_num_ctx="$(grep -m1 '^HERMES_NUM_CTX=' "${HUB_ENV_FILE}" 2>/dev/null | cut -d= -f2- || true)"
+fi
+# Fall back to the process env in case the value is exported rather than file-only.
+[[ -z "${ci_num_ctx}" ]] && ci_num_ctx="${HERMES_NUM_CTX:-}"
+# Normalize: strip whitespace, a stray CR (CRLF env files), and surrounding quotes
+# (a PyYAML/dotenv re-dump may emit HERMES_NUM_CTX="65536"). The value is numeric,
+# so deleting all of these characters is equivalent to a strip.
+ci_num_ctx="$(printf '%s' "${ci_num_ctx}" | tr -d "[:space:]\"'")"
+# Only a POSITIVE integer is a meaningful context window; treat 0 / garbage as unset.
+if ! printf '%s' "${ci_num_ctx}" | grep -qE '^[1-9][0-9]*$'; then
+  ci_num_ctx=""
+fi
+
 if [[ -f "${CONFIG_FILE}" ]]; then
-  python3 - "${CONFIG_FILE}" "${SKILLS_SOURCE}" "${PLUGIN_NAME}" "${CI_MEMORY_PROVIDER}" <<'PY'
+  python3 - "${CONFIG_FILE}" "${SKILLS_SOURCE}" "${PLUGIN_NAME}" "${CI_MEMORY_PROVIDER}" "${ci_num_ctx}" <<'PY'
 from pathlib import Path
 import re
 import sys
@@ -67,6 +92,7 @@ config_path = Path(sys.argv[1])
 skills_dir = sys.argv[2]
 plugin_name = sys.argv[3]
 memory_provider = sys.argv[4] if len(sys.argv) > 4 else ""
+num_ctx = sys.argv[5] if len(sys.argv) > 5 else ""
 
 text = config_path.read_text(encoding="utf-8")
 lines = text.splitlines(keepends=True)
@@ -250,8 +276,28 @@ if memory_provider:
             set_child_scalar("memory", "provider", memory_provider)
             print(f"CI context: selected '{memory_provider}' as active memory provider")
 
+# ── Hub-managed context window ────────────────────────────────────────────────
+# Reconcile model.num_ctx every boot (see the shell preamble for why a write that
+# only happens at config generation is not enough). Only touch an existing model
+# section so we never create a provider-less stub — bootstrap-from-hub.sh owns
+# generating that section on first boot. Skip the write when the value is already
+# correct so repeated runs stay byte-identical (idempotent).
+if num_ctx:
+    model_start, _ = section_bounds("model")
+    if model_start is None:
+        print(
+            "CI context: no model section yet; num_ctx will be reconciled on next startup",
+            file=sys.stderr,
+        )
+    elif get_child_scalar("model", "num_ctx") != num_ctx:
+        set_child_scalar("model", "num_ctx", num_ctx)
+        print(f"CI context: set model.num_ctx={num_ctx}")
+
 new_text = "".join(lines)
-config_path.write_text(new_text, encoding="utf-8")
+# Only write when something actually changed, so a fully-reconciled config is a
+# true no-op (no needless mtime churn on every boot).
+if new_text != text:
+    config_path.write_text(new_text, encoding="utf-8")
 PY
 else
   echo "CI context: ${CONFIG_FILE} not found yet; plugin and skill config will be reconciled on next startup" >&2
