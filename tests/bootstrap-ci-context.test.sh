@@ -193,33 +193,38 @@ assert_not_contains "memory provider not selected" "provider: companionintellige
 rm -rf "${data_dir}"
 
 # ─── Test 8: HERMES_NUM_CTX from .env.hub-bootstrap is reconciled in ──────────
-# A config generated before the Hub computed a context window has no model.num_ctx;
-# the reconcile must add it from .env.hub-bootstrap so Ollama doesn't load the
-# model at its oversized default.
-echo "test: num_ctx from .env.hub-bootstrap is written into model.num_ctx"
+# A config generated before the Hub computed a context window has no
+# model.ollama_num_ctx; the reconcile must add it from .env.hub-bootstrap so Ollama
+# doesn't load the model at its oversized default. context_length is intentionally
+# NOT written (the agent fatally rejects a window below 64K; see bootstrap script).
+echo "test: HERMES_NUM_CTX is written into model.ollama_num_ctx"
 data_dir="$(mktemp -d)"
 printf 'model:\n  provider: ollama\n  default: qwen3.6:27b\n' > "${data_dir}/config.yaml"
 printf 'HERMES_NUM_CTX=65536\n' > "${data_dir}/.env.hub-bootstrap"
 run_bootstrap "${data_dir}"
 out="$(cat "${data_dir}/config.yaml")"
-assert_contains "model.num_ctx set" "num_ctx: 65536" "${out}"
-assert_eq "single num_ctx key (no duplicate)" "1" "$(count_child_key "${data_dir}/config.yaml" num_ctx)"
+assert_contains "model.ollama_num_ctx set" "ollama_num_ctx: 65536" "${out}"
+assert_not_contains "context_length not written (avoids 64K-minimum abort)" "context_length:" "${out}"
+assert_eq "single ollama_num_ctx key (no duplicate)" "1" "$(count_child_key "${data_dir}/config.yaml" ollama_num_ctx)"
 rm -rf "${data_dir}"
 
-# ─── Test 9: a stale num_ctx is corrected to the Hub's current value ──────────
-echo "test: a pre-existing stale model.num_ctx is updated to the Hub value"
+# ─── Test 9: a stale/legacy num_ctx is migrated to the Hub's current value ─────
+# Upstream only reads ollama_num_ctx; a config carrying the dead num_ctx key (from
+# a pre-fix appliance) must have it removed and the live keys set to the Hub value.
+echo "test: a pre-existing legacy model.num_ctx is migrated and updated"
 data_dir="$(mktemp -d)"
 printf 'model:\n  provider: ollama\n  num_ctx: 262144\n' > "${data_dir}/config.yaml"
 printf 'HERMES_NUM_CTX=65536\n' > "${data_dir}/.env.hub-bootstrap"
 run_bootstrap "${data_dir}"
 out="$(cat "${data_dir}/config.yaml")"
-assert_contains "stale num_ctx replaced" "num_ctx: 65536" "${out}"
-assert_not_contains "old num_ctx gone" "num_ctx: 262144" "${out}"
-assert_eq "single num_ctx key (no duplicate)" "1" "$(count_child_key "${data_dir}/config.yaml" num_ctx)"
+assert_contains "ollama_num_ctx set to Hub value" "ollama_num_ctx: 65536" "${out}"
+assert_not_contains "legacy num_ctx key removed" "  num_ctx:" "${out}"
+assert_not_contains "old value gone" "262144" "${out}"
+assert_eq "single ollama_num_ctx key (no duplicate)" "1" "$(count_child_key "${data_dir}/config.yaml" ollama_num_ctx)"
 rm -rf "${data_dir}"
 
-# ─── Test 10: num_ctx reconcile is idempotent across two runs ────────────────
-echo "test: num_ctx reconcile is idempotent (two runs identical)"
+# ─── Test 10: context reconcile is idempotent across two runs ────────────────
+echo "test: context reconcile is idempotent (two runs identical)"
 data_dir="$(mktemp -d)"
 printf 'model:\n  provider: ollama\n' > "${data_dir}/config.yaml"
 printf 'HERMES_NUM_CTX=65536\n' > "${data_dir}/.env.hub-bootstrap"
@@ -230,13 +235,14 @@ hash2="$(shasum "${data_dir}/config.yaml" | awk '{print $1}')"
 assert_eq "two runs produce identical config.yaml" "${hash1}" "${hash2}"
 rm -rf "${data_dir}"
 
-# ─── Test 11: no HERMES_NUM_CTX → model.num_ctx is not touched ────────────────
-echo "test: without HERMES_NUM_CTX no num_ctx is written"
+# ─── Test 11: no HERMES_NUM_CTX → model context keys are not touched ──────────
+echo "test: without HERMES_NUM_CTX no context window keys are written"
 data_dir="$(mktemp -d)"
 printf 'model:\n  provider: ollama\n' > "${data_dir}/config.yaml"
 run_bootstrap "${data_dir}"
 out="$(cat "${data_dir}/config.yaml")"
-assert_not_contains "no num_ctx written" "num_ctx:" "${out}"
+assert_not_contains "no ollama_num_ctx written" "ollama_num_ctx:" "${out}"
+assert_not_contains "no context_length written" "context_length:" "${out}"
 rm -rf "${data_dir}"
 
 # ─── Test 12: a non-integer HERMES_NUM_CTX is ignored ────────────────────────
@@ -246,7 +252,8 @@ printf 'model:\n  provider: ollama\n' > "${data_dir}/config.yaml"
 printf 'HERMES_NUM_CTX=not-a-number\n' > "${data_dir}/.env.hub-bootstrap"
 run_bootstrap "${data_dir}"
 out="$(cat "${data_dir}/config.yaml")"
-assert_not_contains "garbage num_ctx not written" "num_ctx:" "${out}"
+assert_not_contains "garbage ollama_num_ctx not written" "ollama_num_ctx:" "${out}"
+assert_not_contains "garbage context_length not written" "context_length:" "${out}"
 rm -rf "${data_dir}"
 
 # ─── Test 13: a quoted HERMES_NUM_CTX value is still applied ─────────────────
@@ -256,8 +263,8 @@ printf 'model:\n  provider: ollama\n' > "${data_dir}/config.yaml"
 printf 'HERMES_NUM_CTX="65536"\n' > "${data_dir}/.env.hub-bootstrap"
 run_bootstrap "${data_dir}"
 out="$(cat "${data_dir}/config.yaml")"
-assert_contains "quoted num_ctx applied" "num_ctx: 65536" "${out}"
-assert_not_contains "no stray quotes in value" 'num_ctx: "' "${out}"
+assert_contains "quoted ollama_num_ctx applied" "ollama_num_ctx: 65536" "${out}"
+assert_not_contains "no stray quotes in value" 'ollama_num_ctx: "' "${out}"
 rm -rf "${data_dir}"
 
 # ─── Test 14: HERMES_NUM_CTX=0 is rejected (not a meaningful window) ──────────
@@ -267,7 +274,7 @@ printf 'model:\n  provider: ollama\n' > "${data_dir}/config.yaml"
 printf 'HERMES_NUM_CTX=0\n' > "${data_dir}/.env.hub-bootstrap"
 run_bootstrap "${data_dir}"
 out="$(cat "${data_dir}/config.yaml")"
-assert_not_contains "zero num_ctx not written" "num_ctx:" "${out}"
+assert_not_contains "zero ollama_num_ctx not written" "ollama_num_ctx:" "${out}"
 rm -rf "${data_dir}"
 
 # ─── Test 15: .env.hub-bootstrap without HERMES_NUM_CTX must not abort ───────
@@ -281,7 +288,7 @@ printf 'OPENAI_MODEL=qwen3.6:27b\nOLLAMA_HOST=http://host.docker.internal:11434\
 run_bootstrap "${data_dir}" "${CREDS[@]}"
 out="$(cat "${data_dir}/config.yaml")"
 assert_contains "reconcile still ran (ci-runtime enabled)" "- ci-runtime" "${out}"
-assert_not_contains "no num_ctx written without the key" "num_ctx:" "${out}"
+assert_not_contains "no ollama_num_ctx written without the key" "ollama_num_ctx:" "${out}"
 rm -rf "${data_dir}"
 
 # ─── Test 16: a fully-reconciled config is not rewritten (no mtime churn) ─────

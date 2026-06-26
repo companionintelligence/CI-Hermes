@@ -196,16 +196,24 @@ model:
   provider: ollama
   default: '${model_name_yaml}'
 EOF
-        # Hardware-aware context size from the Hub (HERMES_NUM_CTX). Sets the
-        # native Ollama num_ctx so Hermes doesn't inherit Ollama's oversized
-        # memory-based default (e.g. 262144 on unified-memory APUs). The host
-        # OLLAMA_CONTEXT_LENGTH remains authoritative for the OpenAI-compatible
-        # surface; this covers the native ollama provider path.
+        # Hardware-aware context size from the Hub (HERMES_NUM_CTX). The upstream
+        # hermes-agent reads model.ollama_num_ctx (NOT num_ctx) and injects it as
+        # extra_body.options.num_ctx on every chat request — see the bundled
+        # plugins/model-providers/custom profile. A value under the wrong key is
+        # silently ignored, so Hermes falls back to Ollama's tiny 4096 default for
+        # any model it can't auto-detect.
+        #
+        # We deliberately do NOT also set model.context_length: the agent rejects a
+        # context window below MINIMUM_CONTEXT_LENGTH (64K) with a fatal error at
+        # startup, and the Hub ladder routinely emits smaller values (32768/16384/…)
+        # on memory-constrained hardware. Leaving context_length unset lets the agent
+        # auto-detect the model's true window (>=64K for supported models) while
+        # ollama_num_ctx still caps the KV cache Ollama actually allocates.
         num_ctx_raw=$(grep "^HERMES_NUM_CTX=" "${OUT_ENV}" | cut -d= -f2- | head -n 1)
         num_ctx=$(normalize_env_value "${num_ctx_raw}")
         if printf '%s' "${num_ctx}" | grep -q -E '^[0-9]+$'; then
-          printf '  num_ctx: %s\n' "${num_ctx}" >> "${OUT_CONFIG}"
-          log "set model.num_ctx=${num_ctx} in ${OUT_CONFIG}"
+          printf '  ollama_num_ctx: %s\n' "${num_ctx}" >> "${OUT_CONFIG}"
+          log "set model.ollama_num_ctx=${num_ctx} in ${OUT_CONFIG}"
         fi
         chmod 600 "${OUT_CONFIG}" 2>/dev/null || true
         log "wrote ${OUT_CONFIG} with provider=ollama"

@@ -57,13 +57,18 @@ fi
 # Uses CI_SERVER_URL / CI_SERVER_TOKEN / CI_SERVER_ENABLED from the environment.
 python3 /app/configure-ci-server.py 2>&1 || true
 
-# Hardware-aware context window (num_ctx) the Hub computed for this machine and
-# wrote into .env.hub-bootstrap as HERMES_NUM_CTX. bootstrap-from-hub.sh only
-# stamps model.num_ctx when it FIRST generates config.yaml; once the file exists
-# it skips ("config.yaml already exists; skipping generation"), so a config created
-# before this value existed — or a value that later changes — would keep Ollama's
-# oversized memory-based default (e.g. 262144 on unified-memory APUs). Reconcile it
-# into model.num_ctx on every boot, mirroring how CI-OpenClaw re-patches its config.
+# Hardware-aware context window the Hub computed for this machine and wrote into
+# .env.hub-bootstrap as HERMES_NUM_CTX. The upstream hermes-agent reads
+# model.ollama_num_ctx (NOT num_ctx) and injects it as extra_body.options.num_ctx
+# on every chat request; a value under the wrong key is silently ignored and Ollama
+# falls back to its tiny 4096 default. bootstrap-from-hub.sh only stamps this key
+# when it FIRST generates config.yaml; once the file exists it skips ("config.yaml
+# already exists; skipping generation"), so a config created before this value
+# existed — or a value that later changes — would keep Ollama's default. Reconcile
+# model.ollama_num_ctx on every boot (and migrate the legacy, never-read num_ctx key
+# off existing configs), mirroring how CI-OpenClaw re-patches its config. We do NOT
+# set model.context_length: the agent fatally rejects a window below 64K, and the
+# Hub ladder routinely emits smaller values — auto-detection keeps Hermes bootable.
 HUB_ENV_FILE="${DATA_DIR}/.env.hub-bootstrap"
 ci_num_ctx=""
 if [[ -f "${HUB_ENV_FILE}" ]]; then
@@ -249,6 +254,19 @@ def set_child_scalar(section: str, child: str, value: str):
             return
     lines.insert(section_index + 1, new_line)
 
+def delete_child_scalar(section: str, child: str) -> bool:
+    """Remove a `  child: value` scalar line from a section. Returns True if removed."""
+    global lines
+    section_index, section_end = section_bounds(section)
+    if section_index is None:
+        return False
+    child_re = re.compile(rf"^  {re.escape(child)}:\s*(?:.*)$")
+    for i in range(section_index + 1, section_end):
+        if child_re.match(lines[i]):
+            del lines[i]
+            return True
+    return False
+
 if Path(skills_dir).is_dir():
     ensure_child_list_item("skills", "external_dirs", skills_dir)
 else:
@@ -277,8 +295,9 @@ if memory_provider:
             print(f"CI context: selected '{memory_provider}' as active memory provider")
 
 # ── Hub-managed context window ────────────────────────────────────────────────
-# Reconcile model.num_ctx every boot (see the shell preamble for why a write that
-# only happens at config generation is not enough). Only touch an existing model
+# Reconcile model.ollama_num_ctx every boot (see the shell preamble for why a write
+# that only happens at config generation is not enough, and why ollama_num_ctx — not
+# num_ctx — is the key the upstream agent reads). Only touch an existing model
 # section so we never create a provider-less stub — bootstrap-from-hub.sh owns
 # generating that section on first boot. Skip the write when the value is already
 # correct so repeated runs stay byte-identical (idempotent).
@@ -289,9 +308,14 @@ if num_ctx:
             "CI context: no model section yet; num_ctx will be reconciled on next startup",
             file=sys.stderr,
         )
-    elif get_child_scalar("model", "num_ctx") != num_ctx:
-        set_child_scalar("model", "num_ctx", num_ctx)
-        print(f"CI context: set model.num_ctx={num_ctx}")
+    else:
+        # Migrate the legacy, never-read `num_ctx` key off existing configs so an
+        # appliance bootstrapped before this fix stops carrying a dead key.
+        if delete_child_scalar("model", "num_ctx"):
+            print("CI context: removed stale model.num_ctx (upstream reads ollama_num_ctx)")
+        if get_child_scalar("model", "ollama_num_ctx") != num_ctx:
+            set_child_scalar("model", "ollama_num_ctx", num_ctx)
+            print(f"CI context: set model.ollama_num_ctx={num_ctx}")
 
 new_text = "".join(lines)
 # Only write when something actually changed, so a fully-reconciled config is a
