@@ -23,6 +23,12 @@ HUB_APP_SLUG="${HUB_APP_SLUG:-hermes-agent}"
 DATA_DIR="${HERMES_HOME:-/opt/data}"
 OUT_ENV="${DATA_DIR}/.env.hub-bootstrap"
 
+# Hermes' hard minimum context window. Mirrors the upstream agent's
+# MINIMUM_CONTEXT_LENGTH, which is the literal 64000 (NOT 65536) and is compared
+# with a strict `<`, so a context_length of exactly 64000 is accepted. We only pin
+# model.context_length at/above this value; below it the agent would abort at startup.
+HERMES_MIN_CONTEXT=64000
+
 log() {
   echo "[hub-bootstrap] $*"
 }
@@ -207,17 +213,20 @@ EOF
         # window matches the KV cache Ollama actually allocates (otherwise the agent
         # auto-detects the model's full window — e.g. 128K — and over-fills a smaller
         # cache, silently truncating long sessions). But ONLY when the value clears
-        # Hermes' 64K minimum: the agent fatally rejects a context_length below
-        # MINIMUM_CONTEXT_LENGTH (64K) at startup. The Hub floors hermes-agent to 64K,
-        # so this normally fires; the guard keeps us safe against an older Hub (or a
-        # model whose own window is below 64K), where we leave context_length to the
-        # agent's auto-detection and only cap the KV cache via ollama_num_ctx.
+        # HERMES_MIN_CONTEXT: the agent fatally rejects a smaller context_length at
+        # startup. The Hub floors hermes-agent to that minimum, so this normally fires;
+        # the guard keeps us safe against an older Hub (or a model whose own window is
+        # below the minimum), where we leave context_length to the agent's
+        # auto-detection and only cap the KV cache via ollama_num_ctx.
+        #
+        # Only a POSITIVE integer is a meaningful window; treat 0 / garbage as unset,
+        # matching the reconcile path in bootstrap-ci-context.sh.
         num_ctx_raw=$(grep "^HERMES_NUM_CTX=" "${OUT_ENV}" | cut -d= -f2- | head -n 1)
         num_ctx=$(normalize_env_value "${num_ctx_raw}")
-        if printf '%s' "${num_ctx}" | grep -q -E '^[0-9]+$'; then
+        if printf '%s' "${num_ctx}" | grep -q -E '^[1-9][0-9]*$'; then
           printf '  ollama_num_ctx: %s\n' "${num_ctx}" >> "${OUT_CONFIG}"
           log "set model.ollama_num_ctx=${num_ctx} in ${OUT_CONFIG}"
-          if [ "${num_ctx}" -ge 64000 ]; then
+          if [ "${num_ctx}" -ge "${HERMES_MIN_CONTEXT}" ]; then
             printf '  context_length: %s\n' "${num_ctx}" >> "${OUT_CONFIG}"
             log "set model.context_length=${num_ctx} in ${OUT_CONFIG}"
           fi

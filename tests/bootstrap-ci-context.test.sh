@@ -223,6 +223,33 @@ assert_contains "model.ollama_num_ctx set" "ollama_num_ctx: 32768" "${out}"
 assert_not_contains "context_length NOT written below 64K (avoids startup abort)" "context_length:" "${out}"
 rm -rf "${data_dir}"
 
+# ─── Test 8c: a downgrade below 64K REMOVES a previously-pinned context_length ──
+# A config pinned at >=64K on prior hardware must drop context_length when the Hub
+# later recommends a sub-64K window, so the agent auto-detects instead of booting
+# with a now-too-large pinned window (the "<min → context_length unset" contract).
+echo "test: a downgrade below 64K removes a pre-existing context_length"
+data_dir="$(mktemp -d)"
+printf 'model:\n  provider: ollama\n  ollama_num_ctx: 65536\n  context_length: 65536\n' > "${data_dir}/config.yaml"
+printf 'HERMES_NUM_CTX=32768\n' > "${data_dir}/.env.hub-bootstrap"
+run_bootstrap "${data_dir}"
+out="$(cat "${data_dir}/config.yaml")"
+assert_contains "ollama_num_ctx updated to new value" "ollama_num_ctx: 32768" "${out}"
+assert_not_contains "stale context_length removed on downgrade" "context_length:" "${out}"
+rm -rf "${data_dir}"
+
+# ─── Test 8d: duplicate stale num_ctx keys are ALL migrated away ───────────────
+# delete_child_scalar removes every occurrence, not just the first, so a config that
+# somehow carried duplicates doesn't keep a stale copy.
+echo "test: duplicate legacy num_ctx keys are all removed"
+data_dir="$(mktemp -d)"
+printf 'model:\n  provider: ollama\n  num_ctx: 111\n  num_ctx: 222\n' > "${data_dir}/config.yaml"
+printf 'HERMES_NUM_CTX=65536\n' > "${data_dir}/.env.hub-bootstrap"
+run_bootstrap "${data_dir}"
+out="$(cat "${data_dir}/config.yaml")"
+assert_eq "no legacy num_ctx keys remain" "0" "$(count_child_key "${data_dir}/config.yaml" num_ctx)"
+assert_contains "ollama_num_ctx set" "ollama_num_ctx: 65536" "${out}"
+rm -rf "${data_dir}"
+
 # ─── Test 9: a stale/legacy num_ctx is migrated to the Hub's current value ─────
 # Upstream only reads ollama_num_ctx; a config carrying the dead num_ctx key (from
 # a pre-fix appliance) must have it removed and the live keys set to the Hub value.

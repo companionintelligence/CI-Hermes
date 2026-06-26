@@ -102,6 +102,11 @@ plugin_name = sys.argv[3]
 memory_provider = sys.argv[4] if len(sys.argv) > 4 else ""
 num_ctx = sys.argv[5] if len(sys.argv) > 5 else ""
 
+# Hermes' hard minimum context window. Mirrors the upstream agent's
+# MINIMUM_CONTEXT_LENGTH, which is the literal 64000 (NOT 65536) and is compared
+# with a strict `<`, so a context_length of exactly 64000 is accepted.
+HERMES_MIN_CONTEXT = 64000
+
 text = config_path.read_text(encoding="utf-8")
 lines = text.splitlines(keepends=True)
 
@@ -258,17 +263,25 @@ def set_child_scalar(section: str, child: str, value: str):
     lines.insert(section_index + 1, new_line)
 
 def delete_child_scalar(section: str, child: str) -> bool:
-    """Remove a `  child: value` scalar line from a section. Returns True if removed."""
+    """Remove ALL `  child: value` scalar lines from a section. Returns True if any
+    were removed. Removing every occurrence (not just the first) means a config that
+    already carried duplicates — from manual edits or an earlier reconcile bug —
+    doesn't keep a stale copy that a later read could pick up."""
     global lines
     section_index, section_end = section_bounds(section)
     if section_index is None:
         return False
     child_re = re.compile(rf"^  {re.escape(child)}:\s*(?:.*)$")
-    for i in range(section_index + 1, section_end):
+    removed = False
+    i = section_index + 1
+    while i < section_end:
         if child_re.match(lines[i]):
             del lines[i]
-            return True
-    return False
+            section_end -= 1
+            removed = True
+            continue
+        i += 1
+    return removed
 
 if Path(skills_dir).is_dir():
     ensure_child_list_item("skills", "external_dirs", skills_dir)
@@ -308,7 +321,7 @@ if num_ctx:
     model_start, _ = section_bounds("model")
     if model_start is None:
         print(
-            "CI context: no model section yet; num_ctx will be reconciled on next startup",
+            "CI context: no model section yet; ollama_num_ctx will be reconciled on next startup",
             file=sys.stderr,
         )
     else:
@@ -320,11 +333,17 @@ if num_ctx:
             set_child_scalar("model", "ollama_num_ctx", num_ctx)
             print(f"CI context: set model.ollama_num_ctx={num_ctx}")
         # Pin context_length to the same value so the agent's working window matches
-        # the KV cache — but only when it clears Hermes' 64K minimum (below that the
-        # agent aborts at startup, so we leave context_length to its auto-detection).
-        if int(num_ctx) >= 64000 and get_child_scalar("model", "context_length") != num_ctx:
-            set_child_scalar("model", "context_length", num_ctx)
-            print(f"CI context: set model.context_length={num_ctx}")
+        # the KV cache — but only when it clears HERMES_MIN_CONTEXT (below that the
+        # agent aborts at startup). context_length is fully Hub-managed: when the
+        # value drops below the minimum (e.g. a downgrade to smaller hardware) we
+        # REMOVE it so the agent falls back to auto-detecting the model's true window,
+        # matching the "<min → context_length unset" contract.
+        if int(num_ctx) >= HERMES_MIN_CONTEXT:
+            if get_child_scalar("model", "context_length") != num_ctx:
+                set_child_scalar("model", "context_length", num_ctx)
+                print(f"CI context: set model.context_length={num_ctx}")
+        elif delete_child_scalar("model", "context_length"):
+            print("CI context: removed model.context_length (Hub value below minimum; auto-detect)")
 
 new_text = "".join(lines)
 # Only write when something actually changed, so a fully-reconciled config is a
