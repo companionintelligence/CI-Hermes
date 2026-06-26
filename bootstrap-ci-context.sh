@@ -66,9 +66,12 @@ python3 /app/configure-ci-server.py 2>&1 || true
 # already exists; skipping generation"), so a config created before this value
 # existed — or a value that later changes — would keep Ollama's default. Reconcile
 # model.ollama_num_ctx on every boot (and migrate the legacy, never-read num_ctx key
-# off existing configs), mirroring how CI-OpenClaw re-patches its config. We do NOT
-# set model.context_length: the agent fatally rejects a window below 64K, and the
-# Hub ladder routinely emits smaller values — auto-detection keeps Hermes bootable.
+# off existing configs), mirroring how CI-OpenClaw re-patches its config. We also pin
+# model.context_length to the same value so the agent's working window matches the KV
+# cache Ollama allocates — but ONLY when it clears Hermes' 64K minimum, since the
+# agent fatally rejects a smaller context_length at startup (the Hub floors
+# hermes-agent to 64K; the guard protects against older Hubs / sub-64K models, where
+# auto-detection keeps Hermes bootable).
 HUB_ENV_FILE="${DATA_DIR}/.env.hub-bootstrap"
 ci_num_ctx=""
 if [[ -f "${HUB_ENV_FILE}" ]]; then
@@ -316,6 +319,12 @@ if num_ctx:
         if get_child_scalar("model", "ollama_num_ctx") != num_ctx:
             set_child_scalar("model", "ollama_num_ctx", num_ctx)
             print(f"CI context: set model.ollama_num_ctx={num_ctx}")
+        # Pin context_length to the same value so the agent's working window matches
+        # the KV cache — but only when it clears Hermes' 64K minimum (below that the
+        # agent aborts at startup, so we leave context_length to its auto-detection).
+        if int(num_ctx) >= 64000 and get_child_scalar("model", "context_length") != num_ctx:
+            set_child_scalar("model", "context_length", num_ctx)
+            print(f"CI context: set model.context_length={num_ctx}")
 
 new_text = "".join(lines)
 # Only write when something actually changed, so a fully-reconciled config is a

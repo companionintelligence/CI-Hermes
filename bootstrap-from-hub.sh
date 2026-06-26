@@ -203,17 +203,24 @@ EOF
         # silently ignored, so Hermes falls back to Ollama's tiny 4096 default for
         # any model it can't auto-detect.
         #
-        # We deliberately do NOT also set model.context_length: the agent rejects a
-        # context window below MINIMUM_CONTEXT_LENGTH (64K) with a fatal error at
-        # startup, and the Hub ladder routinely emits smaller values (32768/16384/…)
-        # on memory-constrained hardware. Leaving context_length unset lets the agent
-        # auto-detect the model's true window (>=64K for supported models) while
-        # ollama_num_ctx still caps the KV cache Ollama actually allocates.
+        # We also pin model.context_length to the same value so the agent's working
+        # window matches the KV cache Ollama actually allocates (otherwise the agent
+        # auto-detects the model's full window — e.g. 128K — and over-fills a smaller
+        # cache, silently truncating long sessions). But ONLY when the value clears
+        # Hermes' 64K minimum: the agent fatally rejects a context_length below
+        # MINIMUM_CONTEXT_LENGTH (64K) at startup. The Hub floors hermes-agent to 64K,
+        # so this normally fires; the guard keeps us safe against an older Hub (or a
+        # model whose own window is below 64K), where we leave context_length to the
+        # agent's auto-detection and only cap the KV cache via ollama_num_ctx.
         num_ctx_raw=$(grep "^HERMES_NUM_CTX=" "${OUT_ENV}" | cut -d= -f2- | head -n 1)
         num_ctx=$(normalize_env_value "${num_ctx_raw}")
         if printf '%s' "${num_ctx}" | grep -q -E '^[0-9]+$'; then
           printf '  ollama_num_ctx: %s\n' "${num_ctx}" >> "${OUT_CONFIG}"
           log "set model.ollama_num_ctx=${num_ctx} in ${OUT_CONFIG}"
+          if [ "${num_ctx}" -ge 64000 ]; then
+            printf '  context_length: %s\n' "${num_ctx}" >> "${OUT_CONFIG}"
+            log "set model.context_length=${num_ctx} in ${OUT_CONFIG}"
+          fi
         fi
         chmod 600 "${OUT_CONFIG}" 2>/dev/null || true
         log "wrote ${OUT_CONFIG} with provider=ollama"

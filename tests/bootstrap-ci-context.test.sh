@@ -192,20 +192,35 @@ out="$(cat "${data_dir}/config.yaml")"
 assert_not_contains "memory provider not selected" "provider: companionintelligence" "${out}"
 rm -rf "${data_dir}"
 
-# ─── Test 8: HERMES_NUM_CTX from .env.hub-bootstrap is reconciled in ──────────
+# ─── Test 8: HERMES_NUM_CTX (>=64K) is reconciled into both keys ──────────────
 # A config generated before the Hub computed a context window has no
 # model.ollama_num_ctx; the reconcile must add it from .env.hub-bootstrap so Ollama
-# doesn't load the model at its oversized default. context_length is intentionally
-# NOT written (the agent fatally rejects a window below 64K; see bootstrap script).
-echo "test: HERMES_NUM_CTX is written into model.ollama_num_ctx"
+# doesn't load the model at its oversized default. Because 65536 clears Hermes' 64K
+# minimum, context_length is pinned to the same value so the agent's window matches.
+echo "test: HERMES_NUM_CTX>=64K is written into model.ollama_num_ctx + context_length"
 data_dir="$(mktemp -d)"
 printf 'model:\n  provider: ollama\n  default: qwen3.6:27b\n' > "${data_dir}/config.yaml"
 printf 'HERMES_NUM_CTX=65536\n' > "${data_dir}/.env.hub-bootstrap"
 run_bootstrap "${data_dir}"
 out="$(cat "${data_dir}/config.yaml")"
 assert_contains "model.ollama_num_ctx set" "ollama_num_ctx: 65536" "${out}"
-assert_not_contains "context_length not written (avoids 64K-minimum abort)" "context_length:" "${out}"
+assert_contains "model.context_length set (>=64K clears the minimum)" "context_length: 65536" "${out}"
 assert_eq "single ollama_num_ctx key (no duplicate)" "1" "$(count_child_key "${data_dir}/config.yaml" ollama_num_ctx)"
+assert_eq "single context_length key (no duplicate)" "1" "$(count_child_key "${data_dir}/config.yaml" context_length)"
+rm -rf "${data_dir}"
+
+# ─── Test 8b: a sub-64K HERMES_NUM_CTX sets ollama_num_ctx but NOT context_length ─
+# Below Hermes' 64K minimum, pinning context_length would make the agent abort at
+# startup — so we cap the KV cache via ollama_num_ctx and leave context_length to the
+# agent's auto-detection (which resolves the model's true >=64K window).
+echo "test: sub-64K HERMES_NUM_CTX sets ollama_num_ctx only (no context_length)"
+data_dir="$(mktemp -d)"
+printf 'model:\n  provider: ollama\n  default: qwen3.6:27b\n' > "${data_dir}/config.yaml"
+printf 'HERMES_NUM_CTX=32768\n' > "${data_dir}/.env.hub-bootstrap"
+run_bootstrap "${data_dir}"
+out="$(cat "${data_dir}/config.yaml")"
+assert_contains "model.ollama_num_ctx set" "ollama_num_ctx: 32768" "${out}"
+assert_not_contains "context_length NOT written below 64K (avoids startup abort)" "context_length:" "${out}"
 rm -rf "${data_dir}"
 
 # ─── Test 9: a stale/legacy num_ctx is migrated to the Hub's current value ─────
@@ -218,6 +233,7 @@ printf 'HERMES_NUM_CTX=65536\n' > "${data_dir}/.env.hub-bootstrap"
 run_bootstrap "${data_dir}"
 out="$(cat "${data_dir}/config.yaml")"
 assert_contains "ollama_num_ctx set to Hub value" "ollama_num_ctx: 65536" "${out}"
+assert_contains "context_length set to Hub value (>=64K)" "context_length: 65536" "${out}"
 assert_not_contains "legacy num_ctx key removed" "  num_ctx:" "${out}"
 assert_not_contains "old value gone" "262144" "${out}"
 assert_eq "single ollama_num_ctx key (no duplicate)" "1" "$(count_child_key "${data_dir}/config.yaml" ollama_num_ctx)"
@@ -264,6 +280,7 @@ printf 'HERMES_NUM_CTX="65536"\n' > "${data_dir}/.env.hub-bootstrap"
 run_bootstrap "${data_dir}"
 out="$(cat "${data_dir}/config.yaml")"
 assert_contains "quoted ollama_num_ctx applied" "ollama_num_ctx: 65536" "${out}"
+assert_contains "quoted value also pins context_length (>=64K)" "context_length: 65536" "${out}"
 assert_not_contains "no stray quotes in value" 'ollama_num_ctx: "' "${out}"
 rm -rf "${data_dir}"
 
