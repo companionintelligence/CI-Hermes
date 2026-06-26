@@ -250,7 +250,9 @@ fixture="$(printf 'HERMES_DEFAULT_MODEL=qwen3.5:9b\nHERMES_NUM_CTX=32768\n')"
 run_with_fixture_in_dir "${fixture}" "${data_dir}"
 config_out="$(cat "${data_dir}/config.yaml")"
 assert_contains "model.ollama_num_ctx written from HERMES_NUM_CTX" "ollama_num_ctx: 32768" "${config_out}"
-assert_not_contains "legacy num_ctx key not written" "  num_ctx: 32768" "${config_out}"
+# Assert the legacy key is absent at ANY value (the two-space indent anchors the
+# `num_ctx` child without matching the `ollama_num_ctx` line above it).
+assert_not_contains "legacy num_ctx key not written" "  num_ctx:" "${config_out}"
 assert_not_contains "context_length not written below 64K (avoids startup abort)" "context_length:" "${config_out}"
 rm -rf "${data_dir}"
 
