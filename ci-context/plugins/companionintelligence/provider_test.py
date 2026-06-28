@@ -10,6 +10,7 @@ Run: ``python3 -m unittest provider_test`` from this directory.
 
 import os
 import sys
+import threading
 import types
 import unittest
 import urllib.error
@@ -77,6 +78,8 @@ class _MockClient:
         self.context_calls = 0
         self.recall_calls = 0
         self.turn_calls = []
+        self.write_calls = []
+        self.write_event = threading.Event()
 
     def context(self):
         self.context_calls += 1
@@ -88,6 +91,11 @@ class _MockClient:
 
     def turn(self, messages, session_id="", platform=""):
         self.turn_calls.append((messages, session_id, platform))
+        return {}
+
+    def write(self, content, source="", title="", session_id=""):
+        self.write_calls.append((content, source, session_id))
+        self.write_event.set()
         return {}
 
     def _get(self, path):  # used by fetch_intent_manifest
@@ -140,6 +148,24 @@ class CIClientDriftTests(unittest.TestCase):
     def test_url_normalization_strips_api_mcp_suffix(self):
         client = ci._CIClient("http://ci-server:8642/api/mcp/", "tok")
         self.assertEqual(client._base, "http://ci-server:8642")
+
+    def test_url_normalization_only_strips_api_mcp_and_whitespace(self):
+        # A too-aggressive strip (e.g. stripping any /api/* path) must not pass.
+        for url, expected in [
+            ("http://ci-server:8642", "http://ci-server:8642"),
+            ("http://ci-server:8642/api/memory", "http://ci-server:8642/api/memory"),
+            ("  http://ci-server:8642/api/mcp  ", "http://ci-server:8642"),
+        ]:
+            self.assertEqual(ci._CIClient(url, "t")._base, expected, url)
+
+    def test_recall_clamps_results(self):
+        client = self._client()
+        captured = {}
+        client._post = lambda path, payload: captured.update(payload=payload) or {}
+        client.recall("q", max_results=-3)  # negative → min bound of 1
+        self.assertEqual(captured["payload"]["maxResults"], 1)
+        client.recall("q", max_results=0)  # 0 is falsy → defaults to 5 (max_results or 5)
+        self.assertEqual(captured["payload"]["maxResults"], 5)
 
     def test_recall_caps_max_results_at_20(self):
         client = self._client()
@@ -262,6 +288,64 @@ class TurnGatingTests(unittest.TestCase):
         provider._sync_thread.join(timeout=5)
         messages, _, _ = client.turn_calls[0]
         self.assertEqual(len(messages[0]["content"]), 4000)
+
+
+class WriteGatingTests(unittest.TestCase):
+    def setUp(self):
+        _clear_flags()
+
+    def tearDown(self):
+        _clear_flags()
+
+    def test_write_flag_off_no_write(self):
+        os.environ["CI_MEMORY_WRITE_ENABLED"] = "false"
+        client = _MockClient()
+        _provider_with_client(client).on_memory_write("write", "MEMORY.md", "remember this")
+        self.assertEqual(client.write_calls, [])
+
+    def test_write_default_persists(self):
+        client = _MockClient()
+        _provider_with_client(client).on_memory_write("write", "MEMORY.md", "remember this")
+        self.assertTrue(client.write_event.wait(timeout=5))
+        self.assertEqual(len(client.write_calls), 1)
+        content, source, _ = client.write_calls[0]
+        self.assertEqual(content, "remember this")
+        self.assertEqual(source, "MEMORY.md")
+
+    def test_clear_action_is_skipped(self):
+        client = _MockClient()
+        _provider_with_client(client).on_memory_write("clear", "MEMORY.md", "x")
+        self.assertEqual(client.write_calls, [])
+
+
+class SessionFlushGatingTests(unittest.TestCase):
+    """on_session_end / on_pre_compress are gated by CI_MEMORY_TURN_ENABLED."""
+
+    def setUp(self):
+        _clear_flags()
+
+    def tearDown(self):
+        _clear_flags()
+
+    _MESSAGES = [{"role": "user", "content": "u"}, {"role": "assistant", "content": "a"}]
+
+    def test_session_end_off_no_flush(self):
+        os.environ["CI_MEMORY_TURN_ENABLED"] = "false"
+        client = _MockClient()
+        _provider_with_client(client).on_session_end(self._MESSAGES)
+        self.assertEqual(client.turn_calls, [])
+
+    def test_session_end_default_flushes(self):
+        client = _MockClient()
+        _provider_with_client(client).on_session_end(self._MESSAGES)
+        self.assertEqual(len(client.turn_calls), 1)
+
+    def test_pre_compress_off_no_flush(self):
+        os.environ["CI_MEMORY_TURN_ENABLED"] = "false"
+        client = _MockClient()
+        provider = _provider_with_client(client)
+        provider.on_pre_compress(self._MESSAGES)
+        self.assertEqual(client.turn_calls, [])
 
 
 if __name__ == "__main__":
