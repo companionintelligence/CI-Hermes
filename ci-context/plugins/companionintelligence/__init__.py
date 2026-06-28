@@ -27,6 +27,8 @@ from typing import Any, Dict, List, Optional
 
 from agent.memory_provider import MemoryProvider
 
+from .intent_catalog import describe_catalog_for_prompt, fetch_intent_manifest
+
 logger = logging.getLogger(__name__)
 
 _REQUEST_TIMEOUT = 10.0   # seconds for write calls (absorb)
@@ -366,21 +368,33 @@ class CompanionIntelligenceProvider(MemoryProvider):
     # ---------------------------------------------------------------------------
 
     def system_prompt_block(self) -> str:
-        """L0 — fetch and return the user profile block for the system prompt.
+        """L0 — fetch and return the user profile block + the CI Intent catalog.
 
         Called once at session start. Blocks briefly while the server responds,
         but this happens before the first user message so latency is invisible.
         """
         if not self._client:
             return ""
+
+        blocks: List[str] = []
+
         try:
             resp = self._client.context()
             block = resp.get("block", "")
+            if block:
+                blocks.append(block)
             logger.debug("CI-Server system_prompt_block: %d chars", len(block))
-            return block
         except Exception as exc:
             logger.warning("CI-Server system_prompt_block failed: %s", exc)
-            return ""
+
+        # Append the curated CI Intent catalog so the agent prefers the typed,
+        # privacy-labelled intents over raw CRUD. Mirrors how CI-OpenClaw consumes
+        # the same shared catalog; degrades silently if CI-Server lacks the endpoint.
+        catalog = describe_catalog_for_prompt(fetch_intent_manifest(self._client._get))
+        if catalog:
+            blocks.append(catalog)
+
+        return "\n\n".join(blocks)
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
         """Kick off an async L1 search as soon as the user message arrives.
