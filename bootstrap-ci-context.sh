@@ -104,6 +104,13 @@ fi
 aux_base="$(strip_qcr "${aux_base}")"
 aux_key="$(strip_qcr "${aux_key}")"
 aux_model="$(strip_qcr "${aux_model}")"
+# Local-endpoint signal for the main-model picker fix (Python block below). Gated on
+# the "ollama" key sentinel ONLY — NOT the native flag — because mislabeling the local
+# endpoint as the cloud "openai-api" provider breaks the GUI model switch regardless of
+# whether the native /api/chat adapter is on. Empty for cloud providers (real key) so
+# the Python block leaves them untouched.
+main_base="${aux_base}"
+[[ "${aux_key}" == "ollama" ]] || main_base=""
 # Gate (mirrors bootstrap-from-hub.sh): only wire aux to the local endpoint when
 # native mode is enabled AND this is the local Ollama endpoint (api_key sentinel
 # "ollama"). Clearing aux_base makes the Python block a no-op. This keeps flag-off a
@@ -113,7 +120,7 @@ case "${ci_native_lc}" in 1|true|yes|on) : ;; *) aux_base="" ;; esac
 [[ "${aux_key}" == "ollama" ]] || aux_base=""
 
 if [[ -f "${CONFIG_FILE}" ]]; then
-  python3 - "${CONFIG_FILE}" "${SKILLS_SOURCE}" "${PLUGIN_NAME}" "${CI_MEMORY_PROVIDER}" "${ci_num_ctx}" "${aux_base}" "${aux_model}" <<'PY'
+  python3 - "${CONFIG_FILE}" "${SKILLS_SOURCE}" "${PLUGIN_NAME}" "${CI_MEMORY_PROVIDER}" "${ci_num_ctx}" "${aux_base}" "${aux_model}" "${main_base}" <<'PY'
 from pathlib import Path
 import re
 import sys
@@ -125,6 +132,7 @@ memory_provider = sys.argv[4] if len(sys.argv) > 4 else ""
 num_ctx = sys.argv[5] if len(sys.argv) > 5 else ""
 aux_base = sys.argv[6] if len(sys.argv) > 6 else ""
 aux_model = sys.argv[7] if len(sys.argv) > 7 else ""
+main_base = sys.argv[8] if len(sys.argv) > 8 else ""
 
 # Hermes' hard minimum context window. Mirrors the upstream agent's
 # MINIMUM_CONTEXT_LENGTH, which is the literal 64000 (NOT 65536) and is compared
@@ -307,6 +315,48 @@ def delete_child_scalar(section: str, child: str) -> bool:
         i += 1
     return removed
 
+def ensure_provider_entry(provider_key: str, name: str, base_url: str, api_key: str) -> bool:
+    """Ensure ``providers.<provider_key>`` exists with the given local endpoint so the
+    GUI model picker LISTS it (the dashboard reads providers:/custom_providers:, not
+    model.base_url). Never clobbers an existing entry for that key — respects a user's
+    own provider config. Handles an absent section, the inline-empty form
+    (``providers: {}`` / ``[]`` from a PyYAML re-dump), and an existing block."""
+    global lines
+
+    def _q(v: str) -> str:
+        return v.replace("'", "''")  # YAML single-quote escaping
+
+    block = [
+        f"  {provider_key}:\n",
+        f"    name: '{_q(name)}'\n",
+        f"    base_url: '{_q(base_url)}'\n",
+        f"    api_key: '{_q(api_key)}'\n",
+    ]
+    idx = next((i for i, l in enumerate(lines) if re.match(r"^providers:", l)), None)
+    if idx is None:
+        if lines and not lines[-1].endswith("\n"):
+            lines[-1] += "\n"
+        if lines and lines[-1].strip():
+            lines.append("\n")
+        lines.append("providers:\n")
+        lines.extend(block)
+        return True
+    if re.match(r"^providers:\s*(\{\s*\}|\[\s*\])\s*(?:#.*)?$", lines[idx]):
+        # Inline-empty form → open into a block and add our entry.
+        lines[idx] = "providers:\n"
+        lines[idx + 1:idx + 1] = block
+        return True
+    # Existing block form: skip if our key is already present (never clobber a user's).
+    start, end = section_bounds("providers")
+    if start is None:
+        return False
+    key_re = re.compile(rf"^  {re.escape(provider_key)}:\s*(?:.*)$")
+    for i in range(start + 1, end):
+        if key_re.match(lines[i]):
+            return False
+    lines[start + 1:start + 1] = block
+    return True
+
 if Path(skills_dir).is_dir():
     ensure_child_list_item("skills", "external_dirs", skills_dir)
 else:
@@ -368,6 +418,40 @@ if num_ctx:
                 print(f"CI context: set model.context_length={num_ctx}")
         elif delete_child_scalar("model", "context_length"):
             print("CI context: removed model.context_length (Hub value below minimum; auto-detect)")
+
+# ── Main-model endpoint + provider repair (local Ollama only) ─────────────────
+# Pin model.base_url so the GUI model picker surfaces the local endpoint as the
+# "custom" provider (which injects ollama_num_ctx) instead of the generic
+# "openai-api" provider, and auto-heal a config an earlier GUI switch left on
+# "openai-api"/"openai" (no base_url -> targets api.openai.com, num_ctx dropped).
+# Gated on the local sentinel via main_base (empty for cloud) so a genuine cloud
+# provider is never rewritten. Only touch an existing model section — bootstrap-
+# from-hub.sh owns first-boot generation, so we never create a provider-less stub.
+if main_base:
+    model_start, _ = section_bounds("model")
+    if model_start is None:
+        print(
+            "CI context: no model section yet; main-model endpoint will be reconciled on next startup",
+            file=sys.stderr,
+        )
+    else:
+        cur_provider = (get_child_scalar("model", "provider") or "").strip().lower()
+        if cur_provider in ("openai-api", "openai"):
+            set_child_scalar("model", "provider", "ollama")
+            print(f"CI context: healed model.provider '{cur_provider}' -> ollama (local endpoint)")
+        if not (get_child_scalar("model", "base_url") or "").strip():
+            _qb = main_base.replace("'", "''")  # YAML single-quote escaping
+            set_child_scalar("model", "base_url", f"'{_qb}'")
+            print(f"CI context: set model.base_url={main_base} (picker shows local as 'custom')")
+        if not (get_child_scalar("model", "api_key") or "").strip():
+            set_child_scalar("model", "api_key", "'ollama'")
+            print("CI context: set model.api_key=ollama (local endpoint)")
+        # Register the local endpoint as a named provider so the GUI model picker
+        # lists it (dashboard reads providers:, not model.base_url). Keyed "ollama" —
+        # a built-in alias of the num_ctx-aware "custom" profile — so a GUI switch
+        # keeps num_ctx. Never clobbers a user's own providers entry.
+        if ensure_provider_entry("ollama", "Ollama (local)", main_base, "ollama"):
+            print("CI context: registered providers.ollama for the GUI model picker")
 
 # ── Hub-managed auxiliary providers ───────────────────────────────────────────
 # Point side-tasks (compression/title/vision/…) at the SAME endpoint as the main
