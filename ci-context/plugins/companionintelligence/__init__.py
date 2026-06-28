@@ -345,7 +345,10 @@ class CompanionIntelligenceProvider(MemoryProvider):
     def initialize(self, session_id: str, **kwargs) -> None:
         cfg = _load_config()
         self._session_id = str(session_id or "").strip()
-        self._platform = str(kwargs.get("platform") or "").strip()
+        # Hardcode the platform as "hermes" so CI-Server labels turns as
+        # "hermes conversation" instead of the generic "tui conversation" the
+        # opencode runtime reports. Mirrors how CI-OpenClaw hardcodes "openclaw".
+        self._platform = "hermes"
 
         url = cfg.get("url") or os.environ.get("CI_SERVER_URL", "")
         token = cfg.get("token") or os.environ.get("CI_SERVER_TOKEN", "")
