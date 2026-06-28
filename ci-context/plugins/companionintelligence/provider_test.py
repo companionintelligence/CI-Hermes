@@ -8,12 +8,14 @@ memory-client drift fixes, and the intent-catalog injection) with mocks.
 Run: ``python3 -m unittest provider_test`` from this directory.
 """
 
+import json
 import os
 import sys
 import threading
 import types
 import unittest
 import urllib.error
+from unittest import mock
 
 # --- Stub the Hermes base so ``import companionintelligence`` works standalone ---
 _agent = types.ModuleType("agent")
@@ -199,6 +201,109 @@ class CIClientDriftTests(unittest.TestCase):
         client._post = fake_post
         with self.assertRaises(urllib.error.HTTPError):
             client.write("hello")
+
+
+class _FakeResp:
+    """Minimal urllib response usable as a context manager."""
+
+    def __init__(self, body=b"{}", status=200):
+        self._body = body
+        self.status = status
+
+    def read(self):
+        return self._body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+class MemoryTransportTests(unittest.TestCase):
+    """The /api/memory/* transport: request construction, auth header, parsing."""
+
+    def _client(self):
+        return ci._CIClient("http://ci-server:8642", "tok")
+
+    def _capture(self, body=b"{}"):
+        captured = {}
+
+        def fake_urlopen(req, timeout=None):
+            captured["url"] = req.full_url
+            captured["method"] = req.get_method()
+            captured["api_key"] = req.get_header("X-api-key")
+            captured["content_type"] = req.get_header("Content-type")
+            captured["accept"] = req.get_header("Accept")
+            captured["body"] = req.data
+            return _FakeResp(body)
+
+        return captured, fake_urlopen
+
+    def test_context_issues_authenticated_get(self):
+        cap, fake = self._capture(b'{"block":"PROFILE"}')
+        with mock.patch("urllib.request.urlopen", fake):
+            out = self._client().context()
+        self.assertTrue(cap["url"].endswith("/api/memory/context"))
+        self.assertEqual(cap["method"], "GET")
+        self.assertEqual(cap["api_key"], "tok")
+        self.assertEqual(cap["accept"], "application/json")
+        self.assertEqual(out, {"block": "PROFILE"})
+
+    def test_recall_posts_query_and_capped_results(self):
+        cap, fake = self._capture()
+        with mock.patch("urllib.request.urlopen", fake):
+            self._client().recall("hello", 7)
+        self.assertTrue(cap["url"].endswith("/api/memory/recall"))
+        self.assertEqual(cap["method"], "POST")
+        self.assertEqual(cap["content_type"], "application/json")
+        self.assertEqual(json.loads(cap["body"]), {"query": "hello", "maxResults": 7})
+
+    def test_turn_payload_includes_session_and_platform(self):
+        cap, fake = self._capture()
+        with mock.patch("urllib.request.urlopen", fake):
+            self._client().turn([{"role": "user", "content": "u"}], session_id="s1", platform="hermes")
+        body = json.loads(cap["body"])
+        self.assertEqual(body["messages"], [{"role": "user", "content": "u"}])
+        self.assertEqual(body["sessionId"], "s1")
+        self.assertEqual(body["platform"], "hermes")
+
+    def test_turn_payload_omits_empty_session_and_platform(self):
+        cap, fake = self._capture()
+        with mock.patch("urllib.request.urlopen", fake):
+            self._client().turn([{"role": "user", "content": "u"}])
+        body = json.loads(cap["body"])
+        self.assertNotIn("sessionId", body)
+        self.assertNotIn("platform", body)
+
+    def test_write_payload_includes_supplied_fields_only(self):
+        cap, fake = self._capture()
+        with mock.patch("urllib.request.urlopen", fake):
+            self._client().write("note text", source="MEMORY.md", title="T", session_id="s")
+        self.assertTrue(cap["url"].endswith("/api/memory/write"))
+        self.assertEqual(
+            json.loads(cap["body"]),
+            {"content": "note text", "source": "MEMORY.md", "title": "T", "sessionId": "s"},
+        )
+
+    def test_write_payload_omits_empty_optionals(self):
+        cap, fake = self._capture()
+        with mock.patch("urllib.request.urlopen", fake):
+            self._client().write("just content")
+        self.assertEqual(json.loads(cap["body"]), {"content": "just content"})
+
+    def test_empty_body_parses_to_empty_dict(self):
+        _, fake = self._capture(b"")
+        with mock.patch("urllib.request.urlopen", fake):
+            self.assertEqual(self._client().context(), {})
+
+    def test_http_error_propagates(self):
+        def fake(req, timeout=None):
+            raise urllib.error.HTTPError(req.full_url, 500, "err", None, None)
+
+        with mock.patch("urllib.request.urlopen", fake):
+            with self.assertRaises(urllib.error.HTTPError):
+                self._client().context()
 
 
 class ContextAndIntentGatingTests(unittest.TestCase):
