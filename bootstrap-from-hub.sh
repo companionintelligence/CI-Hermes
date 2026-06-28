@@ -231,6 +231,38 @@ EOF
             log "set model.context_length=${num_ctx} in ${OUT_CONFIG}"
           fi
         fi
+
+        # Point auxiliary side-tasks (compression, title, vision, …) at the SAME
+        # local endpoint as the main model. Without this, Hermes' aux auto-detection
+        # chain only tries cloud providers (OpenRouter/Nous/api-key) and resolves to
+        # nothing on a local-only appliance — so compression/title silently don't run
+        # (it drops middle turns without a summary). An explicit base_url+api_key per
+        # task forces the "custom" path to the local endpoint, which also lets the
+        # native /api/chat adapter take over.
+        #
+        # Gated on (1) CI_HERMES_OLLAMA_NATIVE being enabled — so flag-off stays a true
+        # no-op — and (2) the api_key being the local "ollama" sentinel, so we NEVER
+        # embed a cloud API key in config.yaml or change cloud aux behavior when the
+        # Hub points Hermes at a cloud provider. Lockstep with bootstrap-ci-context.sh.
+        aux_base=$(normalize_env_value "$(grep "^HERMES_OPENAI_BASE_URL=" "${OUT_ENV}" | cut -d= -f2- | head -n 1)")
+        aux_key=$(normalize_env_value "$(grep "^HERMES_OPENAI_API_KEY=" "${OUT_ENV}" | cut -d= -f2- | head -n 1)")
+        ci_native=$(printf '%s' "${CI_HERMES_OLLAMA_NATIVE:-}" | tr '[:upper:]' '[:lower:]')
+        case "${ci_native}" in 1|true|yes|on) native_aux=1 ;; *) native_aux="" ;; esac
+        if [ -n "${native_aux}" ] && [ -n "${aux_base}" ] && [ "${aux_key}" = "ollama" ]; then
+          esc_base=$(yaml_single_quote "${aux_base}")
+          esc_model=$(yaml_single_quote "${model_name}")
+          {
+            printf 'auxiliary:\n'
+            for aux_task in compression title_generation vision web_extract session_search skills_hub mcp; do
+              printf '  %s:\n' "${aux_task}"
+              printf "    base_url: '%s'\n" "${esc_base}"
+              printf "    api_key: 'ollama'\n"
+              printf "    model: '%s'\n" "${esc_model}"
+            done
+          } >> "${OUT_CONFIG}"
+          log "wrote auxiliary providers (side-tasks -> ${aux_base}) in ${OUT_CONFIG}"
+        fi
+
         chmod 600 "${OUT_CONFIG}" 2>/dev/null || true
         log "wrote ${OUT_CONFIG} with provider=ollama"
       else

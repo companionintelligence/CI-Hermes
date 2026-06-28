@@ -291,6 +291,60 @@ assert_not_contains "no context_length line for zero" "context_length:" "${confi
 assert_contains "model still configured" "default: 'qwen3.5:9b'" "${config_out}"
 rm -rf "${data_dir}"
 
+# ─── Auxiliary-providers tests ────────────────────────────────────────────────
+# These exercise the native-only aux block. Set the flag explicitly with export so
+# the flag-OFF case (Test 16) is deterministic regardless of shell assignment
+# persistence; unset it before that case.
+export CI_HERMES_OLLAMA_NATIVE=1
+
+# ─── Test 13: auxiliary side-tasks point at the local endpoint (flag ON) ──────
+# With native mode on + the local ollama endpoint, write an auxiliary: block so
+# compression/title/vision/etc. resolve to the local Ollama instead of failing aux
+# auto-detection. (Native flag required; api_key sentinel must be "ollama".)
+echo "test: auxiliary block written when native flag on + local ollama endpoint"
+data_dir="$(mktemp -d)"
+fixture="$(printf 'HERMES_DEFAULT_MODEL=gemma4:e2b\nHERMES_OPENAI_BASE_URL=http://host.docker.internal:11434/v1\nHERMES_OPENAI_API_KEY=ollama\n')"
+run_with_fixture_in_dir "${fixture}" "${data_dir}" "172.17.0.1"
+config_out="$(cat "${data_dir}/config.yaml")"
+assert_contains "auxiliary section present" "auxiliary:" "${config_out}"
+assert_contains "compression task present" "  compression:" "${config_out}"
+assert_contains "title_generation task present" "  title_generation:" "${config_out}"
+assert_contains "vision task present" "  vision:" "${config_out}"
+assert_contains "aux base_url at local ollama (host rewritten)" "base_url: 'http://172.17.0.1:11434/v1'" "${config_out}"
+assert_contains "aux api_key is the local sentinel" "api_key: 'ollama'" "${config_out}"
+assert_contains "aux model set" "model: 'gemma4:e2b'" "${config_out}"
+rm -rf "${data_dir}"
+
+# ─── Test 14: no auxiliary block when the endpoint is unknown (flag on) ───────
+echo "test: no auxiliary block when HERMES_OPENAI_BASE_URL is absent"
+data_dir="$(mktemp -d)"
+fixture="$(printf 'HERMES_DEFAULT_MODEL=gemma4:e2b\nHERMES_NUM_CTX=65536\n')"
+run_with_fixture_in_dir "${fixture}" "${data_dir}"
+config_out="$(cat "${data_dir}/config.yaml")"
+assert_not_contains "no auxiliary section without an endpoint" "auxiliary:" "${config_out}"
+rm -rf "${data_dir}"
+
+# ─── Test 15: cloud endpoint (api_key != ollama) → no auxiliary block ─────────
+# Never embed a non-local API key in config.yaml or change cloud aux behavior.
+echo "test: no auxiliary block / no key leak when the endpoint is a cloud provider"
+data_dir="$(mktemp -d)"
+fixture="$(printf 'HERMES_DEFAULT_MODEL=gpt-4o\nHERMES_OPENAI_BASE_URL=https://api.openai.com/v1\nHERMES_OPENAI_API_KEY=sk-secret-cloud-key\n')"
+run_with_fixture_in_dir "${fixture}" "${data_dir}"
+config_out="$(cat "${data_dir}/config.yaml")"
+assert_not_contains "no auxiliary section for cloud endpoint" "auxiliary:" "${config_out}"
+assert_not_contains "cloud api key never written to config.yaml" "sk-secret-cloud-key" "${config_out}"
+rm -rf "${data_dir}"
+
+# ─── Test 16: native flag OFF → no auxiliary block (true no-op) ───────────────
+unset CI_HERMES_OLLAMA_NATIVE
+echo "test: no auxiliary block when CI_HERMES_OLLAMA_NATIVE is off"
+data_dir="$(mktemp -d)"
+fixture="$(printf 'HERMES_DEFAULT_MODEL=gemma4:e2b\nHERMES_OPENAI_BASE_URL=http://host.docker.internal:11434/v1\nHERMES_OPENAI_API_KEY=ollama\n')"
+run_with_fixture_in_dir "${fixture}" "${data_dir}" "172.17.0.1"
+config_out="$(cat "${data_dir}/config.yaml")"
+assert_not_contains "no auxiliary section with flag off" "auxiliary:" "${config_out}"
+rm -rf "${data_dir}"
+
 # ─── Summary ────────────────────────────────────────────────────────────────
 echo
 echo "Results: ${PASS} passed, ${FAIL} failed"
