@@ -109,7 +109,18 @@ def _native_swap(client):
         is_async = isinstance(client, openai.AsyncOpenAI)
     except Exception:
         is_async = "Async" in type(client).__name__
-    sync = OllamaNativeClient(base_url=base, api_key=api_key)
+    # Preserve the original client's timeout + custom headers so aux side-tasks
+    # behave like the main-chat path (Hook 1) — same timeout budget, same headers —
+    # instead of silently falling back to the adapter's defaults. Guarded so an SDK
+    # sentinel / unexpected type can never break native client construction.
+    import httpx as _httpx
+    timeout = getattr(client, "timeout", None)
+    if not isinstance(timeout, (_httpx.Timeout, int, float)):
+        timeout = None
+    default_headers = getattr(client, "default_headers", None)
+    if not isinstance(default_headers, dict):
+        default_headers = None
+    sync = OllamaNativeClient(base_url=base, api_key=api_key, timeout=timeout, default_headers=default_headers)
     return AsyncOllamaNativeClient(sync) if is_async else sync
 
 

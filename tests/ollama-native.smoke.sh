@@ -52,14 +52,14 @@ assert A.is_native_ollama_base_url(OLLAMA + "/v1") is True
 print("detection (flag + /api/version probe, /v1-agnostic): OK")
 
 # live: prove Ollama loads at num_ctx=64000 via native /api/chat
-httpx.post(f"{OLLAMA}/api/chat", json={"model": MODEL, "keep_alive": 0, "messages": []}); time.sleep(1)
+httpx.post(f"{OLLAMA}/api/chat", json={"model": MODEL, "keep_alive": 0, "messages": []}, timeout=30); time.sleep(1)
 client = A.OllamaNativeClient(base_url=OLLAMA + "/v1")
 client.chat.completions.create(model=MODEL, messages=[{"role": "user", "content": "hi"}],
                                extra_body={"options": {"num_ctx": 64000}}, max_tokens=4)
-ctx = [m.get("context_length") for m in httpx.get(f"{OLLAMA}/api/ps").json().get("models", [])
+ctx = [m.get("context_length") for m in httpx.get(f"{OLLAMA}/api/ps", timeout=30).json().get("models", [])
        if m.get("name") == MODEL]
 assert ctx and ctx[0] == 64000, f"expected 64000, got {ctx}"
-httpx.post(f"{OLLAMA}/api/chat", json={"model": MODEL, "keep_alive": 0, "messages": []})
+httpx.post(f"{OLLAMA}/api/chat", json={"model": MODEL, "keep_alive": 0, "messages": []}, timeout=30)
 print(f"live: Ollama loaded {MODEL} at context={ctx[0]} via /api/chat")
 print("SMOKE TEST PASSED")
 PY
