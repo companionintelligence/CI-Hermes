@@ -49,6 +49,26 @@ def _extract_block(resp: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
+# API-system feature flags
+# ---------------------------------------------------------------------------
+# Each CI-Server API the plugin uses can be turned on/off independently via an
+# env var (default on). Flag names match CI-OpenClaw:
+#   CI_MEMORY_CONTEXT_ENABLED  — L0 profile injection (/api/memory/context)
+#   CI_MEMORY_RECALL_ENABLED   — L1 per-turn recall (/api/memory/recall)
+#   CI_MEMORY_TURN_ENABLED     — turn-sync ingestion (/api/memory/turn)
+#   CI_MEMORY_WRITE_ENABLED    — durable note writes (/api/memory/write)
+#   CI_INTENTS_ENABLED         — intent catalog (/api/intents)
+_FALSY = {"0", "false", "no", "off"}
+
+
+def _feature_enabled(env_name: str, default: bool = True) -> bool:
+    raw = os.environ.get(env_name)
+    if raw is None or not raw.strip():
+        return default
+    return raw.strip().lower() not in _FALSY
+
+
+# ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
 
@@ -401,21 +421,23 @@ class CompanionIntelligenceProvider(MemoryProvider):
 
         blocks: List[str] = []
 
-        try:
-            resp = self._client.context()
-            block = _extract_block(resp)
-            if block:
-                blocks.append(block)
-            logger.debug("CI-Server system_prompt_block: %d chars", len(block))
-        except Exception as exc:
-            logger.warning("CI-Server system_prompt_block failed: %s", exc)
+        if _feature_enabled("CI_MEMORY_CONTEXT_ENABLED"):
+            try:
+                resp = self._client.context()
+                block = _extract_block(resp)
+                if block:
+                    blocks.append(block)
+                logger.debug("CI-Server system_prompt_block: %d chars", len(block))
+            except Exception as exc:
+                logger.warning("CI-Server system_prompt_block failed: %s", exc)
 
         # Append the curated CI Intent catalog so the agent prefers the typed,
         # privacy-labelled intents over raw CRUD. Mirrors how CI-OpenClaw consumes
         # the same shared catalog; degrades silently if CI-Server lacks the endpoint.
-        catalog = describe_catalog_for_prompt(fetch_intent_manifest(self._client._get))
-        if catalog:
-            blocks.append(catalog)
+        if _feature_enabled("CI_INTENTS_ENABLED"):
+            catalog = describe_catalog_for_prompt(fetch_intent_manifest(self._client._get))
+            if catalog:
+                blocks.append(catalog)
 
         return "\n\n".join(blocks)
 
@@ -425,7 +447,7 @@ class CompanionIntelligenceProvider(MemoryProvider):
         The HTTP call runs in a background thread so it overlaps with any other
         pre-turn processing. prefetch() then waits for the result.
         """
-        if not self._client:
+        if not self._client or not _feature_enabled("CI_MEMORY_RECALL_ENABLED"):
             return
 
         self._prefetch_result = None
@@ -462,7 +484,7 @@ class CompanionIntelligenceProvider(MemoryProvider):
 
     def sync_turn(self, user_content: str, assistant_content: str, *,
                   session_id: str = "") -> None:
-        if not self._client:
+        if not self._client or not _feature_enabled("CI_MEMORY_TURN_ENABLED"):
             return
 
         messages = [
@@ -492,7 +514,7 @@ class CompanionIntelligenceProvider(MemoryProvider):
 
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
         """Flush the full session transcript on close."""
-        if not self._client or not messages:
+        if not self._client or not messages or not _feature_enabled("CI_MEMORY_TURN_ENABLED"):
             return
 
         # Wait for any in-flight sync before sending the final turn
@@ -516,7 +538,7 @@ class CompanionIntelligenceProvider(MemoryProvider):
 
     def on_pre_compress(self, messages: List[Dict[str, Any]]) -> str:
         """Flush messages that are about to be dropped from the context window."""
-        if not self._client or not messages:
+        if not self._client or not messages or not _feature_enabled("CI_MEMORY_TURN_ENABLED"):
             return ""
 
         serialized = [
@@ -551,7 +573,7 @@ class CompanionIntelligenceProvider(MemoryProvider):
 
         Runs in a background thread so the agent is never blocked by the write.
         """
-        if not self._client or not content.strip():
+        if not self._client or not content.strip() or not _feature_enabled("CI_MEMORY_WRITE_ENABLED"):
             return
 
         # Skip clears — there is nothing meaningful to store.
