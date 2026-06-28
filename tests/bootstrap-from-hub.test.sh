@@ -49,11 +49,23 @@ assert_not_contains() {
   fi
 }
 
-# Line-anchored variants: a bare substring check would let "OPENAI_BASE_URL=" match
-# inside "HERMES_OPENAI_BASE_URL=". These match a whole env line by its key prefix.
+# LITERAL line-prefix checks: assert (no) line *starts with* the given prefix,
+# matched literally — not as a regex. A bare substring check would let
+# "OPENAI_BASE_URL=" match inside "HERMES_OPENAI_BASE_URL=", and a grep -E check
+# would mis-handle prefixes containing metacharacters (URLs with ".", "{") or a
+# stray leading "^". `[[ "$line" == "$prefix"* ]]` treats the quoted prefix as a
+# literal string with a trailing wildcard, so callers pass plain text.
+_starts_with_line() {  # $1 prefix, $2 haystack → 0 if some line starts with prefix
+  local prefix="$1" haystack="$2" line
+  while IFS= read -r line; do
+    [[ "${line}" == "${prefix}"* ]] && return 0
+  done <<< "${haystack}"
+  return 1
+}
+
 assert_line() {
   local label="$1" prefix="$2" haystack="$3"
-  if printf '%s\n' "${haystack}" | grep -qE "^${prefix}"; then
+  if _starts_with_line "${prefix}" "${haystack}"; then
     echo "  ✓ ${label}"; PASS=$((PASS + 1))
   else
     echo "  ✗ ${label}"; echo "    expected a line starting with: ${prefix}"; echo "    in: ${haystack}"; FAIL=$((FAIL + 1))
@@ -62,7 +74,7 @@ assert_line() {
 
 assert_no_line() {
   local label="$1" prefix="$2" haystack="$3"
-  if printf '%s\n' "${haystack}" | grep -qE "^${prefix}"; then
+  if _starts_with_line "${prefix}" "${haystack}"; then
     echo "  ✗ ${label}"; echo "    expected NO line starting with: ${prefix}"; echo "    in: ${haystack}"; FAIL=$((FAIL + 1))
   else
     echo "  ✓ ${label}"; PASS=$((PASS + 1))
@@ -245,9 +257,9 @@ assert_contains "model.api_key sentinel written" "api_key: 'ollama'" "${config_o
 assert_contains "provider stays ollama" "provider: ollama" "${config_out}"
 # providers.ollama registers the local endpoint for the GUI model picker.
 assert_contains "providers.ollama registered for picker" "name: 'Ollama (local)'" "${config_out}"
-assert_line "providers section emitted" "^providers:" "${config_out}"
+assert_line "providers section emitted" "providers:" "${config_out}"
 # model.* keys must stay contiguous (num_ctx/context_length not nested under providers).
-assert_line "ollama_num_ctx under model (2-space)" "^  ollama_num_ctx: 64000" "${config_out}"
+assert_line "ollama_num_ctx under model (2-space)" "  ollama_num_ctx: 64000" "${config_out}"
 python3 -c "import yaml,sys; d=yaml.safe_load(open('${data_dir}/config.yaml')); sys.exit(0 if d['model'].get('ollama_num_ctx')==64000 and 'ollama' in d['providers'] and 'ollama_num_ctx' not in d['providers'] else 1)" \
   && { echo "  ✓ YAML structure valid (model keys contiguous, providers.ollama present)"; PASS=$((PASS+1)); } \
   || { echo "  ✗ YAML structure invalid"; FAIL=$((FAIL+1)); }

@@ -25,7 +25,7 @@ import threading
 import time
 import uuid
 from types import SimpleNamespace
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple, Union
 
 import httpx
 
@@ -503,7 +503,7 @@ class OllamaNativeClient:
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.close()
 
-    def _headers(self) -> Dict[str, str]:
+    def _headers(self) -> Dict[str, Union[str, bytes]]:
         h = {
             "Content-Type": "application/json",
             "Accept": "application/json",

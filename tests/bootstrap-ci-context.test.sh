@@ -55,16 +55,19 @@ assert_not_contains() {
   fi
 }
 
-# Line-anchored negative check (grep -F can't tell a 2-space `  base_url:` model key
-# from a 4-space `    base_url:` auxiliary child, since the former is a substring of
-# the latter). `pattern` is an ERE matched per line.
+# LITERAL line-prefix negative check: a plain substring grep can't tell a 2-space
+# `  base_url:` model key from a 4-space `    base_url:` auxiliary child (the former
+# is a substring of the latter), and a grep -E check mis-handles prefixes with
+# metacharacters (URLs with ".", "{"). `[[ "$line" == "$prefix"* ]]` matches the
+# quoted prefix literally with a trailing wildcard, so callers pass plain text.
 assert_no_line() {
-  local label="$1" pattern="$2" haystack="$3"
-  if printf '%s\n' "${haystack}" | grep -qE -- "${pattern}"; then
-    echo "  ✗ ${label}"; echo "    expected NO line matching: ${pattern}"; echo "    in: ${haystack}"; FAIL=$((FAIL + 1))
-  else
-    echo "  ✓ ${label}"; PASS=$((PASS + 1))
-  fi
+  local label="$1" prefix="$2" haystack="$3" line
+  while IFS= read -r line; do
+    if [[ "${line}" == "${prefix}"* ]]; then
+      echo "  ✗ ${label}"; echo "    expected NO line starting with: ${prefix}"; echo "    in: ${haystack}"; FAIL=$((FAIL + 1)); return
+    fi
+  done <<< "${haystack}"
+  echo "  ✓ ${label}"; PASS=$((PASS + 1))
 }
 
 # Count occurrences of a 2-space-indented child key (e.g. `  enabled:`) across
@@ -453,7 +456,7 @@ assert_contains "model.base_url pinned" "  base_url: 'http://172.17.0.1:11434/v1
 assert_contains "model.api_key sentinel pinned" "  api_key: 'ollama'" "${out}"
 assert_contains "provider stays ollama" "provider: ollama" "${out}"
 assert_contains "providers.ollama registered for picker" "name: 'Ollama (local)'" "${out}"
-assert_no_line "providers section opened (not inline {})" "^providers: \{" "${out}"
+assert_no_line "providers section opened (not inline {})" "providers: {" "${out}"
 assert_not_contains "no auxiliary block (flag off)" "auxiliary:" "${out}"
 rm -rf "${data_dir}"
 
@@ -505,7 +508,7 @@ out="$(cat "${data_dir}/config.yaml")"
 assert_contains "user base_url preserved" "base_url: 'http://my-own-box:11434/v1'" "${out}"
 # 2-space anchor targets the model key only (aux uses 4 spaces): the hub endpoint
 # must not be forced onto the model block over the user's own value.
-assert_no_line "hub endpoint not forced over user model value" "^  base_url: 'http://172\.17\.0\.1:11434/v1'" "${out}"
+assert_no_line "hub endpoint not forced over user model value" "  base_url: 'http://172.17.0.1:11434/v1'" "${out}"
 rm -rf "${data_dir}"
 
 # ─── Test 27: a user's own providers entry (different key) is preserved ────────
@@ -543,7 +546,7 @@ run_bootstrap "${data_dir}" CI_HERMES_OLLAMA_NATIVE=1
 out="$(cat "${data_dir}/config.yaml")"
 assert_contains "providers.ollama added from inline-empty" "name: 'Ollama (local)'" "${out}"
 assert_eq "single providers: key (no duplicate)" "1" "$(grep -cE '^providers:' "${data_dir}/config.yaml")"
-assert_no_line "inline-empty providers was opened" "^providers: \{\}" "${out}"
+assert_no_line "inline-empty providers was opened" "providers: {}" "${out}"
 if python3 -c "import yaml,sys; d=yaml.safe_load(open('${data_dir}/config.yaml')); sys.exit(0 if 'ollama' in (d.get('providers') or {}) else 1)"; then
   echo "  ✓ YAML valid, providers.ollama present"; PASS=$((PASS + 1))
 else
