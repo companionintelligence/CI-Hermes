@@ -88,4 +88,6 @@ docker cp "$ADAPTER_SHIM" "$CONTAINER:/tmp/enable_ollama_native.py" >/dev/null
 docker cp "$TEST_PY" "$CONTAINER:/tmp/ollama_native_smoke.py" >/dev/null
 docker exec -e OLLAMA_URL="$OLLAMA_URL" -e MODEL="$MODEL" -e CI_HERMES_OLLAMA_NATIVE="1" "$CONTAINER" \
   /opt/hermes/.venv/bin/python /tmp/ollama_native_smoke.py
-docker exec "$CONTAINER" sh -c 'rm -f /tmp/ollama_native_adapter.py /tmp/enable_ollama_native.py /tmp/ollama_native_smoke.py; rm -rf /tmp/__pycache__' || true
+# Clean up only the files this run created (incl. their bytecode caches) — never the
+# whole /tmp/__pycache__, which may hold unrelated caches.
+docker exec "$CONTAINER" sh -c 'rm -f /tmp/ollama_native_adapter.py /tmp/enable_ollama_native.py /tmp/ollama_native_smoke.py /tmp/__pycache__/ollama_native_adapter.*.pyc /tmp/__pycache__/enable_ollama_native.*.pyc /tmp/__pycache__/ollama_native_smoke.*.pyc' || true

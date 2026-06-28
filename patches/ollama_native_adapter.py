@@ -510,6 +510,13 @@ class OllamaNativeClient:
         except StopIteration:
             return True, None
 
+    @staticmethod
+    def _timeout_kwargs(timeout: Any) -> Dict[str, Any]:
+        """httpx request kwargs: forward an explicit per-request timeout when given,
+        else omit it so the client's configured default applies. (Passing
+        ``timeout=None`` to httpx DISABLES the timeout entirely, which we never want.)"""
+        return {} if timeout is None else {"timeout": timeout}
+
     def _create_chat_completion(
         self,
         *,
@@ -551,7 +558,7 @@ class OllamaNativeClient:
             return self._stream_completion(model=model, request=request, timeout=timeout)
 
         url = f"{self.base_url}/api/chat"
-        resp = self._http.post(url, json=request, headers=self._headers(), timeout=timeout)
+        resp = self._http.post(url, json=request, headers=self._headers(), **self._timeout_kwargs(timeout))
         if resp.status_code != 200:
             raise _http_error(resp)
         try:
@@ -566,7 +573,7 @@ class OllamaNativeClient:
         def _generator() -> Iterator[_OllamaStreamChunk]:
             tool_idx: Dict[str, int] = {"n": 0}
             try:
-                with self._http.stream("POST", url, json=request, headers=self._headers(), timeout=timeout) as resp:
+                with self._http.stream("POST", url, json=request, headers=self._headers(), **self._timeout_kwargs(timeout)) as resp:
                     if resp.status_code != 200:
                         resp.read()
                         raise _http_error(resp)
@@ -586,9 +593,10 @@ class OllamaNativeClient:
 
         return _generator()
 
-    def _create_embeddings(self, *, model: str, input: Any = None, **_: Any) -> Any:
+    def _create_embeddings(self, *, model: str, input: Any = None, timeout: Any = None, **_: Any) -> Any:
         url = f"{self.base_url}/api/embed"
-        resp = self._http.post(url, json={"model": model, "input": input}, headers=self._headers())
+        resp = self._http.post(url, json={"model": model, "input": input}, headers=self._headers(),
+                               **self._timeout_kwargs(timeout))
         if resp.status_code != 200:
             raise _http_error(resp)
         try:
