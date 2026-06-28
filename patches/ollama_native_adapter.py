@@ -21,6 +21,7 @@ import asyncio
 import json
 import logging
 import os
+import threading
 import time
 import uuid
 from types import SimpleNamespace
@@ -35,9 +36,12 @@ logger = logging.getLogger("ci.ollama_native")
 # through to the stock OpenAI client (today's /v1 behavior).
 FLAG_ENV = "CI_HERMES_OLLAMA_NATIVE"
 
-# Cache of base_url(root) -> bool "is this really an Ollama server" so we probe
-# /api/version at most once per endpoint per process.
-_OLLAMA_PROBE_CACHE: Dict[str, bool] = {}
+# Cache of base_url(root) -> (is_ollama, expires_at_monotonic_or_None). Positive
+# results never expire (an Ollama endpoint stays Ollama); negatives expire after a
+# short TTL so a transient blip (Ollama restart) recovers, while a persistent
+# misconfiguration (non-Ollama endpoint) isn't re-probed on every client build.
+_OLLAMA_PROBE_CACHE: Dict[str, Tuple[bool, Optional[float]]] = {}
+_NEG_PROBE_TTL = 60.0  # seconds
 
 
 def _flag_enabled() -> bool:
@@ -59,13 +63,17 @@ def _probe_is_ollama(root: str, *, timeout: float = 2.0) -> bool:
     This is what keeps us from mis-routing other `provider="custom"` endpoints
     (vLLM / llama.cpp / LM Studio) — which have no /api/chat — to native mode.
 
-    Only POSITIVE results are cached: an endpoint that is Ollama stays Ollama, so
-    `True` is memoized for the process. A negative is treated as transient (e.g. a
-    blip during an Ollama restart) and is NOT cached, so we re-probe next time
-    rather than permanently pinning the endpoint to /v1 after one failed probe.
+    Positive results are memoized for the process (an Ollama endpoint stays Ollama).
+    Negative results are cached only for a short TTL (`_NEG_PROBE_TTL`): a transient
+    blip (Ollama restart) recovers on the next probe after the TTL, while a persistent
+    misconfiguration (non-Ollama endpoint, or Ollama down) isn't re-probed on every
+    client construction — bounding the network round-trips on the hot path.
     """
-    if _OLLAMA_PROBE_CACHE.get(root):
-        return True
+    entry = _OLLAMA_PROBE_CACHE.get(root)
+    if entry is not None:
+        result, expires_at = entry
+        if expires_at is None or time.monotonic() < expires_at:
+            return result
     ok = False
     try:
         resp = httpx.get(f"{root}/api/version", timeout=timeout)
@@ -76,8 +84,7 @@ def _probe_is_ollama(root: str, *, timeout: float = 2.0) -> bool:
     except Exception as exc:  # network/timeout/non-ollama/non-JSON
         logger.debug("Ollama /api/version probe failed for %s: %s", root, exc)
         ok = False
-    if ok:
-        _OLLAMA_PROBE_CACHE[root] = True
+    _OLLAMA_PROBE_CACHE[root] = (True, None) if ok else (False, time.monotonic() + _NEG_PROBE_TTL)
     return ok
 
 
@@ -507,13 +514,6 @@ class OllamaNativeClient:
         return h
 
     @staticmethod
-    def _advance_stream_iterator(it: Iterator[_OllamaStreamChunk]) -> Tuple[bool, Optional[_OllamaStreamChunk]]:
-        try:
-            return False, next(it)
-        except StopIteration:
-            return True, None
-
-    @staticmethod
     def _timeout_kwargs(timeout: Any) -> Dict[str, Any]:
         """httpx request kwargs: forward an explicit per-request timeout when given,
         else omit it so the client's configured default applies. (Passing
@@ -638,12 +638,34 @@ class AsyncOllamaNativeClient:
         if not stream:
             return result
 
+        # Consume the sync streaming generator on ONE dedicated thread (preserving the
+        # httpx streaming response's thread affinity) and forward chunks to the async
+        # consumer via an asyncio.Queue. Advancing the generator with `asyncio.to_thread`
+        # per chunk could resume it on different pool threads, which is not safe for a
+        # live httpx sync stream.
+        loop = asyncio.get_running_loop()
+        queue: asyncio.Queue = asyncio.Queue()
+
+        def _producer() -> None:
+            try:
+                for chunk in result:
+                    loop.call_soon_threadsafe(queue.put_nowait, ("chunk", chunk))
+            except Exception as exc:  # surface to the async consumer
+                loop.call_soon_threadsafe(queue.put_nowait, ("error", exc))
+            finally:
+                loop.call_soon_threadsafe(queue.put_nowait, ("done", None))
+
+        threading.Thread(target=_producer, name="ci-ollama-aux-stream", daemon=True).start()
+
         async def _async_stream() -> Any:
             while True:
-                done, chunk = await asyncio.to_thread(self._sync._advance_stream_iterator, result)
-                if done:
+                kind, payload = await queue.get()
+                if kind == "chunk":
+                    yield payload
+                elif kind == "error":
+                    raise payload
+                else:
                     break
-                yield chunk
 
         return _async_stream()
 
