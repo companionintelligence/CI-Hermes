@@ -33,6 +33,19 @@ logger = logging.getLogger(__name__)
 
 _REQUEST_TIMEOUT = 10.0   # seconds for write calls (absorb)
 _PREFETCH_TIMEOUT = 5.0   # seconds to wait for a queued prefetch result
+_MAX_TURN_CONTENT_CHARS = 4000   # max chars persisted per message (matches CI-OpenClaw)
+_MAX_RECALL_RESULTS = 20         # cap on L1 recall breadth (matches CI-OpenClaw)
+
+
+def _extract_block(resp: dict) -> str:
+    """Read the text payload of a context/recall response.
+
+    Tolerates the server returning the text under ``block``, ``text`` or
+    ``context`` — matching CI-OpenClaw so both harnesses behave identically.
+    """
+    if not isinstance(resp, dict):
+        return ""
+    return resp.get("block") or resp.get("text") or resp.get("context") or ""
 
 
 # ---------------------------------------------------------------------------
@@ -84,7 +97,8 @@ class _CIClient:
 
     def recall(self, query: str, max_results: int = 5) -> dict:
         """L1 — per-turn hybrid search against the knowledge graph."""
-        return self._post("/api/memory/recall", {"query": query, "maxResults": max_results})
+        capped = max(1, min(_MAX_RECALL_RESULTS, int(max_results or 5)))
+        return self._post("/api/memory/recall", {"query": query, "maxResults": capped})
 
     # ── Ingestion ─────────────────────────────────────────────────────────────
 
@@ -106,7 +120,14 @@ class _CIClient:
             payload["title"] = title
         if session_id:
             payload["sessionId"] = session_id
-        return self._post("/api/memory/write", payload)
+        try:
+            return self._post("/api/memory/write", payload)
+        except urllib.error.HTTPError as exc:
+            # Older CI-Server builds expose this as /api/memory/note. Fall back on
+            # 404 so a version skew doesn't drop the write (matches CI-OpenClaw).
+            if exc.code == 404:
+                return self._post("/api/memory/note", payload)
+            raise
 
     # ── Health ────────────────────────────────────────────────────────────────
 
@@ -346,7 +367,9 @@ class CompanionIntelligenceProvider(MemoryProvider):
 
     def initialize(self, session_id: str, **kwargs) -> None:
         cfg = _load_config()
-        self._session_id = str(session_id or "").strip()
+        # Accept session_key as a fallback so a runtime that reports the id under
+        # that name still tags turns correctly (matches CI-OpenClaw's handling).
+        self._session_id = str(session_id or kwargs.get("session_key") or "").strip()
         # Hardcode the platform as "hermes" so CI-Server labels turns as
         # "hermes conversation" instead of the generic "tui conversation" the
         # opencode runtime reports. Mirrors how CI-OpenClaw hardcodes "openclaw".
@@ -380,7 +403,7 @@ class CompanionIntelligenceProvider(MemoryProvider):
 
         try:
             resp = self._client.context()
-            block = resp.get("block", "")
+            block = _extract_block(resp)
             if block:
                 blocks.append(block)
             logger.debug("CI-Server system_prompt_block: %d chars", len(block))
@@ -411,7 +434,7 @@ class CompanionIntelligenceProvider(MemoryProvider):
         def _run() -> None:
             try:
                 resp = self._client.recall(query)
-                self._prefetch_result = resp.get("block", "") or ""
+                self._prefetch_result = _extract_block(resp)
             except Exception as exc:
                 logger.debug("CI-Server prefetch failed: %s", exc)
                 self._prefetch_result = ""
@@ -443,8 +466,8 @@ class CompanionIntelligenceProvider(MemoryProvider):
             return
 
         messages = [
-            {"role": "user",      "content": (user_content or "")[:4000]},
-            {"role": "assistant", "content": (assistant_content or "")[:4000]},
+            {"role": "user",      "content": (user_content or "")[:_MAX_TURN_CONTENT_CHARS]},
+            {"role": "assistant", "content": (assistant_content or "")[:_MAX_TURN_CONTENT_CHARS]},
         ]
         sid = session_id or self._session_id
 
@@ -477,7 +500,7 @@ class CompanionIntelligenceProvider(MemoryProvider):
             self._sync_thread.join(timeout=10.0)
 
         serialized = [
-            {"role": m.get("role", "user"), "content": str(m.get("content", ""))[:4000]}
+            {"role": m.get("role", "user"), "content": str(m.get("content", ""))[:_MAX_TURN_CONTENT_CHARS]}
             for m in messages
             if m.get("role") in ("user", "assistant")
         ]
@@ -497,7 +520,7 @@ class CompanionIntelligenceProvider(MemoryProvider):
             return ""
 
         serialized = [
-            {"role": m.get("role", "user"), "content": str(m.get("content", ""))[:2000]}
+            {"role": m.get("role", "user"), "content": str(m.get("content", ""))[:_MAX_TURN_CONTENT_CHARS]}
             for m in messages
             if m.get("role") in ("user", "assistant")
         ]
