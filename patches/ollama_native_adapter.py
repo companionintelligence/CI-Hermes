@@ -512,7 +512,15 @@ class OllamaNativeClient:
         # Ollama ignores auth locally, but a reverse proxy may want it.
         if self.api_key and self.api_key != "ollama":
             h["Authorization"] = f"Bearer {self.api_key}"
-        h.update(self._default_headers)
+        # Only forward headers with real str/bytes values. default_headers copied
+        # from an OpenAI SDK client (the aux Hook-2 path mirrors the client's
+        # timeout + default_headers) can contain the SDK's `Omit()` / `NotGiven`
+        # sentinels for UNSET headers (e.g. OpenAI-Organization / OpenAI-Project).
+        # httpx rejects those ("Header value must be str or bytes"), which would
+        # fail every aux side-task (title/compression/vision). Drop non-string values.
+        for k, v in (self._default_headers or {}).items():
+            if isinstance(v, (str, bytes)):
+                h[k] = v
         return h
 
     @staticmethod

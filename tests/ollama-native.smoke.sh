@@ -44,6 +44,21 @@ for ln in [{"message": {"content": "a"}}, {"done": True, "done_reason": "stop"}]
 assert "".join(c.choices[0].delta.content or "" for c in ch) == "a"
 print("unit translation: OK")
 
+# regression: default_headers copied from an OpenAI SDK client (aux Hook-2 path) can
+# carry the SDK's Omit()/NotGiven sentinels for unset headers (OpenAI-Organization/
+# -Project). httpx rejects non-str header values, which silently broke every aux
+# side-task (title/compression/vision). _headers() must drop them.
+import openai as _openai
+_sentinels = [s for s in (getattr(_openai, "Omit", None), getattr(_openai, "NotGiven", None)) if s is not None]
+assert _sentinels, "expected openai.Omit/NotGiven to exist"
+_hc = A.OllamaNativeClient(base_url=OLLAMA + "/v1",
+                           default_headers={"OpenAI-Organization": _sentinels[0](), "X-CI-Real": "yes"})
+_h = _hc._headers()
+assert "OpenAI-Organization" not in _h, f"Omit sentinel leaked into headers: {_h}"
+assert _h.get("X-CI-Real") == "yes", _h
+assert all(isinstance(v, (str, bytes)) for v in _h.values()), _h
+print("unit Omit/NotGiven header filtering: OK")
+
 # detection: flag gate + /api/version probe (works with or without /v1)
 os.environ.pop("CI_HERMES_OLLAMA_NATIVE", None)
 assert A.is_native_ollama_base_url(OLLAMA) is False
@@ -79,6 +94,22 @@ assert isinstance(acl, _A.AsyncOllamaNativeClient)
 _, vcl, _ = aux.resolve_vision_provider_client(model=MODEL, base_url=OLLAMA + "/v1", api_key="ollama")
 assert isinstance(vcl, _A.OllamaNativeClient)
 print("Hook 2 aux routers (text sync/async + vision): native — OK")
+
+# end-to-end: an ACTUAL aux call must succeed (not just resolve to a native client).
+# This mirrors title/compression/vision, which go through call_llm -> the resolved
+# client -> _headers(); it is the path the Omit-sentinel header bug broke.
+_r = sc.chat.completions.create(model=MODEL, messages=[{"role": "user", "content": "Reply with the word OK"}],
+                                extra_body={"options": {"num_ctx": 64000}, "think": False}, max_tokens=8)
+assert _r.choices[0].message is not None and (_r.choices[0].message.content or "").strip(), _r
+print(f"Hook 2 aux real call via /api/chat: OK ({(_r.choices[0].message.content or '').strip()[:20]!r})")
+
+# end-to-end: the actual title-generation helper (the symptom the user hit).
+from agent.title_generator import generate_title
+_t = generate_title("hey what is date today", "Today is 2026-06-28.",
+                    main_runtime={"model": MODEL, "provider": "ollama",
+                                  "base_url": OLLAMA + "/v1", "api_key": "ollama", "api_mode": None})
+assert _t, "title generation returned None (aux path broken)"
+print(f"title_generation end-to-end: OK ({_t!r})")
 print("PHASE 2 SMOKE PASSED")
 PY
 
