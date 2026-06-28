@@ -49,6 +49,38 @@ assert_not_contains() {
   fi
 }
 
+# LITERAL line-prefix checks: assert (no) line *starts with* the given prefix,
+# matched literally — not as a regex. A bare substring check would let
+# "OPENAI_BASE_URL=" match inside "HERMES_OPENAI_BASE_URL=", and a grep -E check
+# would mis-handle prefixes containing metacharacters (URLs with ".", "{") or a
+# stray leading "^". `[[ "$line" == "$prefix"* ]]` treats the quoted prefix as a
+# literal string with a trailing wildcard, so callers pass plain text.
+_starts_with_line() {  # $1 prefix, $2 haystack → 0 if some line starts with prefix
+  local prefix="$1" haystack="$2" line
+  while IFS= read -r line; do
+    [[ "${line}" == "${prefix}"* ]] && return 0
+  done <<< "${haystack}"
+  return 1
+}
+
+assert_line() {
+  local label="$1" prefix="$2" haystack="$3"
+  if _starts_with_line "${prefix}" "${haystack}"; then
+    echo "  ✓ ${label}"; PASS=$((PASS + 1))
+  else
+    echo "  ✗ ${label}"; echo "    expected a line starting with: ${prefix}"; echo "    in: ${haystack}"; FAIL=$((FAIL + 1))
+  fi
+}
+
+assert_no_line() {
+  local label="$1" prefix="$2" haystack="$3"
+  if _starts_with_line "${prefix}" "${haystack}"; then
+    echo "  ✗ ${label}"; echo "    expected NO line starting with: ${prefix}"; echo "    in: ${haystack}"; FAIL=$((FAIL + 1))
+  else
+    echo "  ✓ ${label}"; PASS=$((PASS + 1))
+  fi
+}
+
 run_with_fixture() {
   local fixture_body="$1"
   local gateway_ip_override="${2:-}"
@@ -106,20 +138,36 @@ run_with_fixture_in_dir() {
   rm -f "${fixture_file}"
 }
 
-# ─── Test 1: HERMES_ keys are translated to OPENAI_* and originals kept ─────
-echo "test: translates HERMES_OPENAI_BASE_URL to OPENAI_API_BASE and OPENAI_BASE_URL"
+# ─── Test 1: LOCAL Ollama (api_key sentinel "ollama") → CUSTOM_* aliases only ──
+# The OpenAI-SDK aliases (OPENAI_BASE_URL/OPENAI_API_BASE/OPENAI_API_KEY) are
+# deliberately suppressed for a local endpoint: they make the upstream model picker
+# mislabel the local box as the cloud "openai-api" provider (dropping num_ctx and
+# targeting api.openai.com on a GUI switch). The runtime uses CUSTOM_BASE_URL +
+# config model.base_url instead. Model aliases are unaffected.
+echo "test: local endpoint aliases to CUSTOM_* only (no OPENAI_* foot-guns)"
 fixture=$'HERMES_OPENAI_BASE_URL=http://ci-hub-ollama:11434/v1\nHERMES_OPENAI_API_KEY=ollama\nHERMES_DEFAULT_MODEL=hermes4-70b\nHERMES_DEFAULT_MODEL_BACKEND_ID=hermes4:70b\nHERMES_EMBEDDINGS_MODEL=nomic-embed-text\n'
 out="$(run_with_fixture "${fixture}")"
-assert_contains "OPENAI_API_BASE present" "OPENAI_API_BASE=http://ci-hub-ollama:11434/v1" "${out}"
-assert_contains "OPENAI_BASE_URL alias present" "OPENAI_BASE_URL=http://ci-hub-ollama:11434/v1" "${out}"
+assert_no_line "OPENAI_API_BASE suppressed for local" "OPENAI_API_BASE=" "${out}"
+assert_no_line "OPENAI_BASE_URL suppressed for local" "OPENAI_BASE_URL=" "${out}"
+assert_no_line "OPENAI_API_KEY suppressed for local" "OPENAI_API_KEY=" "${out}"
 assert_contains "CUSTOM_BASE_URL alias present" "CUSTOM_BASE_URL=http://ci-hub-ollama:11434/v1" "${out}"
-assert_contains "OPENAI_API_KEY present" "OPENAI_API_KEY=ollama" "${out}"
 assert_contains "CUSTOM_API_KEY alias present" "CUSTOM_API_KEY=ollama" "${out}"
 assert_contains "OPENAI_MODEL present" "OPENAI_MODEL=hermes4-70b" "${out}"
 assert_contains "HERMES_INFERENCE_MODEL alias present" "HERMES_INFERENCE_MODEL=hermes4-70b" "${out}"
 assert_contains "OPENAI_EMBEDDINGS_MODEL present" "OPENAI_EMBEDDINGS_MODEL=nomic-embed-text" "${out}"
 assert_contains "original HERMES_ key preserved" "HERMES_DEFAULT_MODEL=hermes4-70b" "${out}"
 assert_contains "BACKEND_ID passthrough preserved" "HERMES_DEFAULT_MODEL_BACKEND_ID=hermes4:70b" "${out}"
+
+# ─── Test 1-cloud: CLOUD provider (real api_key) keeps the full OPENAI_* fan-out ─
+# For a cloud endpoint "openai-api" is the correct provider and the OpenAI aliases
+# are required (host-gated key resolution), so they must NOT be suppressed.
+echo "test: cloud endpoint keeps OPENAI_* aliases (real key)"
+fixture=$'HERMES_OPENAI_BASE_URL=https://api.openai.com/v1\nHERMES_OPENAI_API_KEY=sk-real-cloud\nHERMES_DEFAULT_MODEL=gpt-4o\n'
+out="$(run_with_fixture "${fixture}")"
+assert_line "cloud OPENAI_API_BASE present" "OPENAI_API_BASE=https://api.openai.com/v1" "${out}"
+assert_line "cloud OPENAI_BASE_URL present" "OPENAI_BASE_URL=https://api.openai.com/v1" "${out}"
+assert_line "cloud OPENAI_API_KEY present" "OPENAI_API_KEY=sk-real-cloud" "${out}"
+assert_line "cloud CUSTOM_BASE_URL present" "CUSTOM_BASE_URL=https://api.openai.com/v1" "${out}"
 
 # ─── Test 1b: backend id becomes model fallback when plain default model is absent ──
 echo "test: backend id becomes model fallback when plain default model is absent"
@@ -193,6 +241,39 @@ run_with_fixture_in_dir "${fixture}" "${data_dir}"
 config_out="$(cat "${data_dir}/config.yaml")"
 assert_contains "config provider set" "provider: ollama" "${config_out}"
 assert_contains "config default key used" "default: 'model: foo #bar''s'" "${config_out}"
+rm -rf "${data_dir}"
+
+# ─── Test 6b: local endpoint pins model.base_url + api_key (picker shows 'custom') ──
+# The pinned endpoint makes the GUI model picker surface the local box as the
+# "custom" provider (which injects ollama_num_ctx) rather than the cloud
+# "openai-api" provider, and makes the runtime config-authoritative.
+echo "test: local endpoint writes model.base_url + api_key into config.yaml"
+data_dir="$(mktemp -d)"
+fixture=$'HERMES_DEFAULT_MODEL=gemma4:e2b\nHERMES_OPENAI_BASE_URL=http://host.docker.internal:11434/v1\nHERMES_OPENAI_API_KEY=ollama\nHERMES_NUM_CTX=64000\n'
+run_with_fixture_in_dir "${fixture}" "${data_dir}" "172.17.0.1"
+config_out="$(cat "${data_dir}/config.yaml")"
+assert_contains "model.base_url pinned (host rewritten)" "base_url: 'http://172.17.0.1:11434/v1'" "${config_out}"
+assert_contains "model.api_key sentinel written" "api_key: 'ollama'" "${config_out}"
+assert_contains "provider stays ollama" "provider: ollama" "${config_out}"
+# providers.ollama registers the local endpoint for the GUI model picker.
+assert_contains "providers.ollama registered for picker" "name: 'Ollama (local)'" "${config_out}"
+assert_line "providers section emitted" "providers:" "${config_out}"
+# model.* keys must stay contiguous (num_ctx/context_length not nested under providers).
+assert_line "ollama_num_ctx under model (2-space)" "  ollama_num_ctx: 64000" "${config_out}"
+python3 -c "import yaml,sys; d=yaml.safe_load(open('${data_dir}/config.yaml')); sys.exit(0 if d['model'].get('ollama_num_ctx')==64000 and 'ollama' in d['providers'] and 'ollama_num_ctx' not in d['providers'] else 1)" \
+  && { echo "  ✓ YAML structure valid (model keys contiguous, providers.ollama present)"; PASS=$((PASS+1)); } \
+  || { echo "  ✗ YAML structure invalid"; FAIL=$((FAIL+1)); }
+rm -rf "${data_dir}"
+
+# ─── Test 6c: cloud endpoint does NOT pin model.base_url / leak the key ───────
+echo "test: cloud endpoint leaves model.base_url out of config.yaml (no key leak)"
+data_dir="$(mktemp -d)"
+fixture=$'HERMES_DEFAULT_MODEL=gpt-4o\nHERMES_OPENAI_BASE_URL=https://api.openai.com/v1\nHERMES_OPENAI_API_KEY=sk-secret-cloud\n'
+run_with_fixture_in_dir "${fixture}" "${data_dir}"
+config_out="$(cat "${data_dir}/config.yaml")"
+assert_not_contains "no model.base_url for cloud" "base_url:" "${config_out}"
+assert_not_contains "cloud key never written to model block" "sk-secret-cloud" "${config_out}"
+assert_not_contains "no providers.ollama picker entry for cloud" "Ollama (local)" "${config_out}"
 rm -rf "${data_dir}"
 
 # ─── Test 7: existing config.yaml is never overwritten ───────────────────────

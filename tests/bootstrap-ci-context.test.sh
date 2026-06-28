@@ -55,6 +55,21 @@ assert_not_contains() {
   fi
 }
 
+# LITERAL line-prefix negative check: a plain substring grep can't tell a 2-space
+# `  base_url:` model key from a 4-space `    base_url:` auxiliary child (the former
+# is a substring of the latter), and a grep -E check mis-handles prefixes with
+# metacharacters (URLs with ".", "{"). `[[ "$line" == "$prefix"* ]]` matches the
+# quoted prefix literally with a trailing wildcard, so callers pass plain text.
+assert_no_line() {
+  local label="$1" prefix="$2" haystack="$3" line
+  while IFS= read -r line; do
+    if [[ "${line}" == "${prefix}"* ]]; then
+      echo "  ✗ ${label}"; echo "    expected NO line starting with: ${prefix}"; echo "    in: ${haystack}"; FAIL=$((FAIL + 1)); return
+    fi
+  done <<< "${haystack}"
+  echo "  ✓ ${label}"; PASS=$((PASS + 1))
+}
+
 # Count occurrences of a 2-space-indented child key (e.g. `  enabled:`) across
 # the whole file. The fixtures only ever have one section containing a given
 # key, so a count > 1 means a duplicate mapping key was emitted.
@@ -376,7 +391,14 @@ printf 'HERMES_OPENAI_BASE_URL=http://172.17.0.1:11434/v1\nHERMES_OPENAI_API_KEY
 run_bootstrap "${data_dir}" CI_HERMES_OLLAMA_NATIVE=1
 out="$(cat "${data_dir}/config.yaml")"
 assert_contains "existing auxiliary preserved" "provider: openrouter" "${out}"
-assert_not_contains "our base_url not injected over user config" "base_url: 'http://172.17.0.1:11434/v1'" "${out}"
+# The user's auxiliary.compression must be left exactly as-is — no base_url injected.
+# (A grep can't distinguish it from the intended providers.ollama base_url, so assert
+# on the parsed structure.)
+if python3 -c "import yaml,sys; a=yaml.safe_load(open('${data_dir}/config.yaml')).get('auxiliary',{}).get('compression',{}); sys.exit(0 if a.get('provider')=='openrouter' and 'base_url' not in a else 1)"; then
+  echo "  ✓ user aux.compression untouched (no base_url injected)"; PASS=$((PASS + 1))
+else
+  echo "  ✗ user aux.compression was modified"; FAIL=$((FAIL + 1))
+fi
 rm -rf "${data_dir}"
 
 # ─── Test 18b: an inline auxiliary section is NOT duplicated ──────────────────
@@ -417,6 +439,119 @@ run_bootstrap "${data_dir}" CI_HERMES_OLLAMA_NATIVE=1
 out="$(cat "${data_dir}/config.yaml")"
 assert_not_contains "no auxiliary section for cloud endpoint" "auxiliary:" "${out}"
 assert_not_contains "cloud api key never written to config.yaml" "sk-secret-cloud-key" "${out}"
+rm -rf "${data_dir}"
+
+# ─── Test 22: reconcile pins model.base_url + api_key for a local endpoint ─────
+# Surfaces the local box as the GUI picker's "custom" provider (num_ctx-aware).
+# Local-gated only (NOT the native flag) — the picker mislabel breaks the GUI
+# switch regardless of whether the native adapter is on, so we use the flag-OFF
+# run here to prove independence.
+echo "test: reconcile pins model.base_url + api_key for a local endpoint (flag off)"
+data_dir="$(mktemp -d)"
+printf 'model:\n  provider: ollama\n  default: gemma4:e2b\n' > "${data_dir}/config.yaml"
+printf 'HERMES_OPENAI_BASE_URL=http://172.17.0.1:11434/v1\nHERMES_OPENAI_API_KEY=ollama\n' > "${data_dir}/.env.hub-bootstrap"
+run_bootstrap "${data_dir}"
+out="$(cat "${data_dir}/config.yaml")"
+assert_contains "model.base_url pinned" "  base_url: 'http://172.17.0.1:11434/v1'" "${out}"
+assert_contains "model.api_key sentinel pinned" "  api_key: 'ollama'" "${out}"
+assert_contains "provider stays ollama" "provider: ollama" "${out}"
+assert_contains "providers.ollama registered for picker" "name: 'Ollama (local)'" "${out}"
+assert_no_line "providers section opened (not inline {})" "providers: {" "${out}"
+assert_not_contains "no auxiliary block (flag off)" "auxiliary:" "${out}"
+rm -rf "${data_dir}"
+
+# ─── Test 23: auto-heal a config an earlier GUI switch left on 'openai-api' ────
+echo "test: reconcile heals provider openai-api -> ollama for a local endpoint"
+data_dir="$(mktemp -d)"
+printf 'model:\n  provider: openai-api\n  default: qwen3.5:9b\n  ollama_num_ctx: 64000\n' > "${data_dir}/config.yaml"
+printf 'HERMES_OPENAI_BASE_URL=http://172.17.0.1:11434/v1\nHERMES_OPENAI_API_KEY=ollama\n' > "${data_dir}/.env.hub-bootstrap"
+run_bootstrap "${data_dir}" CI_HERMES_OLLAMA_NATIVE=1
+out="$(cat "${data_dir}/config.yaml")"
+assert_contains "provider healed to ollama" "provider: ollama" "${out}"
+assert_not_contains "openai-api provider removed" "provider: openai-api" "${out}"
+assert_contains "endpoint pinned after heal" "  base_url: 'http://172.17.0.1:11434/v1'" "${out}"
+assert_contains "providers.ollama registered after heal" "name: 'Ollama (local)'" "${out}"
+rm -rf "${data_dir}"
+
+# ─── Test 24: cloud endpoint → no model.base_url, no heal, no key leak ─────────
+echo "test: reconcile leaves the model block alone for a cloud endpoint"
+data_dir="$(mktemp -d)"
+printf 'model:\n  provider: openai-api\n  default: gpt-4o\n' > "${data_dir}/config.yaml"
+printf 'HERMES_OPENAI_BASE_URL=https://api.openai.com/v1\nHERMES_OPENAI_API_KEY=sk-secret-cloud-key\n' > "${data_dir}/.env.hub-bootstrap"
+run_bootstrap "${data_dir}" CI_HERMES_OLLAMA_NATIVE=1
+out="$(cat "${data_dir}/config.yaml")"
+assert_contains "cloud provider left as-is (not healed)" "provider: openai-api" "${out}"
+assert_not_contains "no model.base_url pinned for cloud" "base_url:" "${out}"
+assert_not_contains "cloud key never written to config.yaml" "sk-secret-cloud-key" "${out}"
+assert_not_contains "no providers.ollama picker entry for cloud" "Ollama (local)" "${out}"
+rm -rf "${data_dir}"
+
+# ─── Test 25: model endpoint reconcile is idempotent ──────────────────────────
+echo "test: model.base_url/heal reconcile is idempotent"
+data_dir="$(mktemp -d)"
+printf 'model:\n  provider: openai-api\n  default: qwen3.5:9b\n' > "${data_dir}/config.yaml"
+printf 'HERMES_OPENAI_BASE_URL=http://172.17.0.1:11434/v1\nHERMES_OPENAI_API_KEY=ollama\n' > "${data_dir}/.env.hub-bootstrap"
+run_bootstrap "${data_dir}" CI_HERMES_OLLAMA_NATIVE=1
+hash1="$(shasum "${data_dir}/config.yaml" | awk '{print $1}')"
+run_bootstrap "${data_dir}" CI_HERMES_OLLAMA_NATIVE=1
+hash2="$(shasum "${data_dir}/config.yaml" | awk '{print $1}')"
+assert_eq "two runs produce identical config.yaml" "${hash1}" "${hash2}"
+rm -rf "${data_dir}"
+
+# ─── Test 26: a user's explicit model.base_url is never clobbered ──────────────
+echo "test: an existing model.base_url is preserved"
+data_dir="$(mktemp -d)"
+printf "model:\n  provider: ollama\n  default: gemma4:e2b\n  base_url: 'http://my-own-box:11434/v1'\n" > "${data_dir}/config.yaml"
+printf 'HERMES_OPENAI_BASE_URL=http://172.17.0.1:11434/v1\nHERMES_OPENAI_API_KEY=ollama\n' > "${data_dir}/.env.hub-bootstrap"
+run_bootstrap "${data_dir}" CI_HERMES_OLLAMA_NATIVE=1
+out="$(cat "${data_dir}/config.yaml")"
+assert_contains "user base_url preserved" "base_url: 'http://my-own-box:11434/v1'" "${out}"
+# 2-space anchor targets the model key only (aux uses 4 spaces): the hub endpoint
+# must not be forced onto the model block over the user's own value.
+assert_no_line "hub endpoint not forced over user model value" "  base_url: 'http://172.17.0.1:11434/v1'" "${out}"
+rm -rf "${data_dir}"
+
+# ─── Test 27: a user's own providers entry (different key) is preserved ────────
+echo "test: ensure_provider_entry adds ollama without clobbering a user provider"
+data_dir="$(mktemp -d)"
+printf "model:\n  provider: ollama\n  default: gemma4:e2b\nproviders:\n  myremote:\n    name: 'My Remote'\n    base_url: 'https://remote.example/v1'\n" > "${data_dir}/config.yaml"
+printf 'HERMES_OPENAI_BASE_URL=http://172.17.0.1:11434/v1\nHERMES_OPENAI_API_KEY=ollama\n' > "${data_dir}/.env.hub-bootstrap"
+run_bootstrap "${data_dir}" CI_HERMES_OLLAMA_NATIVE=1
+out="$(cat "${data_dir}/config.yaml")"
+assert_contains "user provider preserved" "name: 'My Remote'" "${out}"
+assert_contains "ollama provider added alongside" "name: 'Ollama (local)'" "${out}"
+assert_eq "single providers: key (no duplicate)" "1" "$(grep -cE '^providers:' "${data_dir}/config.yaml")"
+rm -rf "${data_dir}"
+
+# ─── Test 28: an existing providers.ollama is never clobbered (idempotent) ─────
+echo "test: an existing providers.ollama entry is left untouched"
+data_dir="$(mktemp -d)"
+printf "model:\n  provider: ollama\n  default: gemma4:e2b\nproviders:\n  ollama:\n    name: 'My Own Ollama'\n    base_url: 'http://my-box:11434/v1'\n" > "${data_dir}/config.yaml"
+printf 'HERMES_OPENAI_BASE_URL=http://172.17.0.1:11434/v1\nHERMES_OPENAI_API_KEY=ollama\n' > "${data_dir}/.env.hub-bootstrap"
+run_bootstrap "${data_dir}" CI_HERMES_OLLAMA_NATIVE=1
+out="$(cat "${data_dir}/config.yaml")"
+assert_contains "existing providers.ollama name preserved" "name: 'My Own Ollama'" "${out}"
+assert_not_contains "our providers.ollama not forced over user's" "name: 'Ollama (local)'" "${out}"
+rm -rf "${data_dir}"
+
+# ─── Test 29: inline-empty 'providers: {}' (PyYAML re-dump) is opened cleanly ──
+# A config re-dumped by Hermes serializes an empty mapping as `providers: {}`.
+# ensure_provider_entry must open it into a block and add ollama — not append a
+# second top-level providers: key.
+echo "test: inline-empty 'providers: {}' is opened and gets the ollama entry"
+data_dir="$(mktemp -d)"
+printf 'model:\n  provider: ollama\n  default: gemma4:e2b\nproviders: {}\n' > "${data_dir}/config.yaml"
+printf 'HERMES_OPENAI_BASE_URL=http://172.17.0.1:11434/v1\nHERMES_OPENAI_API_KEY=ollama\n' > "${data_dir}/.env.hub-bootstrap"
+run_bootstrap "${data_dir}" CI_HERMES_OLLAMA_NATIVE=1
+out="$(cat "${data_dir}/config.yaml")"
+assert_contains "providers.ollama added from inline-empty" "name: 'Ollama (local)'" "${out}"
+assert_eq "single providers: key (no duplicate)" "1" "$(grep -cE '^providers:' "${data_dir}/config.yaml")"
+assert_no_line "inline-empty providers was opened" "providers: {}" "${out}"
+if python3 -c "import yaml,sys; d=yaml.safe_load(open('${data_dir}/config.yaml')); sys.exit(0 if 'ollama' in (d.get('providers') or {}) else 1)"; then
+  echo "  ✓ YAML valid, providers.ollama present"; PASS=$((PASS + 1))
+else
+  echo "  ✗ YAML invalid or providers.ollama missing"; FAIL=$((FAIL + 1))
+fi
 rm -rf "${data_dir}"
 
 # ─── Summary ────────────────────────────────────────────────────────────────

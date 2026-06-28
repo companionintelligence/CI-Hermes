@@ -43,22 +43,44 @@ fetch_bootstrap() {
 }
 
 translate_keys() {
-  # stdin: HERMES_* and other env lines from Hub
-  # stdout: OPENAI_* lines Hermes can read, plus the original keys preserved
-  awk '
+  # $1: is_local_ollama — "1" when the Hub endpoint is the local Ollama box
+  #     (api_key sentinel "ollama"); "0"/empty for a cloud provider.
+  #
+  # stdin:  HERMES_* and other env lines from Hub
+  # stdout: env lines Hermes can read, plus the original keys preserved.
+  #
+  # For a LOCAL Ollama endpoint we deliberately do NOT emit — and actively drop —
+  # the OpenAI-SDK aliases OPENAI_BASE_URL / OPENAI_API_BASE / OPENAI_API_KEY.
+  # The runtime resolves the local endpoint from CUSTOM_BASE_URL + config
+  # model.base_url (upstream no longer consults OPENAI_BASE_URL), so these aliases
+  # are unused there — while setting them makes the upstream model picker treat the
+  # local endpoint as the generic "openai-api" provider, which loses the Ollama
+  # num_ctx injection and points the main model at api.openai.com after a GUI model
+  # switch. For a CLOUD provider the OpenAI aliases are correct and required
+  # (host-gated key resolution), so we keep the original fan-out untouched.
+  awk -v is_local="${1:-0}" '
     BEGIN { FS="="; emitted_model_aliases=0 }
+    # Local: never let an OpenAI-SDK base/key alias reach the agent (foot-gun above),
+    # even if a future Hub were to send one directly.
+    is_local == "1" && /^OPENAI_BASE_URL=/ { next }
+    is_local == "1" && /^OPENAI_API_BASE=/ { next }
+    is_local == "1" && /^OPENAI_API_KEY=/  { next }
     /^HERMES_OPENAI_BASE_URL=/ {
       v=$0
-      sub(/^HERMES_OPENAI_BASE_URL=/, "OPENAI_API_BASE=", v); print v
-      sub(/^OPENAI_API_BASE=/, "OPENAI_BASE_URL=", v); print v
-      sub(/^OPENAI_BASE_URL=/, "CUSTOM_BASE_URL=", v); print v
+      sub(/^HERMES_OPENAI_BASE_URL=/, "CUSTOM_BASE_URL=", v); print v
+      if (is_local != "1") {
+        a=$0; sub(/^HERMES_OPENAI_BASE_URL=/, "OPENAI_API_BASE=", a); print a
+        b=$0; sub(/^HERMES_OPENAI_BASE_URL=/, "OPENAI_BASE_URL=", b); print b
+      }
       print
       next
     }
     /^HERMES_OPENAI_API_KEY=/  {
       v=$0
-      sub(/^HERMES_OPENAI_API_KEY=/, "OPENAI_API_KEY=", v); print v
-      sub(/^OPENAI_API_KEY=/, "CUSTOM_API_KEY=", v); print v
+      sub(/^HERMES_OPENAI_API_KEY=/, "CUSTOM_API_KEY=", v); print v
+      if (is_local != "1") {
+        a=$0; sub(/^HERMES_OPENAI_API_KEY=/, "OPENAI_API_KEY=", a); print a
+      }
       print
       next
     }
@@ -159,8 +181,16 @@ main() {
     exit 0
   fi
 
+  # Detect a local-Ollama endpoint (api_key sentinel "ollama") vs a cloud provider,
+  # so translate_keys suppresses the OpenAI-SDK aliases for local only — they make
+  # the model picker mislabel the local box as the cloud "openai-api" provider.
+  main_api_key="$(printf '%s\n' "${body}" | grep -m1 '^HERMES_OPENAI_API_KEY=' | cut -d= -f2- || true)"
+  main_api_key="$(normalize_env_value "${main_api_key}")"
+  is_local_ollama=0
+  [ "${main_api_key}" = "ollama" ] && is_local_ollama=1
+
   tmp="$(mktemp)"
-  if ! printf '%s\n' "${body}" | translate_keys > "${tmp}"; then
+  if ! printf '%s\n' "${body}" | translate_keys "${is_local_ollama}" > "${tmp}"; then
     rm -f "${tmp}"
     log "ERROR: translate_keys failed"
     exit 0
@@ -202,6 +232,23 @@ model:
   provider: ollama
   default: '${model_name_yaml}'
 EOF
+        # Pin the local endpoint in config.yaml so (1) the runtime resolves it from
+        # the single source of truth (upstream no longer consults OPENAI_BASE_URL) and
+        # (2) the GUI model picker surfaces it as the "custom" provider — the one that
+        # injects ollama_num_ctx — instead of the generic "openai-api" provider (which
+        # drops num_ctx and points the main model at api.openai.com on a switch).
+        # Local-only: gated on the "ollama" key sentinel, mirroring the auxiliary
+        # block, so cloud setups (provider/base_url come from the Hub) are untouched.
+        main_base=$(normalize_env_value "$(grep "^HERMES_OPENAI_BASE_URL=" "${OUT_ENV}" | cut -d= -f2- | head -n 1)")
+        main_key=$(normalize_env_value "$(grep "^HERMES_OPENAI_API_KEY=" "${OUT_ENV}" | cut -d= -f2- | head -n 1)")
+        if [ -n "${main_base}" ] && [ "${main_key}" = "ollama" ]; then
+          esc_main_base=$(yaml_single_quote "${main_base}")
+          {
+            printf "  base_url: '%s'\n" "${esc_main_base}"
+            printf "  api_key: 'ollama'\n"
+          } >> "${OUT_CONFIG}"
+          log "set model.base_url=${main_base} (config-authoritative endpoint) in ${OUT_CONFIG}"
+        fi
         # Hardware-aware context size from the Hub (HERMES_NUM_CTX). The upstream
         # hermes-agent reads model.ollama_num_ctx (NOT num_ctx) and injects it as
         # extra_body.options.num_ctx on every chat request — see the bundled
@@ -230,6 +277,25 @@ EOF
             printf '  context_length: %s\n' "${num_ctx}" >> "${OUT_CONFIG}"
             log "set model.context_length=${num_ctx} in ${OUT_CONFIG}"
           fi
+        fi
+
+        # Register the local endpoint as a named provider so the GUI model picker
+        # LISTS it with its models — the dashboard picker reads providers:/
+        # custom_providers:, NOT model.base_url. Keyed "ollama": a built-in alias of
+        # the num_ctx-aware "custom" profile, so selecting a model here writes a
+        # provider that still injects ollama_num_ctx on switch (verified: both the
+        # "ollama" slug and a "custom" write resolve to the custom profile). Emitted
+        # AFTER all model.* keys so they stay contiguous under model:. Local-only.
+        if [ -n "${main_base}" ] && [ "${main_key}" = "ollama" ]; then
+          esc_main_base=$(yaml_single_quote "${main_base}")
+          {
+            printf 'providers:\n'
+            printf '  ollama:\n'
+            printf "    name: 'Ollama (local)'\n"
+            printf "    base_url: '%s'\n" "${esc_main_base}"
+            printf "    api_key: 'ollama'\n"
+          } >> "${OUT_CONFIG}"
+          log "registered providers.ollama for the GUI model picker -> ${main_base}"
         fi
 
         # Point auxiliary side-tasks (compression, title, vision, …) at the SAME
