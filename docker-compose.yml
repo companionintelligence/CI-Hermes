@@ -13,6 +13,9 @@ services:
       GATEWAY_ALLOWED_USERS: ${GATEWAY_ALLOWED_USERS:-} # Set to your messaging user ID(s) to avoid default-deny gateway auth
       # Tells the dashboard to probe the gateway via HTTP instead of local PID detection
       GATEWAY_HEALTH_URL: http://hermes-gateway:8642
+      # Route local Ollama through the native /api/chat API (honors num_ctx) instead
+      # of the OpenAI-compat /v1 endpoint (which ignores it). Empty = off (stock /v1).
+      CI_HERMES_OLLAMA_NATIVE: ${CI_HERMES_OLLAMA_NATIVE:-}
     ports:
       # Expose local dev on 18790 to match the CI app port; the Node server listens on 18789.
       - "18790:18789"
@@ -43,6 +46,8 @@ services:
       API_SERVER_ENABLED: "true"
       API_SERVER_HOST: "0.0.0.0"
       API_SERVER_KEY: ${APP_SEED:-hermes-internal-key}
+      # Route local Ollama through native /api/chat (honors num_ctx); empty = off.
+      CI_HERMES_OLLAMA_NATIVE: ${CI_HERMES_OLLAMA_NATIVE:-}
     volumes:
       - ./data:/opt/data
     networks:

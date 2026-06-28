@@ -348,6 +348,77 @@ after="$(stat -c %Y "${data_dir}/config.yaml")"
 assert_eq "config.yaml not rewritten when unchanged (mtime preserved)" "${before}" "${after}"
 rm -rf "${data_dir}"
 
+# ─── Test 17: reconcile adds an auxiliary block (native on + local ollama) ────
+# A pre-existing config with no auxiliary section gets one so side-tasks resolve
+# to the local Ollama instead of failing aux auto-detection.
+echo "test: reconcile adds auxiliary providers (native on + ollama endpoint)"
+data_dir="$(mktemp -d)"
+printf 'model:\n  provider: ollama\n  default: gemma4:e2b\n' > "${data_dir}/config.yaml"
+printf 'HERMES_OPENAI_BASE_URL=http://172.17.0.1:11434/v1\nHERMES_OPENAI_API_KEY=ollama\nHERMES_DEFAULT_MODEL=gemma4:e2b\n' > "${data_dir}/.env.hub-bootstrap"
+run_bootstrap "${data_dir}" CI_HERMES_OLLAMA_NATIVE=1
+out="$(cat "${data_dir}/config.yaml")"
+assert_contains "auxiliary section added" "auxiliary:" "${out}"
+assert_contains "compression task added" "  compression:" "${out}"
+assert_contains "vision task added" "  vision:" "${out}"
+assert_contains "aux base_url at local ollama" "base_url: 'http://172.17.0.1:11434/v1'" "${out}"
+assert_contains "aux api_key is the local sentinel" "api_key: 'ollama'" "${out}"
+hash1="$(shasum "${data_dir}/config.yaml" | awk '{print $1}')"
+run_bootstrap "${data_dir}" CI_HERMES_OLLAMA_NATIVE=1
+hash2="$(shasum "${data_dir}/config.yaml" | awk '{print $1}')"
+assert_eq "auxiliary reconcile is idempotent" "${hash1}" "${hash2}"
+rm -rf "${data_dir}"
+
+# ─── Test 18: an existing auxiliary section is NOT clobbered (block form) ──────
+echo "test: a user-configured auxiliary section is preserved"
+data_dir="$(mktemp -d)"
+printf 'model:\n  provider: ollama\nauxiliary:\n  compression:\n    provider: openrouter\n' > "${data_dir}/config.yaml"
+printf 'HERMES_OPENAI_BASE_URL=http://172.17.0.1:11434/v1\nHERMES_OPENAI_API_KEY=ollama\n' > "${data_dir}/.env.hub-bootstrap"
+run_bootstrap "${data_dir}" CI_HERMES_OLLAMA_NATIVE=1
+out="$(cat "${data_dir}/config.yaml")"
+assert_contains "existing auxiliary preserved" "provider: openrouter" "${out}"
+assert_not_contains "our base_url not injected over user config" "base_url: 'http://172.17.0.1:11434/v1'" "${out}"
+rm -rf "${data_dir}"
+
+# ─── Test 18b: an inline auxiliary section is NOT duplicated ──────────────────
+echo "test: an inline 'auxiliary: {}' is detected (no duplicate top-level key)"
+data_dir="$(mktemp -d)"
+printf 'model:\n  provider: ollama\nauxiliary: {}\n' > "${data_dir}/config.yaml"
+printf 'HERMES_OPENAI_BASE_URL=http://172.17.0.1:11434/v1\nHERMES_OPENAI_API_KEY=ollama\n' > "${data_dir}/.env.hub-bootstrap"
+run_bootstrap "${data_dir}" CI_HERMES_OLLAMA_NATIVE=1
+assert_eq "no duplicate auxiliary key" "1" "$(grep -cE '^auxiliary:' "${data_dir}/config.yaml")"
+rm -rf "${data_dir}"
+
+# ─── Test 19: no auxiliary block when the endpoint is unknown ─────────────────
+echo "test: reconcile adds no auxiliary block without an endpoint in .env"
+data_dir="$(mktemp -d)"
+printf 'model:\n  provider: ollama\n' > "${data_dir}/config.yaml"
+printf 'HERMES_NUM_CTX=65536\n' > "${data_dir}/.env.hub-bootstrap"
+run_bootstrap "${data_dir}" CI_HERMES_OLLAMA_NATIVE=1
+out="$(cat "${data_dir}/config.yaml")"
+assert_not_contains "no auxiliary section without endpoint" "auxiliary:" "${out}"
+rm -rf "${data_dir}"
+
+# ─── Test 20: native flag OFF → no auxiliary block (true no-op) ───────────────
+echo "test: reconcile adds no auxiliary block when CI_HERMES_OLLAMA_NATIVE is off"
+data_dir="$(mktemp -d)"
+printf 'model:\n  provider: ollama\n' > "${data_dir}/config.yaml"
+printf 'HERMES_OPENAI_BASE_URL=http://172.17.0.1:11434/v1\nHERMES_OPENAI_API_KEY=ollama\n' > "${data_dir}/.env.hub-bootstrap"
+run_bootstrap "${data_dir}"
+out="$(cat "${data_dir}/config.yaml")"
+assert_not_contains "no auxiliary section with flag off" "auxiliary:" "${out}"
+rm -rf "${data_dir}"
+
+# ─── Test 21: cloud endpoint (api_key != ollama) → no block, no key leak ──────
+echo "test: reconcile writes no auxiliary block / no key leak for a cloud endpoint"
+data_dir="$(mktemp -d)"
+printf 'model:\n  provider: ollama\n' > "${data_dir}/config.yaml"
+printf 'HERMES_OPENAI_BASE_URL=https://api.openai.com/v1\nHERMES_OPENAI_API_KEY=sk-secret-cloud-key\n' > "${data_dir}/.env.hub-bootstrap"
+run_bootstrap "${data_dir}" CI_HERMES_OLLAMA_NATIVE=1
+out="$(cat "${data_dir}/config.yaml")"
+assert_not_contains "no auxiliary section for cloud endpoint" "auxiliary:" "${out}"
+assert_not_contains "cloud api key never written to config.yaml" "sk-secret-cloud-key" "${out}"
+rm -rf "${data_dir}"
+
 # ─── Summary ────────────────────────────────────────────────────────────────
 echo
 echo "Results: ${PASS} passed, ${FAIL} failed"

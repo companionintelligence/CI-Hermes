@@ -90,8 +90,30 @@ if ! printf '%s' "${ci_num_ctx}" | grep -qE '^[1-9][0-9]*$'; then
   ci_num_ctx=""
 fi
 
+# The main inference endpoint the Hub configured, so we can point auxiliary
+# side-tasks (compression/title/vision/…) at the SAME endpoint. Without this,
+# Hermes' aux auto-detect only tries cloud providers and resolves to nothing on a
+# local-only appliance, so those tasks silently don't run. See the Python block.
+strip_qcr() { printf '%s' "$1" | tr -d "\r" | sed -e "s/^[\"']//" -e "s/[\"']\$//"; }
+aux_base=""; aux_key=""; aux_model=""
+if [[ -f "${HUB_ENV_FILE}" ]]; then
+  aux_base="$(grep -m1 '^HERMES_OPENAI_BASE_URL=' "${HUB_ENV_FILE}" 2>/dev/null | cut -d= -f2- || true)"
+  aux_key="$(grep -m1 '^HERMES_OPENAI_API_KEY=' "${HUB_ENV_FILE}" 2>/dev/null | cut -d= -f2- || true)"
+  aux_model="$(grep -m1 '^HERMES_DEFAULT_MODEL=' "${HUB_ENV_FILE}" 2>/dev/null | cut -d= -f2- || true)"
+fi
+aux_base="$(strip_qcr "${aux_base}")"
+aux_key="$(strip_qcr "${aux_key}")"
+aux_model="$(strip_qcr "${aux_model}")"
+# Gate (mirrors bootstrap-from-hub.sh): only wire aux to the local endpoint when
+# native mode is enabled AND this is the local Ollama endpoint (api_key sentinel
+# "ollama"). Clearing aux_base makes the Python block a no-op. This keeps flag-off a
+# true no-op and never writes a cloud API key into config.yaml.
+ci_native_lc="$(printf '%s' "${CI_HERMES_OLLAMA_NATIVE:-}" | tr '[:upper:]' '[:lower:]')"
+case "${ci_native_lc}" in 1|true|yes|on) : ;; *) aux_base="" ;; esac
+[[ "${aux_key}" == "ollama" ]] || aux_base=""
+
 if [[ -f "${CONFIG_FILE}" ]]; then
-  python3 - "${CONFIG_FILE}" "${SKILLS_SOURCE}" "${PLUGIN_NAME}" "${CI_MEMORY_PROVIDER}" "${ci_num_ctx}" <<'PY'
+  python3 - "${CONFIG_FILE}" "${SKILLS_SOURCE}" "${PLUGIN_NAME}" "${CI_MEMORY_PROVIDER}" "${ci_num_ctx}" "${aux_base}" "${aux_key}" "${aux_model}" <<'PY'
 from pathlib import Path
 import re
 import sys
@@ -101,6 +123,9 @@ skills_dir = sys.argv[2]
 plugin_name = sys.argv[3]
 memory_provider = sys.argv[4] if len(sys.argv) > 4 else ""
 num_ctx = sys.argv[5] if len(sys.argv) > 5 else ""
+aux_base = sys.argv[6] if len(sys.argv) > 6 else ""
+aux_key = sys.argv[7] if len(sys.argv) > 7 else ""
+aux_model = sys.argv[8] if len(sys.argv) > 8 else ""
 
 # Hermes' hard minimum context window. Mirrors the upstream agent's
 # MINIMUM_CONTEXT_LENGTH, which is the literal 64000 (NOT 65536) and is compared
@@ -344,6 +369,36 @@ if num_ctx:
                 print(f"CI context: set model.context_length={num_ctx}")
         elif delete_child_scalar("model", "context_length"):
             print("CI context: removed model.context_length (Hub value below minimum; auto-detect)")
+
+# ── Hub-managed auxiliary providers ───────────────────────────────────────────
+# Point side-tasks (compression/title/vision/…) at the SAME endpoint as the main
+# model. Hermes' aux auto-detect chain only tries cloud providers (OpenRouter/Nous/
+# api-key) and resolves to NOTHING on a local-only appliance — so compression/title
+# silently don't run (middle turns dropped without a summary). An explicit
+# base_url+api_key per task forces the "custom" path to the local endpoint (and lets
+# the native /api/chat adapter take over when CI_HERMES_OLLAMA_NATIVE is on). Only
+# add when there is no `auxiliary:` section yet — never clobber a user's own config.
+if aux_base:
+    # Detect an existing auxiliary section in ANY form (block `auxiliary:` or inline
+    # `auxiliary: {...}` from a PyYAML re-dump) so we never append a duplicate
+    # top-level key, and never clobber a user's own auxiliary config.
+    has_aux = any(re.match(r"^auxiliary:", ln) for ln in lines)
+    if not has_aux:
+        def _yq(v: str) -> str:
+            return v.replace("'", "''")  # YAML single-quote escaping
+        block = ["auxiliary:\n"]
+        for _t in ("compression", "title_generation", "vision", "web_extract", "session_search", "skills_hub", "mcp"):
+            block.append(f"  {_t}:\n")
+            block.append(f"    base_url: '{_yq(aux_base)}'\n")
+            block.append("    api_key: 'ollama'\n")
+            if aux_model:
+                block.append(f"    model: '{_yq(aux_model)}'\n")
+        if lines and not lines[-1].endswith("\n"):
+            lines[-1] += "\n"
+        if lines and lines[-1].strip():
+            lines.append("\n")
+        lines.extend(block)
+        print(f"CI context: added auxiliary providers (side-tasks -> {aux_base})")
 
 new_text = "".join(lines)
 # Only write when something actually changed, so a fully-reconciled config is a

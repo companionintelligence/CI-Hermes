@@ -26,6 +26,20 @@ COPY ci-context/plugins/ci-runtime /opt/hermes/plugins/ci-runtime
 COPY ci-context/plugins/companionintelligence /app/ci-context/plugins/companionintelligence
 RUN chmod +x /app/entrypoint.sh /app/gateway-entrypoint.sh /app/start-hermes.sh /app/bootstrap-ci-context.sh /app/bootstrap-from-hub.sh
 
+# CI-Hermes: native Ollama (/api/chat) adapter. The upstream agent talks to Ollama
+# via the OpenAI-compat /v1 endpoint, which silently ignores per-request num_ctx
+# (verified through Ollama v0.30.11/main) — so models load at Ollama's 4096 default.
+# This patch routes local Ollama onto the native /api/chat API (which honors num_ctx)
+# via a drop-in client + a startup .pth shim. Inert unless CI_HERMES_OLLAMA_NATIVE=1
+# at runtime. See specs/ci/ci-hermes-ollama-native-api-plan.md and CI-Hermes#24.
+COPY patches/ollama_native_adapter.py patches/enable_ollama_native.py patches/ci-ollama-native.pth /app/patches/
+RUN SP="$(/opt/hermes/.venv/bin/python -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')" && \
+    install -m 0644 /app/patches/ollama_native_adapter.py "$SP/ollama_native_adapter.py" && \
+    install -m 0644 /app/patches/enable_ollama_native.py  "$SP/enable_ollama_native.py" && \
+    install -m 0644 /app/patches/ci-ollama-native.pth     "$SP/ci-ollama-native.pth" && \
+    /opt/hermes/.venv/bin/python -c "import enable_ollama_native" && \
+    echo "CI ollama-native patches installed into $SP"
+
 # Ensure hermes venv is in PATH everywhere. The agent's terminal tool spawns
 # subprocesses that may not inherit Docker ENV, so we cover all cases:
 # - ENV: for the entrypoint, Node server, and direct child processes
