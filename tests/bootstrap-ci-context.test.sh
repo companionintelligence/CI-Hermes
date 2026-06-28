@@ -531,6 +531,26 @@ assert_contains "existing providers.ollama name preserved" "name: 'My Own Ollama
 assert_not_contains "our providers.ollama not forced over user's" "name: 'Ollama (local)'" "${out}"
 rm -rf "${data_dir}"
 
+# ─── Test 29: inline-empty 'providers: {}' (PyYAML re-dump) is opened cleanly ──
+# A config re-dumped by Hermes serializes an empty mapping as `providers: {}`.
+# ensure_provider_entry must open it into a block and add ollama — not append a
+# second top-level providers: key.
+echo "test: inline-empty 'providers: {}' is opened and gets the ollama entry"
+data_dir="$(mktemp -d)"
+printf 'model:\n  provider: ollama\n  default: gemma4:e2b\nproviders: {}\n' > "${data_dir}/config.yaml"
+printf 'HERMES_OPENAI_BASE_URL=http://172.17.0.1:11434/v1\nHERMES_OPENAI_API_KEY=ollama\n' > "${data_dir}/.env.hub-bootstrap"
+run_bootstrap "${data_dir}" CI_HERMES_OLLAMA_NATIVE=1
+out="$(cat "${data_dir}/config.yaml")"
+assert_contains "providers.ollama added from inline-empty" "name: 'Ollama (local)'" "${out}"
+assert_eq "single providers: key (no duplicate)" "1" "$(grep -cE '^providers:' "${data_dir}/config.yaml")"
+assert_no_line "inline-empty providers was opened" "^providers: \{\}" "${out}"
+if python3 -c "import yaml,sys; d=yaml.safe_load(open('${data_dir}/config.yaml')); sys.exit(0 if 'ollama' in (d.get('providers') or {}) else 1)"; then
+  echo "  ✓ YAML valid, providers.ollama present"; PASS=$((PASS + 1))
+else
+  echo "  ✗ YAML invalid or providers.ollama missing"; FAIL=$((FAIL + 1))
+fi
+rm -rf "${data_dir}"
+
 # ─── Summary ────────────────────────────────────────────────────────────────
 echo
 echo "Results: ${PASS} passed, ${FAIL} failed"
