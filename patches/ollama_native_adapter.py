@@ -484,7 +484,9 @@ class OllamaNativeClient:
         self.embeddings = _Embeddings(self)
         self.is_closed = False
         self._http = http_client or httpx.Client(
-            timeout=timeout or httpx.Timeout(connect=15.0, read=600.0, write=30.0, pool=30.0)
+            timeout=httpx.Timeout(connect=15.0, read=600.0, write=30.0, pool=30.0)
+            if timeout is None
+            else timeout
         )
 
     # lifecycle / SDK-compat surface
