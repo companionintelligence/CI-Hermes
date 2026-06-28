@@ -305,6 +305,20 @@ class MemoryTransportTests(unittest.TestCase):
             with self.assertRaises(urllib.error.HTTPError):
                 self._client().context()
 
+    def test_post_sets_accept_and_content_type_on_recall_turn_write(self):
+        # The CI-Server contract expects JSON in/out; every POST must say so.
+        for op in (
+            lambda c: c.recall("q"),
+            lambda c: c.turn([{"role": "user", "content": "u"}]),
+            lambda c: c.write("note"),
+        ):
+            cap, fake = self._capture()
+            with mock.patch("urllib.request.urlopen", fake):
+                op(self._client())
+            self.assertEqual(cap["accept"], "application/json")
+            self.assertEqual(cap["content_type"], "application/json")
+            self.assertEqual(cap["api_key"], "tok")
+
 
 class ContextAndIntentGatingTests(unittest.TestCase):
     def setUp(self):
@@ -421,6 +435,103 @@ class WriteGatingTests(unittest.TestCase):
         client = _MockClient()
         _provider_with_client(client).on_memory_write("clear", "MEMORY.md", "x")
         self.assertEqual(client.write_calls, [])
+
+    def test_whitespace_only_content_is_skipped(self):
+        client = _MockClient()
+        _provider_with_client(client).on_memory_write("write", "MEMORY.md", "   \n\t  ")
+        self.assertEqual(client.write_calls, [])
+
+
+class MemoryFlushBehaviorTests(unittest.TestCase):
+    """Truncation, role filtering, and serialization across all flush paths."""
+
+    def setUp(self):
+        _clear_flags()
+
+    def tearDown(self):
+        _clear_flags()
+
+    def test_sync_turn_truncates_both_user_and_assistant_to_4000(self):
+        client = _MockClient()
+        provider = _provider_with_client(client)
+        provider.sync_turn("u" * 5000, "a" * 6000)
+        provider._sync_thread.join(timeout=5)
+        messages, _, _ = client.turn_calls[0]
+        self.assertEqual(len(messages[0]["content"]), 4000)
+        self.assertEqual(len(messages[1]["content"]), 4000)
+
+    def test_session_end_truncates_messages_to_4000(self):
+        client = _MockClient()
+        msgs = [{"role": "user", "content": "x" * 5000}, {"role": "assistant", "content": "y" * 5000}]
+        _provider_with_client(client).on_session_end(msgs)
+        sent, _, _ = client.turn_calls[0]
+        self.assertEqual(len(sent[0]["content"]), 4000)
+        self.assertEqual(len(sent[1]["content"]), 4000)
+
+    def test_pre_compress_truncates_messages_to_4000(self):
+        client = _MockClient()
+        msgs = [{"role": "user", "content": "x" * 5000}]
+        _provider_with_client(client).on_pre_compress(msgs)
+        # Background thread — give it a beat to land.
+        for _ in range(50):
+            if client.turn_calls:
+                break
+            threading.Event().wait(0.01)
+        sent, _, _ = client.turn_calls[0]
+        self.assertEqual(len(sent[0]["content"]), 4000)
+
+    def test_session_end_drops_non_user_assistant_roles(self):
+        client = _MockClient()
+        msgs = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "u"},
+            {"role": "tool", "content": "t"},
+            {"role": "assistant", "content": "a"},
+        ]
+        _provider_with_client(client).on_session_end(msgs)
+        sent, _, _ = client.turn_calls[0]
+        self.assertEqual([m["role"] for m in sent], ["user", "assistant"])
+
+    def test_sync_turn_serializes_back_to_back_calls(self):
+        # Two rapid sync_turn() calls must serialize; the second waits for the
+        # first to land so writes can't reorder against the same session.
+        client = _MockClient()
+        provider = _provider_with_client(client)
+        provider.sync_turn("u1", "a1")
+        first = provider._sync_thread
+        provider.sync_turn("u2", "a2")
+        second = provider._sync_thread
+        self.assertIsNot(first, second)
+        second.join(timeout=5)
+        # The first call's user content must appear in the first persisted turn.
+        self.assertEqual(client.turn_calls[0][0][0]["content"], "u1")
+        self.assertEqual(client.turn_calls[1][0][0]["content"], "u2")
+
+
+class PrefetchResultParsingTests(unittest.TestCase):
+    """prefetch() must honour the block | text | context fallback chain."""
+
+    def setUp(self):
+        _clear_flags()
+
+    def tearDown(self):
+        _clear_flags()
+
+    def _provider_returning(self, payload):
+        client = _MockClient()
+        client.recall = lambda q, max_results=5: payload
+        provider = _provider_with_client(client)
+        return provider
+
+    def test_prefetch_uses_text_when_block_missing(self):
+        provider = self._provider_returning({"text": "FALLBACK-TEXT"})
+        provider.queue_prefetch("q")
+        self.assertEqual(provider.prefetch("q"), "FALLBACK-TEXT")
+
+    def test_prefetch_uses_context_when_block_and_text_missing(self):
+        provider = self._provider_returning({"context": "FALLBACK-CTX"})
+        provider.queue_prefetch("q")
+        self.assertEqual(provider.prefetch("q"), "FALLBACK-CTX")
 
 
 class SessionFlushGatingTests(unittest.TestCase):
