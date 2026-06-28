@@ -113,7 +113,7 @@ case "${ci_native_lc}" in 1|true|yes|on) : ;; *) aux_base="" ;; esac
 [[ "${aux_key}" == "ollama" ]] || aux_base=""
 
 if [[ -f "${CONFIG_FILE}" ]]; then
-  python3 - "${CONFIG_FILE}" "${SKILLS_SOURCE}" "${PLUGIN_NAME}" "${CI_MEMORY_PROVIDER}" "${ci_num_ctx}" "${aux_base}" "${aux_key}" "${aux_model}" <<'PY'
+  python3 - "${CONFIG_FILE}" "${SKILLS_SOURCE}" "${PLUGIN_NAME}" "${CI_MEMORY_PROVIDER}" "${ci_num_ctx}" "${aux_base}" "${aux_model}" <<'PY'
 from pathlib import Path
 import re
 import sys
@@ -124,8 +124,7 @@ plugin_name = sys.argv[3]
 memory_provider = sys.argv[4] if len(sys.argv) > 4 else ""
 num_ctx = sys.argv[5] if len(sys.argv) > 5 else ""
 aux_base = sys.argv[6] if len(sys.argv) > 6 else ""
-aux_key = sys.argv[7] if len(sys.argv) > 7 else ""
-aux_model = sys.argv[8] if len(sys.argv) > 8 else ""
+aux_model = sys.argv[7] if len(sys.argv) > 7 else ""
 
 # Hermes' hard minimum context window. Mirrors the upstream agent's
 # MINIMUM_CONTEXT_LENGTH, which is the literal 64000 (NOT 65536) and is compared

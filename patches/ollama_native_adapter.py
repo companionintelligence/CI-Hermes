@@ -69,8 +69,11 @@ def _probe_is_ollama(root: str, *, timeout: float = 2.0) -> bool:
     ok = False
     try:
         resp = httpx.get(f"{root}/api/version", timeout=timeout)
-        ok = resp.status_code == 200 and "version" in (resp.text or "")
-    except Exception as exc:  # network/timeout/non-ollama
+        # Validate the JSON shape ({"version": "<str>"}) rather than a substring
+        # match, so a non-Ollama server returning 200 text containing the word
+        # "version" can't false-positive into native routing.
+        ok = resp.status_code == 200 and isinstance(resp.json().get("version"), str)
+    except Exception as exc:  # network/timeout/non-ollama/non-JSON
         logger.debug("Ollama /api/version probe failed for %s: %s", root, exc)
         ok = False
     if ok:
