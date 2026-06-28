@@ -48,18 +48,22 @@ def _patch_runtime(module) -> None:
     # create_openai_client's params can't break the wrapper (it'd just pass through).
     def wrapped(agent, client_kwargs, *args, **kwargs):
         try:
-            base_url = str((client_kwargs or {}).get("base_url", "") or "")
-            if base_url and is_native_ollama_base_url(base_url):
-                safe = {
-                    k: v
-                    for k, v in client_kwargs.items()
-                    if k in {"api_key", "base_url", "default_headers", "timeout", "http_client"}
-                }
-                logger.info(
-                    "CI ollama-native: chat client via /api/chat (reason=%s, base=%s)",
-                    kwargs.get("reason"), base_url,
-                )
-                return OllamaNativeClient(**safe)
+            # Defensive: only inspect client_kwargs when it's actually a dict. If an
+            # upstream change ever passes a non-dict here, skip native routing and
+            # fall through to the original unchanged (no exception, no warning spam).
+            if isinstance(client_kwargs, dict):
+                base_url = str(client_kwargs.get("base_url", "") or "")
+                if base_url and is_native_ollama_base_url(base_url):
+                    safe = {
+                        k: v
+                        for k, v in client_kwargs.items()
+                        if k in {"api_key", "base_url", "default_headers", "timeout", "http_client"}
+                    }
+                    logger.info(
+                        "CI ollama-native: chat client via /api/chat (reason=%s, base=%s)",
+                        kwargs.get("reason"), base_url,
+                    )
+                    return OllamaNativeClient(**safe)
         except Exception as exc:
             logger.warning("CI ollama-native Hook 1 failed; falling back to /v1: %s", exc)
         return orig(agent, client_kwargs, *args, **kwargs)
