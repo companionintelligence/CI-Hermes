@@ -27,10 +27,45 @@ from typing import Any, Dict, List, Optional
 
 from agent.memory_provider import MemoryProvider
 
+from .intent_catalog import describe_catalog_for_prompt, fetch_intent_manifest
+
 logger = logging.getLogger(__name__)
 
 _REQUEST_TIMEOUT = 10.0   # seconds for write calls (absorb)
 _PREFETCH_TIMEOUT = 5.0   # seconds to wait for a queued prefetch result
+_MAX_TURN_CONTENT_CHARS = 4000   # max chars persisted per message (matches CI-OpenClaw)
+_MAX_RECALL_RESULTS = 20         # cap on L1 recall breadth (matches CI-OpenClaw)
+
+
+def _extract_block(resp: dict) -> str:
+    """Read the text payload of a context/recall response.
+
+    Tolerates the server returning the text under ``block``, ``text`` or
+    ``context`` — matching CI-OpenClaw so both harnesses behave identically.
+    """
+    if not isinstance(resp, dict):
+        return ""
+    return resp.get("block") or resp.get("text") or resp.get("context") or ""
+
+
+# ---------------------------------------------------------------------------
+# API-system feature flags
+# ---------------------------------------------------------------------------
+# Each CI-Server API the plugin uses can be turned on/off independently via an
+# env var (default on). Flag names match CI-OpenClaw:
+#   CI_MEMORY_CONTEXT_ENABLED  — L0 profile injection (/api/memory/context)
+#   CI_MEMORY_RECALL_ENABLED   — L1 per-turn recall (/api/memory/recall)
+#   CI_MEMORY_TURN_ENABLED     — turn-sync ingestion (/api/memory/turn)
+#   CI_MEMORY_WRITE_ENABLED    — durable note writes (/api/memory/write)
+#   CI_INTENTS_ENABLED         — intent catalog (/api/intents)
+_FALSY = {"0", "false", "no", "off"}
+
+
+def _feature_enabled(env_name: str, default: bool = True) -> bool:
+    raw = os.environ.get(env_name)
+    if raw is None or not raw.strip():
+        return default
+    return raw.strip().lower() not in _FALSY
 
 
 # ---------------------------------------------------------------------------
@@ -82,7 +117,8 @@ class _CIClient:
 
     def recall(self, query: str, max_results: int = 5) -> dict:
         """L1 — per-turn hybrid search against the knowledge graph."""
-        return self._post("/api/memory/recall", {"query": query, "maxResults": max_results})
+        capped = max(1, min(_MAX_RECALL_RESULTS, int(max_results or 5)))
+        return self._post("/api/memory/recall", {"query": query, "maxResults": capped})
 
     # ── Ingestion ─────────────────────────────────────────────────────────────
 
@@ -104,7 +140,14 @@ class _CIClient:
             payload["title"] = title
         if session_id:
             payload["sessionId"] = session_id
-        return self._post("/api/memory/write", payload)
+        try:
+            return self._post("/api/memory/write", payload)
+        except urllib.error.HTTPError as exc:
+            # Older CI-Server builds expose this as /api/memory/note. Fall back on
+            # 404 so a version skew doesn't drop the write (matches CI-OpenClaw).
+            if exc.code == 404:
+                return self._post("/api/memory/note", payload)
+            raise
 
     # ── Health ────────────────────────────────────────────────────────────────
 
@@ -344,7 +387,9 @@ class CompanionIntelligenceProvider(MemoryProvider):
 
     def initialize(self, session_id: str, **kwargs) -> None:
         cfg = _load_config()
-        self._session_id = str(session_id or "").strip()
+        # Accept session_key as a fallback so a runtime that reports the id under
+        # that name still tags turns correctly (matches CI-OpenClaw's handling).
+        self._session_id = str(session_id or kwargs.get("session_key") or "").strip()
         # Hardcode the platform as "hermes" so CI-Server labels turns as
         # "hermes conversation" instead of the generic "tui conversation" the
         # opencode runtime reports. Mirrors how CI-OpenClaw hardcodes "openclaw".
@@ -366,21 +411,35 @@ class CompanionIntelligenceProvider(MemoryProvider):
     # ---------------------------------------------------------------------------
 
     def system_prompt_block(self) -> str:
-        """L0 — fetch and return the user profile block for the system prompt.
+        """L0 — fetch and return the user profile block + the CI Intent catalog.
 
         Called once at session start. Blocks briefly while the server responds,
         but this happens before the first user message so latency is invisible.
         """
         if not self._client:
             return ""
-        try:
-            resp = self._client.context()
-            block = resp.get("block", "")
-            logger.debug("CI-Server system_prompt_block: %d chars", len(block))
-            return block
-        except Exception as exc:
-            logger.warning("CI-Server system_prompt_block failed: %s", exc)
-            return ""
+
+        blocks: List[str] = []
+
+        if _feature_enabled("CI_MEMORY_CONTEXT_ENABLED"):
+            try:
+                resp = self._client.context()
+                block = _extract_block(resp)
+                if block:
+                    blocks.append(block)
+                logger.debug("CI-Server system_prompt_block: %d chars", len(block))
+            except Exception as exc:
+                logger.warning("CI-Server system_prompt_block failed: %s", exc)
+
+        # Append the curated CI Intent catalog so the agent prefers the typed,
+        # privacy-labelled intents over raw CRUD. Mirrors how CI-OpenClaw consumes
+        # the same shared catalog; degrades silently if CI-Server lacks the endpoint.
+        if _feature_enabled("CI_INTENTS_ENABLED"):
+            catalog = describe_catalog_for_prompt(fetch_intent_manifest(self._client._get))
+            if catalog:
+                blocks.append(catalog)
+
+        return "\n\n".join(blocks)
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
         """Kick off an async L1 search as soon as the user message arrives.
@@ -388,7 +447,7 @@ class CompanionIntelligenceProvider(MemoryProvider):
         The HTTP call runs in a background thread so it overlaps with any other
         pre-turn processing. prefetch() then waits for the result.
         """
-        if not self._client:
+        if not self._client or not _feature_enabled("CI_MEMORY_RECALL_ENABLED"):
             return
 
         self._prefetch_result = None
@@ -397,7 +456,7 @@ class CompanionIntelligenceProvider(MemoryProvider):
         def _run() -> None:
             try:
                 resp = self._client.recall(query)
-                self._prefetch_result = resp.get("block", "") or ""
+                self._prefetch_result = _extract_block(resp)
             except Exception as exc:
                 logger.debug("CI-Server prefetch failed: %s", exc)
                 self._prefetch_result = ""
@@ -425,12 +484,12 @@ class CompanionIntelligenceProvider(MemoryProvider):
 
     def sync_turn(self, user_content: str, assistant_content: str, *,
                   session_id: str = "") -> None:
-        if not self._client:
+        if not self._client or not _feature_enabled("CI_MEMORY_TURN_ENABLED"):
             return
 
         messages = [
-            {"role": "user",      "content": (user_content or "")[:4000]},
-            {"role": "assistant", "content": (assistant_content or "")[:4000]},
+            {"role": "user",      "content": (user_content or "")[:_MAX_TURN_CONTENT_CHARS]},
+            {"role": "assistant", "content": (assistant_content or "")[:_MAX_TURN_CONTENT_CHARS]},
         ]
         sid = session_id or self._session_id
 
@@ -455,7 +514,7 @@ class CompanionIntelligenceProvider(MemoryProvider):
 
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
         """Flush the full session transcript on close."""
-        if not self._client or not messages:
+        if not self._client or not messages or not _feature_enabled("CI_MEMORY_TURN_ENABLED"):
             return
 
         # Wait for any in-flight sync before sending the final turn
@@ -463,7 +522,7 @@ class CompanionIntelligenceProvider(MemoryProvider):
             self._sync_thread.join(timeout=10.0)
 
         serialized = [
-            {"role": m.get("role", "user"), "content": str(m.get("content", ""))[:4000]}
+            {"role": m.get("role", "user"), "content": str(m.get("content", ""))[:_MAX_TURN_CONTENT_CHARS]}
             for m in messages
             if m.get("role") in ("user", "assistant")
         ]
@@ -479,11 +538,11 @@ class CompanionIntelligenceProvider(MemoryProvider):
 
     def on_pre_compress(self, messages: List[Dict[str, Any]]) -> str:
         """Flush messages that are about to be dropped from the context window."""
-        if not self._client or not messages:
+        if not self._client or not messages or not _feature_enabled("CI_MEMORY_TURN_ENABLED"):
             return ""
 
         serialized = [
-            {"role": m.get("role", "user"), "content": str(m.get("content", ""))[:2000]}
+            {"role": m.get("role", "user"), "content": str(m.get("content", ""))[:_MAX_TURN_CONTENT_CHARS]}
             for m in messages
             if m.get("role") in ("user", "assistant")
         ]
@@ -514,7 +573,7 @@ class CompanionIntelligenceProvider(MemoryProvider):
 
         Runs in a background thread so the agent is never blocked by the write.
         """
-        if not self._client or not content.strip():
+        if not self._client or not content.strip() or not _feature_enabled("CI_MEMORY_WRITE_ENABLED"):
             return
 
         # Skip clears — there is nothing meaningful to store.

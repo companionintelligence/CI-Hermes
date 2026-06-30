@@ -1,0 +1,568 @@
+"""Functional tests for the Companion Intelligence Hermes plugin.
+
+The plugin subclasses ``agent.memory_provider.MemoryProvider``, which only exists
+inside the Hermes runtime. We stub that base so the module imports standalone,
+then exercise the REAL client + provider logic (feature-flag gating, the
+memory-client drift fixes, and the intent-catalog injection) with mocks.
+
+Run: ``python3 -m unittest provider_test`` from this directory.
+"""
+
+import json
+import os
+import sys
+import threading
+import types
+import unittest
+import urllib.error
+from unittest import mock
+
+# --- Stub the Hermes base so ``import companionintelligence`` works standalone ---
+_agent = types.ModuleType("agent")
+_mp = types.ModuleType("agent.memory_provider")
+
+
+class _StubMemoryProvider:  # minimal base; the plugin only subclasses it
+    pass
+
+
+_mp.MemoryProvider = _StubMemoryProvider
+sys.modules.setdefault("agent", _agent)
+sys.modules.setdefault("agent.memory_provider", _mp)
+
+# Make the package importable by name from the parent dir.
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_PARENT = os.path.dirname(_HERE)
+if _PARENT not in sys.path:
+    sys.path.insert(0, _PARENT)
+
+import companionintelligence as ci  # noqa: E402
+
+_FLAGS = (
+    "CI_MEMORY_CONTEXT_ENABLED",
+    "CI_MEMORY_RECALL_ENABLED",
+    "CI_MEMORY_TURN_ENABLED",
+    "CI_MEMORY_WRITE_ENABLED",
+    "CI_INTENTS_ENABLED",
+)
+
+
+def _clear_flags():
+    for name in _FLAGS:
+        os.environ.pop(name, None)
+
+
+_MANIFEST = {
+    "version": "1.0.0",
+    "domains": [{"key": "memory", "title": "Memory", "description": "x"}],
+    "entities": [],
+    "intents": [
+        {
+            "name": "memory.recall",
+            "tool": "memory_recall",
+            "domain": "memory",
+            "title": "Recall",
+            "description": "Recall facts.",
+            "parameters": {"type": "object"},
+            "privacy": {"access": "read", "sensitivity": "personal", "destructive": False, "external": False},
+            "consumes": [],
+            "produces": ["concept"],
+            "phrases": [],
+        }
+    ],
+}
+
+
+class _MockClient:
+    def __init__(self, block="PROFILE", manifest=None):
+        self._block = block
+        self._manifest = manifest
+        self.context_calls = 0
+        self.recall_calls = 0
+        self.turn_calls = []
+        self.write_calls = []
+        self.write_event = threading.Event()
+
+    def context(self):
+        self.context_calls += 1
+        return {"block": self._block}
+
+    def recall(self, query, max_results=5):
+        self.recall_calls += 1
+        return {"block": "RECALL"}
+
+    def turn(self, messages, session_id="", platform=""):
+        self.turn_calls.append((messages, session_id, platform))
+        return {}
+
+    def write(self, content, source="", title="", session_id=""):
+        self.write_calls.append((content, source, session_id))
+        self.write_event.set()
+        return {}
+
+    def _get(self, path):  # used by fetch_intent_manifest
+        return self._manifest or {}
+
+
+def _provider_with_client(client):
+    provider = ci.CompanionIntelligenceProvider()
+    provider._client = client
+    provider._session_id = "s1"
+    provider._platform = "hermes"
+    provider._sync_thread = None
+    return provider
+
+
+class FeatureFlagTests(unittest.TestCase):
+    def setUp(self):
+        _clear_flags()
+
+    def tearDown(self):
+        _clear_flags()
+
+    def test_default_enabled(self):
+        self.assertTrue(ci._feature_enabled("CI_INTENTS_ENABLED"))
+
+    def test_falsy_values_disable(self):
+        for val in ("0", "false", "FALSE", "no", "off", " Off "):
+            os.environ["CI_INTENTS_ENABLED"] = val
+            self.assertFalse(ci._feature_enabled("CI_INTENTS_ENABLED"), val)
+
+    def test_other_values_enable(self):
+        for val in ("1", "true", "yes", "on", "whatever"):
+            os.environ["CI_INTENTS_ENABLED"] = val
+            self.assertTrue(ci._feature_enabled("CI_INTENTS_ENABLED"), val)
+
+
+class ExtractBlockTests(unittest.TestCase):
+    def test_block_then_text_then_context(self):
+        self.assertEqual(ci._extract_block({"block": "b", "text": "t"}), "b")
+        self.assertEqual(ci._extract_block({"text": "t", "context": "c"}), "t")
+        self.assertEqual(ci._extract_block({"context": "c"}), "c")
+        self.assertEqual(ci._extract_block({}), "")
+        self.assertEqual(ci._extract_block(None), "")
+
+
+class CIClientDriftTests(unittest.TestCase):
+    def _client(self):
+        return ci._CIClient("http://ci-server:8642", "tok")
+
+    def test_url_normalization_strips_api_mcp_suffix(self):
+        client = ci._CIClient("http://ci-server:8642/api/mcp/", "tok")
+        self.assertEqual(client._base, "http://ci-server:8642")
+
+    def test_url_normalization_only_strips_api_mcp_and_whitespace(self):
+        # A too-aggressive strip (e.g. stripping any /api/* path) must not pass.
+        for url, expected in [
+            ("http://ci-server:8642", "http://ci-server:8642"),
+            ("http://ci-server:8642/api/memory", "http://ci-server:8642/api/memory"),
+            ("  http://ci-server:8642/api/mcp  ", "http://ci-server:8642"),
+        ]:
+            self.assertEqual(ci._CIClient(url, "t")._base, expected, url)
+
+    def test_recall_clamps_results(self):
+        client = self._client()
+        captured = {}
+        client._post = lambda path, payload: captured.update(payload=payload) or {}
+        client.recall("q", max_results=-3)  # negative → min bound of 1
+        self.assertEqual(captured["payload"]["maxResults"], 1)
+        client.recall("q", max_results=0)  # 0 is falsy → defaults to 5 (max_results or 5)
+        self.assertEqual(captured["payload"]["maxResults"], 5)
+
+    def test_recall_caps_max_results_at_20(self):
+        client = self._client()
+        captured = {}
+        client._post = lambda path, payload: captured.update(path=path, payload=payload) or {}
+        client.recall("q", max_results=999)
+        self.assertEqual(captured["path"], "/api/memory/recall")
+        self.assertEqual(captured["payload"]["maxResults"], 20)
+
+    def test_write_falls_back_to_note_on_404(self):
+        client = self._client()
+        calls = []
+
+        def fake_post(path, payload):
+            calls.append(path)
+            if path == "/api/memory/write":
+                raise urllib.error.HTTPError("http://u", 404, "Not Found", None, None)
+            return {"ok": True}
+
+        client._post = fake_post
+        out = client.write("hello")
+        self.assertEqual(calls, ["/api/memory/write", "/api/memory/note"])
+        self.assertEqual(out, {"ok": True})
+
+    def test_write_reraises_non_404(self):
+        client = self._client()
+
+        def fake_post(path, payload):
+            raise urllib.error.HTTPError("http://u", 500, "Server Error", None, None)
+
+        client._post = fake_post
+        with self.assertRaises(urllib.error.HTTPError):
+            client.write("hello")
+
+
+class _FakeResp:
+    """Minimal urllib response usable as a context manager."""
+
+    def __init__(self, body=b"{}", status=200):
+        self._body = body
+        self.status = status
+
+    def read(self):
+        return self._body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+class MemoryTransportTests(unittest.TestCase):
+    """The /api/memory/* transport: request construction, auth header, parsing."""
+
+    def _client(self):
+        return ci._CIClient("http://ci-server:8642", "tok")
+
+    def _capture(self, body=b"{}"):
+        captured = {}
+
+        def fake_urlopen(req, timeout=None):
+            captured["url"] = req.full_url
+            captured["method"] = req.get_method()
+            captured["api_key"] = req.get_header("X-api-key")
+            captured["content_type"] = req.get_header("Content-type")
+            captured["accept"] = req.get_header("Accept")
+            captured["body"] = req.data
+            return _FakeResp(body)
+
+        return captured, fake_urlopen
+
+    def test_context_issues_authenticated_get(self):
+        cap, fake = self._capture(b'{"block":"PROFILE"}')
+        with mock.patch("urllib.request.urlopen", fake):
+            out = self._client().context()
+        self.assertTrue(cap["url"].endswith("/api/memory/context"))
+        self.assertEqual(cap["method"], "GET")
+        self.assertEqual(cap["api_key"], "tok")
+        self.assertEqual(cap["accept"], "application/json")
+        self.assertEqual(out, {"block": "PROFILE"})
+
+    def test_recall_posts_query_and_capped_results(self):
+        cap, fake = self._capture()
+        with mock.patch("urllib.request.urlopen", fake):
+            self._client().recall("hello", 7)
+        self.assertTrue(cap["url"].endswith("/api/memory/recall"))
+        self.assertEqual(cap["method"], "POST")
+        self.assertEqual(cap["content_type"], "application/json")
+        self.assertEqual(json.loads(cap["body"]), {"query": "hello", "maxResults": 7})
+
+    def test_turn_payload_includes_session_and_platform(self):
+        cap, fake = self._capture()
+        with mock.patch("urllib.request.urlopen", fake):
+            self._client().turn([{"role": "user", "content": "u"}], session_id="s1", platform="hermes")
+        body = json.loads(cap["body"])
+        self.assertEqual(body["messages"], [{"role": "user", "content": "u"}])
+        self.assertEqual(body["sessionId"], "s1")
+        self.assertEqual(body["platform"], "hermes")
+
+    def test_turn_payload_omits_empty_session_and_platform(self):
+        cap, fake = self._capture()
+        with mock.patch("urllib.request.urlopen", fake):
+            self._client().turn([{"role": "user", "content": "u"}])
+        body = json.loads(cap["body"])
+        self.assertNotIn("sessionId", body)
+        self.assertNotIn("platform", body)
+
+    def test_write_payload_includes_supplied_fields_only(self):
+        cap, fake = self._capture()
+        with mock.patch("urllib.request.urlopen", fake):
+            self._client().write("note text", source="MEMORY.md", title="T", session_id="s")
+        self.assertTrue(cap["url"].endswith("/api/memory/write"))
+        self.assertEqual(
+            json.loads(cap["body"]),
+            {"content": "note text", "source": "MEMORY.md", "title": "T", "sessionId": "s"},
+        )
+
+    def test_write_payload_omits_empty_optionals(self):
+        cap, fake = self._capture()
+        with mock.patch("urllib.request.urlopen", fake):
+            self._client().write("just content")
+        self.assertEqual(json.loads(cap["body"]), {"content": "just content"})
+
+    def test_empty_body_parses_to_empty_dict(self):
+        _, fake = self._capture(b"")
+        with mock.patch("urllib.request.urlopen", fake):
+            self.assertEqual(self._client().context(), {})
+
+    def test_http_error_propagates(self):
+        def fake(req, timeout=None):
+            raise urllib.error.HTTPError(req.full_url, 500, "err", None, None)
+
+        with mock.patch("urllib.request.urlopen", fake):
+            with self.assertRaises(urllib.error.HTTPError):
+                self._client().context()
+
+    def test_post_sets_accept_and_content_type_on_recall_turn_write(self):
+        # The CI-Server contract expects JSON in/out; every POST must say so.
+        for op in (
+            lambda c: c.recall("q"),
+            lambda c: c.turn([{"role": "user", "content": "u"}]),
+            lambda c: c.write("note"),
+        ):
+            cap, fake = self._capture()
+            with mock.patch("urllib.request.urlopen", fake):
+                op(self._client())
+            self.assertEqual(cap["accept"], "application/json")
+            self.assertEqual(cap["content_type"], "application/json")
+            self.assertEqual(cap["api_key"], "tok")
+
+
+class ContextAndIntentGatingTests(unittest.TestCase):
+    def setUp(self):
+        _clear_flags()
+
+    def tearDown(self):
+        _clear_flags()
+
+    def test_default_includes_context_and_catalog(self):
+        client = _MockClient(block="PROFILE", manifest=_MANIFEST)
+        out = _provider_with_client(client).system_prompt_block()
+        self.assertIn("PROFILE", out)
+        self.assertIn("memory_recall", out)  # catalog rendered
+        self.assertEqual(client.context_calls, 1)
+
+    def test_context_flag_off_skips_profile_keeps_catalog(self):
+        os.environ["CI_MEMORY_CONTEXT_ENABLED"] = "false"
+        client = _MockClient(block="PROFILE", manifest=_MANIFEST)
+        out = _provider_with_client(client).system_prompt_block()
+        self.assertEqual(client.context_calls, 0)
+        self.assertNotIn("PROFILE", out)
+        self.assertIn("memory_recall", out)
+
+    def test_intents_flag_off_skips_catalog_keeps_profile(self):
+        os.environ["CI_INTENTS_ENABLED"] = "false"
+        client = _MockClient(block="PROFILE", manifest=_MANIFEST)
+        out = _provider_with_client(client).system_prompt_block()
+        self.assertIn("PROFILE", out)
+        self.assertNotIn("memory_recall", out)
+
+
+class RecallGatingTests(unittest.TestCase):
+    def setUp(self):
+        _clear_flags()
+
+    def tearDown(self):
+        _clear_flags()
+
+    def test_recall_flag_off_no_prefetch(self):
+        os.environ["CI_MEMORY_RECALL_ENABLED"] = "false"
+        client = _MockClient()
+        provider = _provider_with_client(client)
+        provider.queue_prefetch("q")
+        self.assertEqual(provider.prefetch("q"), "")
+        self.assertEqual(client.recall_calls, 0)
+
+    def test_recall_default_runs(self):
+        client = _MockClient()
+        provider = _provider_with_client(client)
+        provider.queue_prefetch("q")
+        self.assertEqual(provider.prefetch("q"), "RECALL")  # waits for the bg thread
+        self.assertEqual(client.recall_calls, 1)
+
+
+class TurnGatingTests(unittest.TestCase):
+    def setUp(self):
+        _clear_flags()
+
+    def tearDown(self):
+        _clear_flags()
+
+    def test_turn_flag_off_no_sync(self):
+        os.environ["CI_MEMORY_TURN_ENABLED"] = "false"
+        client = _MockClient()
+        provider = _provider_with_client(client)
+        provider.sync_turn("u", "a")
+        self.assertIsNone(provider._sync_thread)
+        self.assertEqual(client.turn_calls, [])
+
+    def test_turn_default_syncs_user_then_assistant(self):
+        client = _MockClient()
+        provider = _provider_with_client(client)
+        provider.sync_turn("u", "a")
+        self.assertIsNotNone(provider._sync_thread)
+        provider._sync_thread.join(timeout=5)
+        self.assertEqual(len(client.turn_calls), 1)
+        messages, sid, platform = client.turn_calls[0]
+        self.assertEqual(sid, "s1")
+        self.assertEqual(platform, "hermes")
+        self.assertEqual([m["role"] for m in messages], ["user", "assistant"])
+
+    def test_truncation_uses_4000_chars(self):
+        client = _MockClient()
+        provider = _provider_with_client(client)
+        provider.sync_turn("x" * 5000, "a")
+        provider._sync_thread.join(timeout=5)
+        messages, _, _ = client.turn_calls[0]
+        self.assertEqual(len(messages[0]["content"]), 4000)
+
+
+class WriteGatingTests(unittest.TestCase):
+    def setUp(self):
+        _clear_flags()
+
+    def tearDown(self):
+        _clear_flags()
+
+    def test_write_flag_off_no_write(self):
+        os.environ["CI_MEMORY_WRITE_ENABLED"] = "false"
+        client = _MockClient()
+        _provider_with_client(client).on_memory_write("write", "MEMORY.md", "remember this")
+        self.assertEqual(client.write_calls, [])
+
+    def test_write_default_persists(self):
+        client = _MockClient()
+        _provider_with_client(client).on_memory_write("write", "MEMORY.md", "remember this")
+        self.assertTrue(client.write_event.wait(timeout=5))
+        self.assertEqual(len(client.write_calls), 1)
+        content, source, _ = client.write_calls[0]
+        self.assertEqual(content, "remember this")
+        self.assertEqual(source, "MEMORY.md")
+
+    def test_clear_action_is_skipped(self):
+        client = _MockClient()
+        _provider_with_client(client).on_memory_write("clear", "MEMORY.md", "x")
+        self.assertEqual(client.write_calls, [])
+
+    def test_whitespace_only_content_is_skipped(self):
+        client = _MockClient()
+        _provider_with_client(client).on_memory_write("write", "MEMORY.md", "   \n\t  ")
+        self.assertEqual(client.write_calls, [])
+
+
+class MemoryFlushBehaviorTests(unittest.TestCase):
+    """Truncation, role filtering, and serialization across all flush paths."""
+
+    def setUp(self):
+        _clear_flags()
+
+    def tearDown(self):
+        _clear_flags()
+
+    def test_sync_turn_truncates_both_user_and_assistant_to_4000(self):
+        client = _MockClient()
+        provider = _provider_with_client(client)
+        provider.sync_turn("u" * 5000, "a" * 6000)
+        provider._sync_thread.join(timeout=5)
+        messages, _, _ = client.turn_calls[0]
+        self.assertEqual(len(messages[0]["content"]), 4000)
+        self.assertEqual(len(messages[1]["content"]), 4000)
+
+    def test_session_end_truncates_messages_to_4000(self):
+        client = _MockClient()
+        msgs = [{"role": "user", "content": "x" * 5000}, {"role": "assistant", "content": "y" * 5000}]
+        _provider_with_client(client).on_session_end(msgs)
+        sent, _, _ = client.turn_calls[0]
+        self.assertEqual(len(sent[0]["content"]), 4000)
+        self.assertEqual(len(sent[1]["content"]), 4000)
+
+    def test_pre_compress_truncates_messages_to_4000(self):
+        client = _MockClient()
+        msgs = [{"role": "user", "content": "x" * 5000}]
+        _provider_with_client(client).on_pre_compress(msgs)
+        # Background thread — give it a beat to land.
+        for _ in range(50):
+            if client.turn_calls:
+                break
+            threading.Event().wait(0.01)
+        sent, _, _ = client.turn_calls[0]
+        self.assertEqual(len(sent[0]["content"]), 4000)
+
+    def test_session_end_drops_non_user_assistant_roles(self):
+        client = _MockClient()
+        msgs = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "u"},
+            {"role": "tool", "content": "t"},
+            {"role": "assistant", "content": "a"},
+        ]
+        _provider_with_client(client).on_session_end(msgs)
+        sent, _, _ = client.turn_calls[0]
+        self.assertEqual([m["role"] for m in sent], ["user", "assistant"])
+
+    def test_sync_turn_serializes_back_to_back_calls(self):
+        # Two rapid sync_turn() calls must serialize; the second waits for the
+        # first to land so writes can't reorder against the same session.
+        client = _MockClient()
+        provider = _provider_with_client(client)
+        provider.sync_turn("u1", "a1")
+        first = provider._sync_thread
+        provider.sync_turn("u2", "a2")
+        second = provider._sync_thread
+        self.assertIsNot(first, second)
+        second.join(timeout=5)
+        # The first call's user content must appear in the first persisted turn.
+        self.assertEqual(client.turn_calls[0][0][0]["content"], "u1")
+        self.assertEqual(client.turn_calls[1][0][0]["content"], "u2")
+
+
+class PrefetchResultParsingTests(unittest.TestCase):
+    """prefetch() must honour the block | text | context fallback chain."""
+
+    def setUp(self):
+        _clear_flags()
+
+    def tearDown(self):
+        _clear_flags()
+
+    def _provider_returning(self, payload):
+        client = _MockClient()
+        client.recall = lambda q, max_results=5: payload
+        provider = _provider_with_client(client)
+        return provider
+
+    def test_prefetch_uses_text_when_block_missing(self):
+        provider = self._provider_returning({"text": "FALLBACK-TEXT"})
+        provider.queue_prefetch("q")
+        self.assertEqual(provider.prefetch("q"), "FALLBACK-TEXT")
+
+    def test_prefetch_uses_context_when_block_and_text_missing(self):
+        provider = self._provider_returning({"context": "FALLBACK-CTX"})
+        provider.queue_prefetch("q")
+        self.assertEqual(provider.prefetch("q"), "FALLBACK-CTX")
+
+
+class SessionFlushGatingTests(unittest.TestCase):
+    """on_session_end / on_pre_compress are gated by CI_MEMORY_TURN_ENABLED."""
+
+    def setUp(self):
+        _clear_flags()
+
+    def tearDown(self):
+        _clear_flags()
+
+    _MESSAGES = [{"role": "user", "content": "u"}, {"role": "assistant", "content": "a"}]
+
+    def test_session_end_off_no_flush(self):
+        os.environ["CI_MEMORY_TURN_ENABLED"] = "false"
+        client = _MockClient()
+        _provider_with_client(client).on_session_end(self._MESSAGES)
+        self.assertEqual(client.turn_calls, [])
+
+    def test_session_end_default_flushes(self):
+        client = _MockClient()
+        _provider_with_client(client).on_session_end(self._MESSAGES)
+        self.assertEqual(len(client.turn_calls), 1)
+
+    def test_pre_compress_off_no_flush(self):
+        os.environ["CI_MEMORY_TURN_ENABLED"] = "false"
+        client = _MockClient()
+        provider = _provider_with_client(client)
+        provider.on_pre_compress(self._MESSAGES)
+        self.assertEqual(client.turn_calls, [])
+
+
+if __name__ == "__main__":
+    unittest.main()
