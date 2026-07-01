@@ -49,7 +49,7 @@ MANIFEST = {
 
 
 class FetchIntentManifestTests(unittest.TestCase):
-    def test_returns_manifest_when_valid(self):
+    def test_prefers_the_canonical_agent_path(self):
         called = {}
 
         def get_json(path):
@@ -57,7 +57,20 @@ class FetchIntentManifestTests(unittest.TestCase):
             return MANIFEST
 
         manifest = fetch_intent_manifest(get_json)
-        self.assertEqual(called["path"], "/api/intents")
+        self.assertEqual(called["path"], "/api/agent/intents")
+        self.assertEqual(len(manifest["intents"]), 3)
+
+    def test_falls_back_to_legacy_api_intents_when_agent_path_404s(self):
+        seen = []
+
+        def get_json(path):
+            seen.append(path)
+            if path == "/api/agent/intents":
+                raise RuntimeError("HTTP 404")  # older CI-Server
+            return MANIFEST
+
+        manifest = fetch_intent_manifest(get_json)
+        self.assertEqual(seen, ["/api/agent/intents", "/api/intents"])
         self.assertEqual(len(manifest["intents"]), 3)
 
     def test_degrades_to_none_on_error_or_malformed(self):
