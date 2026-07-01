@@ -57,7 +57,7 @@ def _extract_block(resp: dict) -> str:
 #   CI_MEMORY_RECALL_ENABLED   — L1 per-turn recall (/api/memory/recall)
 #   CI_MEMORY_TURN_ENABLED     — turn-sync ingestion (/api/memory/turn)
 #   CI_MEMORY_WRITE_ENABLED    — durable note writes (/api/memory/write)
-#   CI_INTENTS_ENABLED         — intent catalog (/api/intents)
+#   CI_INTENTS_ENABLED         — intent catalog (/api/agent/intents)
 _FALSY = {"0", "false", "no", "off"}
 
 

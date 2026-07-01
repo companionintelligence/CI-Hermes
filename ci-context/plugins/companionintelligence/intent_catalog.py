@@ -1,7 +1,8 @@
 """CI Intent catalog client for the Companion Intelligence Hermes plugin.
 
 CI-Server publishes one curated, typed, domain-organized capability catalog at
-``GET /api/intents`` (and as an ``intents://catalog`` MCP resource). This module
+``GET /api/agent/intents`` (legacy alias ``/api/intents``; also an
+``intents://catalog`` MCP resource). This module
 lets the Hermes memory provider fetch that catalog and inject a compact description
 into the system prompt, so the agent prefers the curated, privacy-labelled intents
 over raw CRUD — the same shared catalog CI-OpenClaw consumes, instead of bespoke
@@ -17,18 +18,26 @@ from __future__ import annotations
 from typing import Callable, Dict, List, Optional
 
 
+# Canonical path first, then the deprecated alias for older CI-Server builds
+# that still serve the catalog from /api/intents.
+_CATALOG_PATHS = ("/api/agent/intents", "/api/intents")
+
+
 def fetch_intent_manifest(get_json: Callable[[str], dict]) -> Optional[dict]:
     """Fetch the intent manifest, or ``None`` if unavailable or malformed.
 
-    Never raises — discovery must degrade gracefully when CI-Server is unreachable.
+    Tries the canonical ``/api/agent/intents`` first, falling back to the legacy
+    ``/api/intents`` alias. Never raises — discovery must degrade gracefully when
+    CI-Server is unreachable.
     """
-    try:
-        body = get_json("/api/intents")
-    except Exception:
-        return None
-    if not isinstance(body, dict) or not isinstance(body.get("intents"), list):
-        return None
-    return body
+    for path in _CATALOG_PATHS:
+        try:
+            body = get_json(path)
+        except Exception:
+            continue
+        if isinstance(body, dict) and isinstance(body.get("intents"), list):
+            return body
+    return None
 
 
 def describe_catalog_for_prompt(manifest: Optional[dict]) -> str:
