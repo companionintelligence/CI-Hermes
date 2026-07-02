@@ -131,6 +131,24 @@ On startup, `/app/bootstrap-ci-context.sh` idempotently:
 
 To connect it to Companion Memory you have two options (see *Connect Hermes to CI Memory* above for the full walkthrough): enter the **Companion Memory URL** and **API Key** in the app's install dialog and it activates automatically on startup, or run `hermes memory setup` in the terminal and follow the instructions. Either way, generate your API key from the CI-Server settings page.
 
+## Hub MCP (platform tools)
+
+On CI marketplace installs with MCP enabled, the Hub injects `HUB_MCP_URL` and `HUB_MCP_API_KEY`. Bootstrap order is:
+
+1. `/app/bootstrap-from-hub.sh` — creates or updates `config.yaml` first
+2. `/app/bootstrap-ci-context.sh` — runs `configure-ci-server.py` (optional CI-Server memory MCP) and `configure-hub-mcp.py` (Hub platform MCP)
+
+The Hub block is written under `mcp_servers.hub` with `transport: sse` and `Authorization: Bearer` headers. It coexists with the optional `ci_server` memory MCP block.
+
+Run the smoke tests:
+
+```bash
+bash tests/hub-mcp-smoke.sh
+bash tests/configure-hub-mcp.test.sh
+```
+
+If Hub MCP is disabled on the Hub, run `cihub mcp setup` and restart the Hermes app to pick up new credentials.
+
 ## License
 
 MIT

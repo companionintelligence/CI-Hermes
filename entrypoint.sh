@@ -5,10 +5,11 @@ set -e
 
 source "/opt/hermes/.venv/bin/activate"
 
-/app/bootstrap-ci-context.sh
+# Pull inference config from the Hub first so config.yaml exists before MCP
+# configurators run (bootstrap-from-hub.sh generates config.yaml on first boot).
+/app/bootstrap-from-hub.sh || true
 
-# Pull inference config from the Hub (idempotent; safe if Hub is unreachable)
-/app/bootstrap-from-hub.sh
+/app/bootstrap-ci-context.sh
 
 # Source the Hub-derived env so OPENAI_API_BASE / OPENAI_MODEL reach the
 # dashboard and the Node server before they spawn agent subprocesses.
