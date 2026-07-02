@@ -204,6 +204,27 @@ nested="$([[ -n "${hub_line}" && "${mcp_line}" -lt "${hub_line}" && "${hub_line}
 assert_eq "hub sits between mcp_servers and agent" "yes" "${nested}"
 rm -rf "${data_dir}"
 
+# ─── Test 9: incomplete hub block gets repaired ──────────────────────────────
+echo "test: incomplete hub block under mcp_servers is reconciled"
+data_dir="$(mktemp -d)"
+mkdir -p "${data_dir}/.hermes"
+cat > "${data_dir}/${CONFIG_REL}" <<'EOF'
+model:
+  provider: ollama
+mcp_servers:
+  hub:
+    timeout: 180
+hub:
+  url: "http://should-not-touch/api/mcp/sse"
+EOF
+run_configure "${data_dir}" HUB_MCP_URL="${HUB_URL}" HUB_MCP_API_KEY="${HUB_KEY}"
+out="$(cat "${data_dir}/${CONFIG_REL}")"
+assert_contains "url added under mcp_servers.hub" "url: \"${HUB_URL}\"" "${out}"
+assert_contains "transport added" "transport: sse" "${out}"
+assert_contains "auth added" 'Authorization: "Bearer '"${HUB_KEY}"'"' "${out}"
+assert_contains "top-level hub block untouched" "http://should-not-touch/api/mcp/sse" "${out}"
+rm -rf "${data_dir}"
+
 # ─── Summary ────────────────────────────────────────────────────────────────
 echo
 echo "Results: ${PASS} passed, ${FAIL} failed"

@@ -135,7 +135,7 @@ To connect it to Companion Memory you have two options (see *Connect Hermes to C
 
 On CI marketplace installs with MCP enabled, the Hub injects `HUB_MCP_URL` and `HUB_MCP_API_KEY`. Bootstrap order is:
 
-1. `/app/bootstrap-from-hub.sh` — creates or updates `config.yaml` first
+1. `/app/bootstrap-from-hub.sh` — creates `config.yaml` when missing (skips if one already exists)
 2. `/app/bootstrap-ci-context.sh` — runs `configure-ci-server.py` (optional CI-Server memory MCP) and `configure-hub-mcp.py` (Hub platform MCP)
 
 The Hub block is written under `mcp_servers.hub` with `transport: sse` and `Authorization: Bearer` headers. It coexists with the optional `ci_server` memory MCP block.

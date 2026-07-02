@@ -10,9 +10,7 @@ transport and Bearer auth. Coexists with the CI-Server memory MCP block.
 import os
 import re
 import shutil
-import sys
 import time
-from typing import Optional
 
 # ---------------------------------------------------------------------------
 # Env
@@ -100,12 +98,29 @@ def _block_end(lines: list, start: int, indent: int) -> int:
     return len(lines)
 
 
-def _find_hub(lines: list):
+def _find_mcp_servers(lines: list):
     for i, line in enumerate(lines):
-        match = _HUB_RE.match(line)
+        match = _MCP_SERVERS_RE.match(line)
         if match:
             return i, len(match.group(1))
     return None, None
+
+
+def _find_hub_in_mcp_servers(lines: list):
+    mcp_index, mcp_indent = _find_mcp_servers(lines)
+    if mcp_index is None:
+        return None, None
+
+    end = _block_end(lines, mcp_index, mcp_indent)
+    for i in range(mcp_index + 1, end):
+        match = _HUB_RE.match(lines[i])
+        if match:
+            return i, len(match.group(1))
+    return None, None
+
+
+def _find_hub(lines: list):
+    return _find_hub_in_mcp_servers(lines)
 
 
 def has_hub_mcp_server(config_text: str) -> bool:
@@ -162,16 +177,23 @@ def patch_mcp(config_text: str) -> str:
 
 def reconcile_mcp_block(config_text: str) -> "tuple[str, bool]":
     lines = config_text.splitlines(keepends=True)
-    start, indent = _find_hub(lines)
+    start, indent = _find_hub_in_mcp_servers(lines)
     if start is None:
         return config_text, False
 
     end = _block_end(lines, start, indent)
+    child_indent = indent + 2
+    grand_indent = child_indent + 2
     mcp_url = desired_mcp_url()
     changed = False
+    has_url = False
+    has_transport = False
+    has_auth = False
+
     for i in range(start + 1, end):
         m_url = re.match(r"^(\s*url:\s*).*$", lines[i])
         if m_url:
+            has_url = True
             new_line = f'{m_url.group(1)}"{mcp_url}"\n'
             if lines[i] != new_line:
                 lines[i] = new_line
@@ -179,6 +201,7 @@ def reconcile_mcp_block(config_text: str) -> "tuple[str, bool]":
             continue
         m_transport = re.match(r"^(\s*transport:\s*).*$", lines[i])
         if m_transport:
+            has_transport = True
             new_line = f"{m_transport.group(1)}sse\n"
             if lines[i] != new_line:
                 lines[i] = new_line
@@ -186,10 +209,27 @@ def reconcile_mcp_block(config_text: str) -> "tuple[str, bool]":
             continue
         m_auth = re.match(r"^(\s*Authorization:\s*).*$", lines[i])
         if m_auth:
+            has_auth = True
             new_line = f'{m_auth.group(1)}"Bearer {HUB_MCP_API_KEY}"\n'
             if lines[i] != new_line:
                 lines[i] = new_line
                 changed = True
+
+    inserts: list[str] = []
+    if not has_url:
+        inserts.append(f'{child_indent}url: "{mcp_url}"\n')
+        changed = True
+    if not has_transport:
+        inserts.append(f"{child_indent}transport: sse\n")
+        changed = True
+    if not has_auth:
+        if not any(re.match(r"^\s*headers:\s*$", lines[i]) for i in range(start + 1, end)):
+            inserts.append(f"{child_indent}headers:\n")
+        inserts.append(f'{grand_indent}Authorization: "Bearer {HUB_MCP_API_KEY}"\n')
+        changed = True
+
+    if inserts:
+        lines[end:end] = inserts
 
     return "".join(lines), changed
 
