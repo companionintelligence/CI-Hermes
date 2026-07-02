@@ -57,6 +57,9 @@ fi
 # Uses CI_SERVER_URL / CI_SERVER_TOKEN / CI_SERVER_ENABLED from the environment.
 python3 /app/configure-ci-server.py 2>&1 || true
 
+# Register Hub platform MCP (SSE + Bearer) when Hub injects credentials.
+python3 /app/configure-hub-mcp.py 2>&1 || true
+
 # Hardware-aware context window the Hub computed for this machine and wrote into
 # .env.hub-bootstrap as HERMES_NUM_CTX. The upstream hermes-agent reads
 # model.ollama_num_ctx (NOT num_ctx) and injects it as extra_body.options.num_ctx

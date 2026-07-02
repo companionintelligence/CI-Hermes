@@ -5,10 +5,10 @@ set -euo pipefail
 
 source "/opt/hermes/.venv/bin/activate"
 
-/app/bootstrap-ci-context.sh
+# Hub bootstrap first — config.yaml must exist before MCP configurators run.
+/app/bootstrap-from-hub.sh || true
 
-# Pull inference config from the Hub (idempotent; safe if Hub is unreachable).
-/app/bootstrap-from-hub.sh
+/app/bootstrap-ci-context.sh
 
 # Export Hub-derived provider env values before launching Hermes.
 HUB_ENV_FILE="${HERMES_HOME:-/opt/data}/.env.hub-bootstrap"
