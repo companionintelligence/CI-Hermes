@@ -199,13 +199,19 @@ def patch_mcp(config_text: str) -> str:
 def reconcile_mcp_block(config_text: str) -> "tuple[str, bool]":
     """Bring an existing ``hub`` block in line with the current transport + creds.
 
-    Rewrites ``url`` to the canonical ``/api/mcp`` endpoint and ``Authorization``
-    to the current key, **removes** any stale ``transport:`` line (older configs
-    wrote ``transport: sse``; the block now omits it to mirror ``ci_server``), and
-    inserts ``url``/``headers``/``Authorization`` if a partial block is missing
-    them. Returns ``(new_text, changed)``; unrelated lines (timeouts, indentation,
-    ordering) are left untouched so a converged config stays byte-identical across
-    runs.
+    A **complete** block (has both ``url`` and ``Authorization``) is updated in
+    place: ``url`` is rewritten to the canonical ``/api/mcp`` endpoint,
+    ``Authorization`` to the current key, and any stale ``transport:`` line is
+    removed (older configs wrote ``transport: sse``; the block now omits it to
+    mirror ``ci_server``). Timeouts, indentation and ordering are left untouched so
+    a converged config stays byte-identical across runs.
+
+    An **incomplete/malformed** block (missing ``url`` or ``Authorization``) is
+    replaced wholesale with a correct ``_hub_lines`` block at the block's own
+    indent. This avoids trying to guess where a missing key nests — inserting an
+    ``Authorization`` at the block's end (rather than under the existing
+    ``headers:`` mapping), or assuming a fixed child indent, could otherwise emit
+    invalid YAML for a partial or re-indented block. Returns ``(new_text, changed)``.
     """
     lines = config_text.splitlines(keepends=True)
     start, indent = _find_hub_in_mcp_servers(lines)
@@ -213,20 +219,24 @@ def reconcile_mcp_block(config_text: str) -> "tuple[str, bool]":
         return config_text, False
 
     end = _block_end(lines, start, indent)
-    child_indent = indent + 2
-    grand_indent = child_indent + 2
+    has_url = any(re.match(r"^\s*url:\s*", lines[i]) for i in range(start + 1, end))
+    has_auth = any(re.match(r"^\s*Authorization:\s*", lines[i]) for i in range(start + 1, end))
+
+    # Incomplete/malformed block → rewrite it wholesale to a known-good shape.
+    if not (has_url and has_auth):
+        new_block = _hub_lines(indent)
+        if lines[start:end] == new_block:
+            return config_text, False
+        lines[start:end] = new_block
+        return "".join(lines), True
+
+    # Complete block → minimal in-place update: rewrite url + auth, drop transport.
     mcp_url = desired_mcp_url()
     changed = False
-    has_url = False
-    has_auth = False
-    # Stale `transport:` lines are deleted (not rewritten): the Streamable HTTP
-    # hub block carries no transport, matching the working ci_server block.
     remove_indices: list[int] = []
-
     for i in range(start + 1, end):
         m_url = re.match(r"^(\s*url:\s*).*$", lines[i])
         if m_url:
-            has_url = True
             new_line = f'{m_url.group(1)}"{mcp_url}"\n'
             if lines[i] != new_line:
                 lines[i] = new_line
@@ -238,28 +248,12 @@ def reconcile_mcp_block(config_text: str) -> "tuple[str, bool]":
             continue
         m_auth = re.match(r"^(\s*Authorization:\s*).*$", lines[i])
         if m_auth:
-            has_auth = True
             new_line = f'{m_auth.group(1)}"Bearer {HUB_MCP_API_KEY}"\n'
             if lines[i] != new_line:
                 lines[i] = new_line
                 changed = True
 
-    # Insert missing credential lines at the block's end. Do this before the
-    # deletions below: inserting at `end` (past every remove index) keeps those
-    # indices valid, and the deletions then shift the inserts up into the block.
-    inserts: list[str] = []
-    if not has_url:
-        inserts.append(f'{" " * child_indent}url: "{mcp_url}"\n')
-        changed = True
-    if not has_auth:
-        if not any(re.match(r"^\s*headers:\s*$", lines[i]) for i in range(start + 1, end)):
-            inserts.append(f'{" " * child_indent}headers:\n')
-        inserts.append(f'{" " * grand_indent}Authorization: "Bearer {HUB_MCP_API_KEY}"\n')
-        changed = True
-    if inserts:
-        lines[end:end] = inserts
-
-    # Delete stale transport lines last, in reverse so earlier indices hold.
+    # Delete stale transport lines in reverse so earlier indices stay valid.
     for i in reversed(remove_indices):
         del lines[i]
 

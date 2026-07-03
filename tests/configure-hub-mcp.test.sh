@@ -245,6 +245,36 @@ assert_contains "auth added" 'Authorization: "Bearer '"${HUB_KEY}"'"' "${out}"
 assert_contains "top-level hub block untouched" "http://should-not-touch/api/mcp/sse" "${out}"
 rm -rf "${data_dir}"
 
+# ─── Test 11: a hub block with headers but no Authorization is repaired validly ──
+# Regression: a partial block (headers present, Authorization missing, trailing
+# keys after) must not get an Authorization appended at block end (orphaned,
+# invalid YAML) — the incomplete block is rewritten wholesale to a valid shape.
+echo "test: incomplete hub block (headers, no Authorization) is rewritten to valid nested YAML"
+data_dir="$(mktemp -d)"
+mkdir -p "${data_dir}/.hermes"
+cat > "${data_dir}/${CONFIG_REL}" <<'EOF'
+model:
+  provider: ollama
+mcp_servers:
+  hub:
+    url: "http://old/api/mcp"
+    headers:
+      X-Trace: "1"
+    timeout: 180
+EOF
+run_configure "${data_dir}" HUB_MCP_URL="${HUB_URL_CANON}" HUB_MCP_API_KEY="${HUB_KEY}"
+out="$(cat "${data_dir}/${CONFIG_REL}")"
+assert_contains "url canonical" "url: \"${HUB_URL_CANON}\"" "${out}"
+assert_contains "Authorization nested under headers (6-space indent)" '      Authorization: "Bearer '"${HUB_KEY}"'"' "${out}"
+assert_not_contains "no transport line" "transport:" "${out}"
+if python3 -c "import yaml" 2>/dev/null; then
+  assert_eq "output parses as valid YAML" "ok" \
+    "$(python3 -c "import yaml; yaml.safe_load(open('${data_dir}/${CONFIG_REL}')); print('ok')" 2>/dev/null || echo "PARSE_ERROR")"
+else
+  echo "  … PyYAML not installed; skipping YAML-parse assertion"
+fi
+rm -rf "${data_dir}"
+
 # ─── Summary ────────────────────────────────────────────────────────────────
 echo
 echo "Results: ${PASS} passed, ${FAIL} failed"
