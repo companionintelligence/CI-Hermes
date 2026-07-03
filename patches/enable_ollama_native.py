@@ -16,6 +16,11 @@ Hooks (see specs/ci/ci-hermes-ollama-native-api-plan.md §11):
     we deliberately do NOT touch the `OpenAI` symbol (it's used in isinstance checks).
     Safe by construction: Gemini native clients already flow through these routers, so
     the aux consumers already handle non-OpenAI native clients.
+  * Hook 3 (with the main flag): `providers.get_provider_profile` — resolve a named
+    custom instance ("custom:<name>") to the "custom" profile so per-request num_ctx
+    is injected for it (the profile lookup is an exact match, so "custom:<name>"
+    otherwise drops num_ctx on the legacy request-build path and the native client
+    would run at Ollama's 4096 default).
 
 Everything is wrapped in try/except and degrades to stock behavior on any error,
 so a bad patch can never crash agent startup — it just reverts to /v1.
@@ -26,11 +31,16 @@ from __future__ import annotations
 import logging
 import os
 import sys
+import threading
 
 logger = logging.getLogger("ci.ollama_native.shim")
 
 _FLAG = "CI_HERMES_OLLAMA_NATIVE"
 _FLAG_AUX = "CI_HERMES_OLLAMA_NATIVE_AUX"
+
+# Serializes the meta-path finder's self-removal during spec resolution so two
+# concurrent target imports can't lose a hook or corrupt sys.meta_path.
+_META_PATH_LOCK = threading.Lock()
 
 
 def _truthy(name: str) -> bool:
@@ -59,6 +69,19 @@ def _patch_runtime(module) -> None:
                         for k, v in client_kwargs.items()
                         if k in {"api_key", "base_url", "default_headers", "timeout", "http_client"}
                     }
+                    # Mirror stock create_openai_client: give the native client the
+                    # agent's keepalive http_client (TCP keepalives → dead-peer
+                    # detection in ~60s) when we aren't already carrying one. Safe with
+                    # the adapter's own per-request long read timeout, so the keepalive
+                    # client's short default timeout can't shorten local-model calls.
+                    if "http_client" not in safe:
+                        try:
+                            builder = getattr(agent, "_build_keepalive_http_client", None)
+                            keepalive = builder(base_url) if callable(builder) else None
+                            if keepalive is not None:
+                                safe["http_client"] = keepalive
+                        except Exception:
+                            pass
                     logger.info(
                         "CI ollama-native: chat client via /api/chat (reason=%s, base=%s)",
                         kwargs.get("reason"), base_url,
@@ -145,15 +168,18 @@ def _patch_aux(module) -> None:
             return orig
 
         def wrapped(*a, **k):
-            client, model = orig(*a, **k)
+            result = orig(*a, **k)
+            # Unpack + swap inside try so an unexpected return arity (a future
+            # upstream change) degrades to the original result instead of raising.
             try:
+                client, model = result
                 native = _native_swap(client)
                 if native is not None:
                     logger.info("CI ollama-native: aux text client via /api/chat")
                     return native, model
             except Exception as exc:
                 logger.warning("CI ollama-native Hook 2 (text) failed; using original: %s", exc)
-            return client, model
+            return result
 
         wrapped._ci_ollama_wrapped = True  # type: ignore[attr-defined]
         return wrapped
@@ -163,15 +189,16 @@ def _patch_aux(module) -> None:
             return orig
 
         def wrapped(*a, **k):
-            provider, client, model = orig(*a, **k)
+            result = orig(*a, **k)
             try:
+                provider, client, model = result
                 native = _native_swap(client)
                 if native is not None:
                     logger.info("CI ollama-native: aux vision client via /api/chat")
                     return provider, native, model
             except Exception as exc:
                 logger.warning("CI ollama-native Hook 2 (vision) failed; using original: %s", exc)
-            return provider, client, model
+            return result
 
         wrapped._ci_ollama_wrapped = True  # type: ignore[attr-defined]
         return wrapped
@@ -184,9 +211,37 @@ def _patch_aux(module) -> None:
             logger.info("CI ollama-native: Hook 2 installed (%s)", fname)
 
 
+def _patch_profiles(module) -> None:
+    """Hook 3 — resolve a named custom instance ("custom:<name>") to the "custom"
+    provider profile so the request-builder injects num_ctx for it.
+
+    The registry lookup is an exact name/alias match, so "custom:ollama-2" returns
+    None → the legacy request-build path runs → num_ctx is never placed in
+    extra_body.options and the native client loads the model at Ollama's 4096 default.
+    Gated per-call on the flag so it's a no-op when native mode is off.
+    """
+    orig = getattr(module, "get_provider_profile", None)
+    if orig is None or getattr(orig, "_ci_ollama_wrapped", False):
+        return
+
+    def wrapped(name, *a, **k):
+        profile = orig(name, *a, **k)
+        try:
+            if profile is None and _truthy(_FLAG) and str(name).startswith("custom:"):
+                return orig("custom", *a, **k)
+        except Exception as exc:
+            logger.warning("CI ollama-native Hook 3 failed; using original: %s", exc)
+        return profile
+
+    wrapped._ci_ollama_wrapped = True  # type: ignore[attr-defined]
+    module.get_provider_profile = wrapped
+    logger.info("CI ollama-native: Hook 3 installed (get_provider_profile)")
+
+
 _TARGETS = {
     "agent.agent_runtime_helpers": _patch_runtime,
     "agent.auxiliary_client": _patch_aux,
+    "providers": _patch_profiles,
 }
 _patched: set = set()
 
@@ -214,18 +269,20 @@ class _PostImportPatcher:
             return None
         import importlib.util
 
-        # Remove ourselves while resolving the real spec to avoid recursion.
-        try:
-            idx = sys.meta_path.index(self)
-        except ValueError:
-            return None
-        sys.meta_path.pop(idx)
-        try:
-            spec = importlib.util.find_spec(fullname)
-        except Exception:
-            spec = None
-        finally:
-            sys.meta_path.insert(idx, self)
+        # Serialize the self-removal/re-insertion so a concurrent import of another
+        # target can't observe a half-mutated meta_path (or double-pop us).
+        with _META_PATH_LOCK:
+            try:
+                idx = sys.meta_path.index(self)
+            except ValueError:
+                return None
+            sys.meta_path.pop(idx)
+            try:
+                spec = importlib.util.find_spec(fullname)
+            except Exception:
+                spec = None
+            finally:
+                sys.meta_path.insert(idx, self)
 
         if spec is None or spec.loader is None or not hasattr(spec.loader, "exec_module"):
             return None
@@ -236,7 +293,12 @@ class _PostImportPatcher:
             _orig(module)
             _apply(_name, module)
 
-        spec.loader.exec_module = exec_module  # type: ignore[assignment]
+        try:
+            spec.loader.exec_module = exec_module  # type: ignore[assignment]
+        except Exception:
+            # A loader that forbids attribute assignment (immutable / some C loaders):
+            # don't claim this spec — let the module import normally, just unpatched.
+            return None
         return spec
 
 
