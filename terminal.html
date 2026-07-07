@@ -92,6 +92,44 @@
       font-size: 0.95em;
     }
 
+    .companion-apps {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-top: 12px;
+      padding: 10px 12px;
+      background: rgba(255, 191, 0, 0.06);
+      border: 1px solid rgba(255, 191, 0, 0.2);
+      border-radius: 8px;
+      color: #A1A1AA;
+      font-size: 12px;
+      line-height: 1.4;
+    }
+
+    .companion-apps strong { color: #E4E4E7; }
+
+    .companion-link {
+      display: inline-flex;
+      flex-shrink: 0;
+      align-items: center;
+      gap: 5px;
+      padding: 6px 10px;
+      border: 1px solid #3F3F46;
+      border-radius: 7px;
+      color: #E4E4E7;
+      font-size: 12px;
+      font-weight: 600;
+      text-decoration: none;
+      transition: border-color 0.15s, color 0.15s, background 0.15s;
+    }
+
+    .companion-link:hover {
+      border-color: #FFBF00;
+      background: rgba(255, 191, 0, 0.08);
+      color: #FFBF00;
+    }
+
     .btn-dashboard {
       display: flex;
       align-items: center;
@@ -381,6 +419,8 @@
       }
       .header-text h1 { font-size: 22px; }
       .pro-tip { display: none; }
+      .companion-apps-copy { display: none; }
+      .companion-apps { justify-content: flex-end; margin-top: 8px; padding: 6px; }
       .terminal-wrapper { padding: 10px 24px 14px; }
       .titlebar { height: 32px; }
       .terminal-info {
@@ -409,6 +449,9 @@
       .header-logo { display: none; }
       .header-text h1 { font-size: 18px; }
       .pro-tip { display: none; }
+      .companion-apps-copy { display: none; }
+      .companion-apps { width: 100%; justify-content: stretch; margin-top: 0; padding: 5px; }
+      .companion-link { flex: 1; justify-content: center; padding: 5px 8px; }
       .terminal-info { display: none; }
       .terminal-wrapper { flex: 1; min-height: 0; padding: 8px 12px calc(8px + env(safe-area-inset-bottom)); }
       .terminal-card { flex: 1; min-height: 0; max-height: none; }
@@ -445,6 +488,15 @@
     </div>
     <div class="pro-tip">
       <strong>Tip:</strong> After setting up messaging (Telegram, Discord, WhatsApp, etc.), restart Hermes from your CI marketplace home screen for changes to take effect.
+    </div>
+    <div class="companion-apps">
+      <span class="companion-apps-copy"><strong>Hermex requires a separate hermes-webui server.</strong> CI-Hermes mobile access works through this responsive dashboard.</span>
+      <a class="companion-link" href="https://apps.apple.com/us/app/hermex/id6767006319" target="_blank" rel="noopener noreferrer">
+        Hermex for iOS <span aria-hidden="true">↗</span>
+      </a>
+      <a class="companion-link" href="https://docs.ci.computer/docs/companion-apps/agent-mobile-apps#hermes-on-iphone" target="_blank" rel="noopener noreferrer">
+        Setup guide <span aria-hidden="true">↗</span>
+      </a>
     </div>
   </div>
 
