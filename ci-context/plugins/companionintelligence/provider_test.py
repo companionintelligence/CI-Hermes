@@ -44,6 +44,7 @@ _FLAGS = (
     "CI_MEMORY_TURN_ENABLED",
     "CI_MEMORY_WRITE_ENABLED",
     "CI_INTENTS_ENABLED",
+    "CI_INTENT_TOOLS_ENABLED",
 )
 
 
@@ -82,6 +83,10 @@ class _MockClient:
         self.turn_calls = []
         self.write_calls = []
         self.write_event = threading.Event()
+        self.get_calls = []
+        self.invoke_calls = []
+        self.invoke_result = {"success": True, "data": {"ok": 1}}
+        self.invoke_error = None
 
     def context(self):
         self.context_calls += 1
@@ -100,7 +105,14 @@ class _MockClient:
         self.write_event.set()
         return {}
 
+    def invoke_intent(self, name, arguments=None):
+        self.invoke_calls.append((name, arguments))
+        if self.invoke_error is not None:
+            raise self.invoke_error
+        return self.invoke_result
+
     def _get(self, path):  # used by fetch_intent_manifest
+        self.get_calls.append(path)
         return self._manifest or {}
 
 
@@ -562,6 +574,239 @@ class SessionFlushGatingTests(unittest.TestCase):
         provider = _provider_with_client(client)
         provider.on_pre_compress(self._MESSAGES)
         self.assertEqual(client.turn_calls, [])
+
+
+class IntentToolSchemaTests(unittest.TestCase):
+    """get_tool_schemas — catalog-backed tool registration with session caching."""
+
+    def setUp(self):
+        _clear_flags()
+
+    def tearDown(self):
+        _clear_flags()
+
+    def test_default_exposes_read_intents_as_openai_schemas(self):
+        client = _MockClient(manifest=_MANIFEST)
+        schemas = _provider_with_client(client).get_tool_schemas()
+        self.assertEqual([s["name"] for s in schemas], ["memory_recall"])
+        self.assertEqual(set(schemas[0].keys()), {"name", "description", "parameters"})
+        self.assertEqual(schemas[0]["parameters"], {"type": "object"})
+
+    def test_schemas_are_cached_after_first_call(self):
+        client = _MockClient(manifest=_MANIFEST)
+        provider = _provider_with_client(client)
+        first = provider.get_tool_schemas()
+        fetches = len(client.get_calls)
+        second = provider.get_tool_schemas()
+        self.assertEqual(first, second)
+        self.assertEqual(len(client.get_calls), fetches)  # no re-fetch
+
+    def test_intent_tools_flag_off_exposes_nothing(self):
+        os.environ["CI_INTENT_TOOLS_ENABLED"] = "false"
+        client = _MockClient(manifest=_MANIFEST)
+        self.assertEqual(_provider_with_client(client).get_tool_schemas(), [])
+        self.assertEqual(client.get_calls, [])  # no catalog fetch at all
+
+    def test_master_intents_flag_off_exposes_nothing(self):
+        os.environ["CI_INTENTS_ENABLED"] = "false"
+        client = _MockClient(manifest=_MANIFEST)
+        self.assertEqual(_provider_with_client(client).get_tool_schemas(), [])
+
+    def test_unreachable_catalog_degrades_to_empty_and_caches(self):
+        client = _MockClient(manifest=_MANIFEST)
+
+        def boom(_path):
+            raise RuntimeError("CI-Server down")
+
+        client._get = boom
+        provider = _provider_with_client(client)
+        self.assertEqual(provider.get_tool_schemas(), [])
+        # The failure is cached: the routing table was built from the first
+        # answer, so later calls must not start advertising unroutable tools.
+        client._get = lambda path: _MANIFEST
+        self.assertEqual(provider.get_tool_schemas(), [])
+
+    def test_works_before_initialize_by_building_client_from_config(self):
+        # MemoryManager.add_provider() calls get_tool_schemas() BEFORE
+        # initialize(), so no session client exists yet.
+        client = _MockClient(manifest=_MANIFEST)
+        provider = ci.CompanionIntelligenceProvider()  # _client is None
+        env = {"CI_SERVER_URL": "http://ci-server:8642", "CI_SERVER_TOKEN": "tok"}
+        with mock.patch.dict(os.environ, env), \
+                mock.patch.object(ci, "_CIClient", return_value=client):
+            schemas = provider.get_tool_schemas()
+        self.assertEqual([s["name"] for s in schemas], ["memory_recall"])
+
+    def test_no_config_and_no_client_exposes_nothing(self):
+        provider = ci.CompanionIntelligenceProvider()
+        with mock.patch.dict(os.environ):
+            os.environ.pop("CI_SERVER_URL", None)
+            os.environ.pop("CI_SERVER_TOKEN", None)
+            self.assertEqual(provider.get_tool_schemas(), [])
+
+
+class HandleToolCallTests(unittest.TestCase):
+    """handle_tool_call — JSON-string results, structured errors, never raises."""
+
+    def setUp(self):
+        _clear_flags()
+
+    def tearDown(self):
+        _clear_flags()
+
+    def test_happy_path_returns_tool_result_as_json_string(self):
+        client = _MockClient(manifest=_MANIFEST)
+        client.invoke_result = {"success": True, "data": {"hello": "world"}}
+        out = _provider_with_client(client).handle_tool_call("memory_recall", {"query": "ada"})
+        self.assertIsInstance(out, str)
+        self.assertEqual(json.loads(out), {"success": True, "data": {"hello": "world"}})
+        self.assertEqual(client.invoke_calls, [("memory_recall", {"query": "ada"})])
+
+    def test_none_args_default_to_empty_input(self):
+        client = _MockClient(manifest=_MANIFEST)
+        _provider_with_client(client).handle_tool_call("memory_recall", None)
+        self.assertEqual(client.invoke_calls, [("memory_recall", {})])
+
+    def test_http_403_returns_structured_error_with_server_detail(self):
+        client = _MockClient(manifest=_MANIFEST)
+        exc = urllib.error.HTTPError("http://u", 403, "Forbidden", None, None)
+        exc.ci_body = "destructive intents need the dispatcher"
+        client.invoke_error = exc
+        out = _provider_with_client(client).handle_tool_call("memory_forget", {})
+        payload = json.loads(out)
+        self.assertFalse(payload["success"])
+        self.assertIn("403", payload["error"])
+        self.assertIn("destructive intents need the dispatcher", payload["error"])
+
+    def test_http_404_mentions_missing_executor(self):
+        client = _MockClient(manifest=_MANIFEST)
+        client.invoke_error = urllib.error.HTTPError("http://u", 404, "Not Found", None, None)
+        payload = json.loads(_provider_with_client(client).handle_tool_call("nope_tool", {}))
+        self.assertFalse(payload["success"])
+        self.assertIn("404", payload["error"])
+
+    def test_unexpected_exception_never_raises(self):
+        client = _MockClient(manifest=_MANIFEST)
+        client.invoke_error = RuntimeError("socket exploded")
+        payload = json.loads(_provider_with_client(client).handle_tool_call("memory_recall", {}))
+        self.assertFalse(payload["success"])
+        self.assertIn("socket exploded", payload["error"])
+
+    def test_missing_client_returns_structured_error(self):
+        provider = ci.CompanionIntelligenceProvider()
+        with mock.patch.dict(os.environ):
+            os.environ.pop("CI_SERVER_URL", None)
+            os.environ.pop("CI_SERVER_TOKEN", None)
+            payload = json.loads(provider.handle_tool_call("memory_recall", {}))
+        self.assertFalse(payload["success"])
+        self.assertIn("not configured", payload["error"])
+
+
+class InvokeIntentTransportTests(unittest.TestCase):
+    """_CIClient.invoke_intent — execute-path fallback ordering (canonical → legacy)."""
+
+    def _client(self):
+        return ci._CIClient("http://ci-server:8642", "tok")
+
+    def test_posts_to_canonical_execute_path_first(self):
+        client = self._client()
+        captured = {}
+        client._post = lambda path, payload: captured.update(path=path, payload=payload) or {"success": True}
+        out = client.invoke_intent("predictions_forecast", {"horizon": "24h"})
+        self.assertEqual(captured["path"], "/api/agent/intents/predictions_forecast/execute")
+        self.assertEqual(captured["payload"], {"horizon": "24h"})
+        self.assertEqual(out, {"success": True})
+
+    def test_falls_back_to_legacy_path_on_route_miss_404(self):
+        client = self._client()
+        seen = []
+
+        def fake_post(path, payload):
+            seen.append(path)
+            if path.startswith("/api/agent/"):
+                raise urllib.error.HTTPError("http://u", 404, "Not Found", None, None)
+            return {"success": True}
+
+        client._post = fake_post
+        out = client.invoke_intent("predictions.forecast")
+        self.assertEqual(
+            seen,
+            [
+                "/api/agent/intents/predictions.forecast/execute",
+                "/api/intents/predictions.forecast/execute",
+            ],
+        )
+        self.assertEqual(out, {"success": True})
+
+    def test_non_404_http_error_propagates_without_fallback(self):
+        client = self._client()
+        seen = []
+
+        def fake_post(path, payload):
+            seen.append(path)
+            raise urllib.error.HTTPError("http://u", 403, "Forbidden", None, None)
+
+        client._post = fake_post
+        with self.assertRaises(urllib.error.HTTPError):
+            client.invoke_intent("memory_forget")
+        self.assertEqual(len(seen), 1)
+
+    def test_404_on_every_candidate_reraises_the_404(self):
+        client = self._client()
+
+        def fake_post(path, payload):
+            raise urllib.error.HTTPError("http://u", 404, "Not Found", None, None)
+
+        client._post = fake_post
+        with self.assertRaises(urllib.error.HTTPError):
+            client.invoke_intent("unknown_intent")
+
+    def test_empty_name_raises_value_error(self):
+        with self.assertRaises(ValueError):
+            self._client().invoke_intent("")
+
+
+class SystemPromptCallableLineTests(unittest.TestCase):
+    """The catalog block advertises callable tools only when registration is active."""
+
+    def setUp(self):
+        _clear_flags()
+
+    def tearDown(self):
+        _clear_flags()
+
+    def test_callable_line_present_when_tools_active(self):
+        client = _MockClient(block="PROFILE", manifest=_MANIFEST)
+        out = _provider_with_client(client).system_prompt_block()
+        self.assertIn("memory_recall", out)
+        self.assertIn("registered as callable tools", out)
+
+    def test_callable_line_absent_when_tools_flag_off(self):
+        os.environ["CI_INTENT_TOOLS_ENABLED"] = "false"
+        client = _MockClient(block="PROFILE", manifest=_MANIFEST)
+        out = _provider_with_client(client).system_prompt_block()
+        self.assertIn("memory_recall", out)  # catalog still injected
+        self.assertNotIn("registered as callable tools", out)
+
+    def test_callable_line_absent_when_no_tools_registered(self):
+        # Catalog reachable but every intent filtered (destructive) → no line.
+        destructive_only = {
+            "intents": [
+                {
+                    "name": "memory.forget",
+                    "tool": "memory_forget",
+                    "domain": "memory",
+                    "title": "Forget",
+                    "description": "Delete knowledge.",
+                    "parameters": {"type": "object"},
+                    "privacy": {"access": "delete", "destructive": True, "external": False},
+                }
+            ]
+        }
+        client = _MockClient(block="PROFILE", manifest=destructive_only)
+        out = _provider_with_client(client).system_prompt_block()
+        self.assertIn("memory_forget", out)  # still described in the catalog
+        self.assertNotIn("registered as callable tools", out)
 
 
 if __name__ == "__main__":

@@ -7,7 +7,12 @@ Pure module, no Hermes runtime required. Run from this directory:
 
 import unittest
 
-from intent_catalog import describe_catalog_for_prompt, fetch_intent_manifest
+from intent_catalog import (
+    describe_catalog_for_prompt,
+    execute_path_candidates,
+    fetch_intent_manifest,
+    manifest_to_tool_schemas,
+)
 
 MANIFEST = {
     "version": "1.0.0",
@@ -94,6 +99,103 @@ class DescribeCatalogTests(unittest.TestCase):
     def test_empty_for_missing_or_empty_manifest(self):
         self.assertEqual(describe_catalog_for_prompt(None), "")
         self.assertEqual(describe_catalog_for_prompt({"intents": []}), "")
+
+
+class ManifestToToolSchemasTests(unittest.TestCase):
+    def test_maps_read_intents_to_openai_function_schemas(self):
+        schemas = manifest_to_tool_schemas(MANIFEST)
+        # memory.forget (destructive) and media.streamingAvailability (external)
+        # are filtered — only the read-only, appliance-local intent survives.
+        self.assertEqual([s["name"] for s in schemas], ["memory_recall"])
+        schema = schemas[0]
+        self.assertEqual(set(schema.keys()), {"name", "description", "parameters"})
+        self.assertIn("Recall knowledge", schema["description"])
+        self.assertIn("Recall stored facts.", schema["description"])
+        self.assertEqual(schema["parameters"], {"type": "object"})
+
+    def test_filters_destructive_and_external(self):
+        names = {s["name"] for s in manifest_to_tool_schemas(MANIFEST)}
+        self.assertNotIn("memory_forget", names)
+        self.assertNotIn("media_streamingAvailability", names)
+
+    def test_include_filters_by_tool_or_dotted_name(self):
+        manifest = {
+            "intents": [
+                dict(MANIFEST["intents"][0]),
+                {
+                    "name": "people.find",
+                    "tool": "people_find",
+                    "domain": "people",
+                    "title": "Find people",
+                    "description": "Find people.",
+                    "parameters": {"type": "object"},
+                    "privacy": {"access": "read", "destructive": False, "external": False},
+                },
+            ]
+        }
+        self.assertEqual(
+            [s["name"] for s in manifest_to_tool_schemas(manifest, include={"memory_recall"})],
+            ["memory_recall"],
+        )
+        # The dotted intent id works as an include key too.
+        self.assertEqual(
+            [s["name"] for s in manifest_to_tool_schemas(manifest, include={"people.find"})],
+            ["people_find"],
+        )
+
+    def test_degrades_to_empty_on_missing_or_malformed(self):
+        self.assertEqual(manifest_to_tool_schemas(None), [])
+        self.assertEqual(manifest_to_tool_schemas({}), [])
+        self.assertEqual(manifest_to_tool_schemas({"intents": "nope"}), [])
+        self.assertEqual(manifest_to_tool_schemas({"intents": ["nope", 3]}), [])
+
+    def test_intent_without_tool_name_is_skipped(self):
+        manifest = {"intents": [{"name": "x.y", "title": "T", "privacy": {}}]}
+        self.assertEqual(manifest_to_tool_schemas(manifest), [])
+
+    def test_missing_parameters_default_to_empty_object_schema(self):
+        manifest = {
+            "intents": [
+                {
+                    "name": "a.b",
+                    "tool": "a_b",
+                    "title": "AB",
+                    "description": "d",
+                    "privacy": {"destructive": False, "external": False},
+                }
+            ]
+        }
+        schemas = manifest_to_tool_schemas(manifest)
+        self.assertEqual(schemas[0]["parameters"], {"type": "object", "properties": {}})
+
+
+class ExecutePathCandidatesTests(unittest.TestCase):
+    def test_mirrors_catalog_path_fallback_ordering(self):
+        self.assertEqual(
+            execute_path_candidates("predictions_forecast"),
+            [
+                "/api/agent/intents/predictions_forecast/execute",
+                "/api/intents/predictions_forecast/execute",
+            ],
+        )
+
+    def test_accepts_dotted_intent_ids(self):
+        self.assertEqual(
+            execute_path_candidates("predictions.forecast"),
+            [
+                "/api/agent/intents/predictions.forecast/execute",
+                "/api/intents/predictions.forecast/execute",
+            ],
+        )
+
+    def test_url_encodes_unsafe_characters(self):
+        paths = execute_path_candidates("a/b c")
+        self.assertEqual(paths[0], "/api/agent/intents/a%2Fb%20c/execute")
+
+    def test_empty_name_yields_no_candidates(self):
+        self.assertEqual(execute_path_candidates(""), [])
+        self.assertEqual(execute_path_candidates("   "), [])
+        self.assertEqual(execute_path_candidates(None), [])
 
 
 if __name__ == "__main__":

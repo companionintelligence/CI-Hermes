@@ -8,6 +8,10 @@ and injects relevant context back into the agent at the right moments:
   prefetch()             — L1 hybrid search results relevant to the current turn
                            queued as soon as the user message arrives, so the
                            HTTP call overlaps with other pre-turn processing
+  get_tool_schemas()     — CI-Server's curated intent catalog exposed as callable
+                           tools (read-only, appliance-local intents only)
+  handle_tool_call()     — executes an intent via CI-Server's generic REST
+                           executor (POST /api/intents/:name/execute)
 
 Config (set by `hermes memory setup` or environment):
   CI_SERVER_URL    — Base URL of your CI-Server instance (e.g. http://ci-server:8642)
@@ -27,7 +31,12 @@ from typing import Any, Dict, List, Optional
 
 from agent.memory_provider import MemoryProvider
 
-from .intent_catalog import describe_catalog_for_prompt, fetch_intent_manifest
+from .intent_catalog import (
+    describe_catalog_for_prompt,
+    execute_path_candidates,
+    fetch_intent_manifest,
+    manifest_to_tool_schemas,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -58,6 +67,9 @@ def _extract_block(resp: dict) -> str:
 #   CI_MEMORY_TURN_ENABLED     — turn-sync ingestion (/api/memory/turn)
 #   CI_MEMORY_WRITE_ENABLED    — durable note writes (/api/memory/write)
 #   CI_INTENTS_ENABLED         — intent catalog (/api/agent/intents)
+#   CI_INTENT_TOOLS_ENABLED    — register catalog intents as callable tools
+#                                (POST /api/intents/:name/execute); also
+#                                requires CI_INTENTS_ENABLED
 _FALSY = {"0", "false", "no", "off"}
 
 
@@ -149,6 +161,34 @@ class _CIClient:
                 return self._post("/api/memory/note", payload)
             raise
 
+    # ── Intent execution ──────────────────────────────────────────────────────
+
+    def invoke_intent(self, name: str, arguments: Optional[dict] = None) -> dict:
+        """Execute a curated intent via CI-Server's generic REST executor.
+
+        POSTs the tool input to the canonical execute path, falling through to
+        the legacy ``/api/intents`` alias on a route-miss 404 — the same
+        canonical-then-legacy ordering the catalog fetch uses. Returns the
+        server's structured ToolResult JSON. Raises on transport/HTTP errors;
+        the provider's ``handle_tool_call`` converts those to structured error
+        strings so nothing propagates into the agent loop.
+        """
+        last_exc: Optional[urllib.error.HTTPError] = None
+        for path in execute_path_candidates(name):
+            try:
+                return self._post(path, arguments or {})
+            except urllib.error.HTTPError as exc:
+                # 404 is both "route not deployed" and "unknown intent"; either
+                # way trying the next candidate is safe (it 404s identically on
+                # an unknown intent).
+                if exc.code == 404:
+                    last_exc = exc
+                    continue
+                raise
+        if last_exc is not None:
+            raise last_exc
+        raise ValueError(f"invalid intent name: {name!r}")
+
     # ── Health ────────────────────────────────────────────────────────────────
 
     def health(self) -> bool:
@@ -193,6 +233,10 @@ class _CIClient:
         except urllib.error.HTTPError as exc:
             body = exc.read().decode("utf-8", errors="replace") if exc.fp else ""
             logger.debug("CI-Server POST %s → HTTP %s: %s", path, exc.code, body[:200])
+            # The response body is consumed by the read above; stash it so
+            # handle_tool_call can surface the server's error message (e.g. an
+            # input-validation detail) to the agent.
+            exc.ci_body = body  # type: ignore[attr-defined]
             raise
         except Exception as exc:
             logger.debug("CI-Server POST %s failed: %s", path, exc)
@@ -214,6 +258,9 @@ class CompanionIntelligenceProvider(MemoryProvider):
         # Prefetch state — reset each turn by queue_prefetch
         self._prefetch_event: Optional[threading.Event] = None
         self._prefetch_result: Optional[str] = None
+        # Intent tool schemas — fetched once per session on the first
+        # get_tool_schemas() call, then cached (None = not fetched yet).
+        self._tool_schemas: Optional[List[Dict[str, Any]]] = None
 
     @property
     def name(self) -> str:
@@ -437,6 +484,14 @@ class CompanionIntelligenceProvider(MemoryProvider):
         if _feature_enabled("CI_INTENTS_ENABLED"):
             catalog = describe_catalog_for_prompt(fetch_intent_manifest(self._client._get))
             if catalog:
+                # When the catalog is also registered as callable tools (see
+                # get_tool_schemas), tell the agent it can invoke these intents
+                # mid-session instead of treating the catalog as descriptive only.
+                if self.get_tool_schemas():
+                    catalog += (
+                        "\n\nRead-only intents from this catalog are registered as callable "
+                        "tools in this session — invoke them directly by tool name."
+                    )
                 blocks.append(catalog)
 
         return "\n\n".join(blocks)
@@ -597,11 +652,102 @@ class CompanionIntelligenceProvider(MemoryProvider):
         t.start()
 
     # ---------------------------------------------------------------------------
-    # Tools — not active
+    # Tools — CI intents as callable tools
     # ---------------------------------------------------------------------------
 
+    def _tools_client(self) -> Optional[_CIClient]:
+        """The session client when initialized, else one built from config.
+
+        The Hermes MemoryManager calls ``get_tool_schemas()`` at provider
+        registration (``add_provider``) — BEFORE ``initialize()`` creates the
+        session client — so tool discovery must be able to stand up its own
+        client. ``is_available()`` already guaranteed URL + token exist for a
+        registered provider.
+        """
+        if self._client:
+            return self._client
+        cfg = _load_config()
+        url, token = cfg.get("url"), cfg.get("token")
+        if url and token:
+            return _CIClient(url, token)
+        return None
+
+    def _intent_tools_enabled(self) -> bool:
+        # CI_INTENTS_ENABLED is the master switch for the intent-catalog
+        # integration; CI_INTENT_TOOLS_ENABLED scopes the callable-tool half.
+        # Both default on, matching every other CI_* flag in this plugin.
+        return _feature_enabled("CI_INTENTS_ENABLED") and _feature_enabled("CI_INTENT_TOOLS_ENABLED")
+
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
-        return []
+        """Expose CI-Server's curated intents as callable tools.
+
+        Fetched from the intent catalog on the first call of the session and
+        cached — the MemoryManager builds its tool→provider routing table from
+        the first call, so later calls must return the same answer or it would
+        advertise tools it cannot route. Only read-only, appliance-local
+        intents are exposed (destructive/external intents are filtered here
+        and rejected server-side with a 403). Never raises: an unreachable
+        catalog degrades to no tools for the session, with a debug log.
+        """
+        if not self._intent_tools_enabled():
+            return []
+        if self._tool_schemas is not None:
+            return self._tool_schemas
+
+        client = self._tools_client()
+        if client is None:
+            logger.debug("CI intent tools: no CI-Server client configured; exposing no tools")
+            self._tool_schemas = []
+            return self._tool_schemas
+
+        manifest = fetch_intent_manifest(client._get)
+        if manifest is None:
+            logger.debug("CI intent tools: intent catalog unreachable; exposing no tools this session")
+            self._tool_schemas = []
+            return self._tool_schemas
+
+        self._tool_schemas = manifest_to_tool_schemas(manifest)
+        logger.debug("CI intent tools: %d callable intents registered", len(self._tool_schemas))
+        return self._tool_schemas
+
+    def handle_tool_call(self, tool_name: str, args: Dict[str, Any], **kwargs) -> str:
+        """Execute a CI intent tool call via the generic REST executor.
+
+        The runtime routes only tool names returned by ``get_tool_schemas()``
+        here. Per the MemoryProvider contract this returns a JSON string — the
+        server's structured ToolResult on success, or a structured error
+        object on failure. Never raises into the agent loop.
+        """
+        client = self._tools_client()
+        if client is None:
+            return json.dumps({"success": False, "error": "CI-Server client is not configured"})
+        try:
+            result = client.invoke_intent(tool_name, args or {})
+            return json.dumps(result)
+        except urllib.error.HTTPError as exc:
+            if exc.code == 404:
+                message = (
+                    f"CI-Server does not expose intent '{tool_name}' "
+                    "(HTTP 404) — unknown intent, or the server predates the REST intent executor"
+                )
+            elif exc.code == 403:
+                message = (
+                    f"CI-Server refused intent '{tool_name}' (HTTP 403) — destructive/external "
+                    "intents cannot run via the generic REST executor"
+                )
+            else:
+                message = f"CI-Server intent '{tool_name}' failed (HTTP {exc.code})"
+            # Not getattr(): HTTPError's addbase ancestor defines a __getattr__
+            # that raises KeyError (not AttributeError) when fp is None, which
+            # getattr's default does not swallow.
+            detail = str(exc.__dict__.get("ci_body") or "")[:300]
+            if detail:
+                message = f"{message}: {detail}"
+            logger.debug("CI intent tool '%s' HTTP error: %s", tool_name, message)
+            return json.dumps({"success": False, "error": message})
+        except Exception as exc:
+            logger.debug("CI intent tool '%s' failed: %s", tool_name, exc)
+            return json.dumps({"success": False, "error": f"CI-Server intent '{tool_name}' failed: {exc}"})
 
     # ---------------------------------------------------------------------------
     # Shutdown

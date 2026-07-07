@@ -131,6 +131,17 @@ On startup, `/app/bootstrap-ci-context.sh` idempotently:
 
 To connect it to Companion Memory you have two options (see *Connect Hermes to CI Memory* above for the full walkthrough): enter the **Companion Memory URL** and **API Key** in the app's install dialog and it activates automatically on startup, or run `hermes memory setup` in the terminal and follow the instructions. Either way, generate your API key from the CI-Server settings page.
 
+### Callable CI intents (tools)
+
+When Companion Memory is connected, the memory provider does more than describe CI-Server's curated intent catalog (`GET /api/agent/intents`, legacy `/api/intents`) in the system prompt — it also registers the catalog's read-only, appliance-local intents as callable tools, so the agent can execute them mid-session (e.g. `predictions_forecast`) through CI-Server's generic REST executor (`POST /api/intents/<name>/execute`). Destructive or external intents are never registered; the server independently refuses them with a 403.
+
+Feature flags (all default **on**):
+
+- `CI_INTENTS_ENABLED=false` — turn off the whole intent-catalog integration (prompt block + tools)
+- `CI_INTENT_TOOLS_ENABLED=false` — keep the prompt catalog but do not register callable tools
+
+Requires a CI-Server build with the REST intent executor; on older servers the catalog stays prompt-only and tool calls degrade to a structured error result instead of failing the session.
+
 ## Hub MCP (platform tools)
 
 On CI marketplace installs with MCP enabled, the Hub injects `HUB_MCP_URL` and `HUB_MCP_API_KEY`. Bootstrap order is:
