@@ -592,6 +592,26 @@ function memoryActionTokenOk(req) {
   return !!SETUP_TOKEN && provided === SETUP_TOKEN;
 }
 
+/** Escape a value for safe interpolation into an HTML attribute. */
+function escapeHtmlAttr(value) {
+  return String(value)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
+}
+
+/** Return `url` only if it is an http(s) URL; otherwise null (reject javascript:, data:, etc.). */
+function safeHttpUrl(url) {
+  try {
+    const u = new URL(url);
+    return u.protocol === "https:" || u.protocol === "http:" ? u.toString() : null;
+  } catch {
+    return null;
+  }
+}
+
 /** Minimal, self-contained interstitial page (mirrors the terminal.html aesthetic). */
 function renderMemoryGateHtml(connectUrl) {
   const t = encodeURIComponent(SETUP_TOKEN);
@@ -614,7 +634,7 @@ function renderMemoryGateHtml(connectUrl) {
      sessions. You'll sign in with Companion Intelligence and approve access; you
      can disconnect any time.</p>
   <div class="actions">
-    <a class="btn primary" href="${connectUrl}">Sign in with Companion Intelligence</a>
+    <a class="btn primary" href="${escapeHtmlAttr(connectUrl)}">Sign in with Companion Intelligence</a>
     <form method="POST" action="${MEMORY_DEFER_PATH}?t=${t}"><button class="secondary" type="submit">Continue without memory</button></form>
     <form method="POST" action="${MEMORY_SKIP_PATH}?t=${t}"><button class="secondary" type="submit">Don't ask again</button></form>
   </div>
@@ -642,10 +662,13 @@ async function maybeServeMemoryGate(req, res, requestPath) {
     });
     if (!resp.ok) return false;
     const { state, connectUrl } = await resp.json();
-    if ((state !== "unconfigured" && state !== "deferred") || !connectUrl) return false;
+    if (state !== "unconfigured" && state !== "deferred") return false;
+    // Only ever link to an http(s) Hub URL — never a javascript:/data: scheme.
+    const safeConnectUrl = safeHttpUrl(connectUrl);
+    if (!safeConnectUrl) return false;
 
     res.writeHead(200, { "Content-Type": "text/html", "Cache-Control": "no-store" });
-    res.end(renderMemoryGateHtml(connectUrl));
+    res.end(renderMemoryGateHtml(safeConnectUrl));
     return true;
   } catch {
     return false;
