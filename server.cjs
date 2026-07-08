@@ -592,10 +592,11 @@ function hasMemoryDeferCookie(req) {
   return (req.headers.cookie || "").split(";").some((c) => c.trim().startsWith(`${MEMORY_DEFER_COOKIE}=`));
 }
 
-/** Anti-CSWSH token check for the gate's local actions. */
+/** Constant-time anti-CSWSH token check for the gate's local actions. */
 function memoryActionTokenOk(req) {
   const provided = new URL(req.url || "/", "http://localhost").searchParams.get("t") || "";
-  return !!SETUP_TOKEN && provided === SETUP_TOKEN;
+  if (!SETUP_TOKEN || provided.length !== SETUP_TOKEN.length) return false;
+  return crypto.timingSafeEqual(Buffer.from(provided), Buffer.from(SETUP_TOKEN));
 }
 
 /** Escape a value for safe interpolation into an HTML attribute. */
@@ -653,7 +654,10 @@ function renderMemoryGateHtml(connectUrl) {
  * any uncertainty so a Hub hiccup never blocks the app.
  */
 async function maybeServeMemoryGate(req, res, requestPath) {
-  if (req.method !== "GET" || requestPath !== "") return false; // only the root dashboard load
+  // Gate the top-level HTML entry points. The marketplace manifest launches
+  // Hermes at `/terminal` (not `/`), so gating only `""` would never show the
+  // interstitial to a normal user; cover both the dashboard root and /terminal.
+  if (req.method !== "GET" || (requestPath !== "" && requestPath !== "/terminal")) return false;
   if (!String(req.headers.accept || "").includes("text/html")) return false;
   if (hasMemoryCreds()) return false;
   if (hasMemoryDeferCookie(req)) return false;
@@ -693,7 +697,8 @@ async function handleMemoryAction(req, res, requestPath) {
   }
 
   if (requestPath === MEMORY_DEFER_PATH) {
-    res.writeHead(302, { Location: "/", "Set-Cookie": `${MEMORY_DEFER_COOKIE}=1; Path=/; HttpOnly; SameSite=Lax` });
+    // Return to the app's launch path (/terminal), not the dashboard root.
+    res.writeHead(302, { Location: "/terminal", "Set-Cookie": `${MEMORY_DEFER_COOKIE}=1; Path=/; HttpOnly; SameSite=Lax` });
     res.end();
     return true;
   }
@@ -711,7 +716,7 @@ async function handleMemoryAction(req, res, requestPath) {
       // best-effort
     }
   }
-  res.writeHead(302, { Location: "/" });
+  res.writeHead(302, { Location: "/terminal" });
   res.end();
   return true;
 }
