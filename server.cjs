@@ -576,6 +576,12 @@ function hubInternalBase() {
   return (process.env.CI_HUB_URL || process.env.HUB_URL || "").trim().replace(/\/+$/, "");
 }
 
+/** Auth header for wrapper->Hub memory-connect calls: this app's own managed key. */
+function mcpAuthHeaders() {
+  const key = (process.env.HUB_MCP_API_KEY || "").trim();
+  return key ? { Authorization: `Bearer ${key}` } : {};
+}
+
 /** Whether memory creds are already present (Hub-injected or operator-set). */
 function hasMemoryCreds() {
   return !!(process.env.CI_SERVER_URL && process.env.CI_SERVER_TOKEN && process.env.CI_SERVER_ENABLED !== "false");
@@ -658,6 +664,7 @@ async function maybeServeMemoryGate(req, res, requestPath) {
 
   try {
     const resp = await fetch(`${hubBase}/api/memory-connect/apps/${encodeURIComponent(appUrn)}/state`, {
+      headers: mcpAuthHeaders(),
       signal: AbortSignal.timeout(4000),
     });
     if (!resp.ok) return false;
@@ -697,6 +704,7 @@ async function handleMemoryAction(req, res, requestPath) {
     try {
       await fetch(`${hubBase}/api/memory-connect/apps/${encodeURIComponent(appUrn)}/skip`, {
         method: "POST",
+        headers: mcpAuthHeaders(),
         signal: AbortSignal.timeout(4000),
       });
     } catch {
