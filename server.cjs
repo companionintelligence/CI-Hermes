@@ -745,8 +745,9 @@ async function handleMemoryAction(req, res, requestPath) {
   }
 
   if (requestPath === MEMORY_DEFER_PATH) {
-    // Return to the app's launch path (/terminal), not the dashboard root.
-    res.writeHead(302, { Location: "/terminal", "Set-Cookie": `${MEMORY_DEFER_COOKIE}=1; Path=/; HttpOnly; SameSite=Lax` });
+    // Return to the app root — where the marketplace launches the app and where
+    // the gate was shown — not the /terminal sub-page.
+    res.writeHead(302, { Location: "/", "Set-Cookie": `${MEMORY_DEFER_COOKIE}=1; Path=/; HttpOnly; SameSite=Lax` });
     res.end();
     return true;
   }
@@ -764,7 +765,7 @@ async function handleMemoryAction(req, res, requestPath) {
       // best-effort
     }
   }
-  res.writeHead(302, { Location: "/terminal" });
+  res.writeHead(302, { Location: "/" });
   res.end();
   return true;
 }
