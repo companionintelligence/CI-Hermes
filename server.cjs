@@ -577,6 +577,11 @@ function proxyDashboardUpgrade(req, socket, head) {
 // The Hub owns the OAuth-style flow; this wrapper renders the gate and relays
 // the skip/defer choices. Paths namespaced under /__ci_memory/.
 const MEMORY_DEFER_COOKIE = "ci_memory_deferred";
+// Grace window (seconds) for the "Continue without memory" choice. Long enough to
+// carry the post-dismiss redirect, short enough that the next fresh launch/reload
+// re-prompts. Deliberately NOT a session cookie — that survived tab-close +
+// relaunch, making "defer" feel as permanent as "Don't ask again".
+const MEMORY_DEFER_GRACE_SECONDS = 30;
 const MEMORY_DEFER_PATH = "/__ci_memory/defer";
 const MEMORY_SKIP_PATH = "/__ci_memory/skip";
 const MEMORY_LOGO_PATH = "/__ci_memory/ci-memory-logo.webp";
@@ -597,7 +602,7 @@ function hasMemoryCreds() {
   return !!(process.env.CI_SERVER_URL && process.env.CI_SERVER_TOKEN && process.env.CI_SERVER_ENABLED !== "false");
 }
 
-/** Whether the request carries the session-scoped "deferred" cookie. */
+/** Whether the request carries the short-lived "deferred" cookie (grace window). */
 function hasMemoryDeferCookie(req) {
   return (req.headers.cookie || "").split(";").some((c) => c.trim().startsWith(`${MEMORY_DEFER_COOKIE}=`));
 }
@@ -747,7 +752,10 @@ async function handleMemoryAction(req, res, requestPath) {
   if (requestPath === MEMORY_DEFER_PATH) {
     // Return to the app root — where the marketplace launches the app and where
     // the gate was shown — not the /terminal sub-page.
-    res.writeHead(302, { Location: "/", "Set-Cookie": `${MEMORY_DEFER_COOKIE}=1; Path=/; HttpOnly; SameSite=Lax` });
+    res.writeHead(302, {
+      Location: "/",
+      "Set-Cookie": `${MEMORY_DEFER_COOKIE}=1; Path=/; Max-Age=${MEMORY_DEFER_GRACE_SECONDS}; HttpOnly; SameSite=Lax`,
+    });
     res.end();
     return true;
   }
