@@ -700,11 +700,17 @@ function renderMemoryGateHtml(connectUrl) {
  * any uncertainty so a Hub hiccup never blocks the app.
  */
 async function maybeServeMemoryGate(req, res, requestPath) {
-  // Gate the top-level HTML entry points. The marketplace manifest launches
-  // Hermes at `/terminal` (not `/`), so gating only `""` would never show the
-  // interstitial to a normal user; cover both the dashboard root and /terminal.
-  if (req.method !== "GET" || (requestPath !== "" && requestPath !== "/terminal")) return false;
-  if (!String(req.headers.accept || "").includes("text/html")) return false;
+  // Gate EVERY top-level HTML navigation, regardless of which SPA route the user
+  // opens or refreshes (/, /terminal, /chat, …) — not just the known entry points
+  // — so a disconnected app re-prompts everywhere, not only at the root. Never
+  // gate the wrapper's own /__ci_memory/* paths (defer/skip/logo), nor
+  // non-navigation requests: API/XHR, static assets, and WebSocket upgrades don't
+  // carry `Sec-Fetch-Dest: document` (and don't Accept text/html on older
+  // browsers), so returning the interstitial HTML for them would break the app.
+  if (req.method !== "GET" || requestPath.startsWith("/__ci_memory")) return false;
+  const secFetchDest = String(req.headers["sec-fetch-dest"] || "");
+  const isNavigation = secFetchDest ? secFetchDest === "document" : String(req.headers.accept || "").includes("text/html");
+  if (!isNavigation) return false;
   if (hasMemoryCreds()) return false;
   if (hasMemoryDeferCookie(req)) return false;
 
