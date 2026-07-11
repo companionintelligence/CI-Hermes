@@ -10,6 +10,27 @@ const PORT = parseInt(process.env.PORT || "18789");
 // so without this any site could connect to /ci/api/terminal and hijack the PTY.
 // APP_SEED (per-app secret from CI marketplace) is embedded in the served HTML.
 const SETUP_TOKEN = process.env.APP_SEED || "";
+
+// Dedicated per-process token for the local memory-gate dismiss actions
+// (/__ci_memory/defer + /skip). Deliberately NOT SETUP_TOKEN (=APP_SEED, the
+// RCE-grade terminal secret): those actions are low-value (dismiss a prompt), so
+// they must not reuse — nor risk leaking — the terminal secret. Minted fresh per
+// boot and carried in the POST body (never the URL) so it can't leak via proxy
+// logs / Referer / history.
+const MEMORY_ACTION_TOKEN = crypto.randomBytes(32).toString("hex");
+
+/**
+ * Byte-safe constant-time token compare: compares BYTE lengths before
+ * crypto.timingSafeEqual, which throws a RangeError on unequal-length buffers
+ * (a multi-byte value can match the JS string length while differing in bytes).
+ */
+function tokensMatch(provided, expected) {
+  if (!expected) return false;
+  const a = Buffer.from(String(provided ?? ""));
+  const b = Buffer.from(expected);
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
+}
+
 const DATA_DIR = "/opt/data";
 const DASHBOARD_HOST = "127.0.0.1";
 const DASHBOARD_PORT = 9119;
@@ -607,17 +628,38 @@ function hasMemoryDeferCookie(req) {
   return (req.headers.cookie || "").split(";").some((c) => c.trim().startsWith(`${MEMORY_DEFER_COOKIE}=`));
 }
 
-/** Constant-time anti-CSWSH token check for the gate's local actions. */
-function memoryActionTokenOk(req) {
-  const provided = new URL(req.url || "/", "http://localhost").searchParams.get("t") || "";
-  if (!SETUP_TOKEN) return false;
-  // Compare BYTE lengths (not JS string length): timingSafeEqual throws
-  // RangeError on unequal-length buffers, and a multi-byte `t` can match the
-  // string length while differing in bytes — that throw would crash the async
-  // request handler. Mirrors the WebSocket-upgrade token check below.
-  const providedBuffer = Buffer.from(provided);
-  const tokenBuffer = Buffer.from(SETUP_TOKEN);
-  return providedBuffer.length === tokenBuffer.length && crypto.timingSafeEqual(providedBuffer, tokenBuffer);
+/**
+ * Read a small urlencoded request body (bounded), resolving to parsed params.
+ * The memory-gate action token travels in the POST body (not the URL), so a
+ * cross-site page still cannot forge it (same-origin policy) while it no longer
+ * leaks through request logs / Referer / history.
+ */
+function readFormBody(req, limit = 8192) {
+  return new Promise((resolve) => {
+    let data = "";
+    let done = false;
+    const finish = (value) => {
+      if (!done) {
+        done = true;
+        resolve(new URLSearchParams(value));
+      }
+    };
+    req.on("data", (chunk) => {
+      if (done) return;
+      data += chunk;
+      // Over the (generous) cap → treat as no token. Stop accumulating (via the
+      // `done` guard) but do NOT destroy the socket here, so the awaiting handler
+      // still delivers its 403 on a live connection.
+      if (data.length > limit) {
+        finish("");
+      }
+    });
+    req.on("end", () => finish(data));
+    req.on("error", () => finish(""));
+    // Resolve on close/abort too, so a client that stalls without a clean
+    // end/error can never leave this promise (and the awaiting handler) pending.
+    req.on("close", () => finish(""));
+  });
 }
 
 /** Escape a value for safe interpolation into an HTML attribute. */
@@ -649,7 +691,6 @@ function safeHttpUrl(url) {
  * (with a light-scheme fallback).
  */
 function renderMemoryGateHtml(connectUrl) {
-  const t = encodeURIComponent(SETUP_TOKEN);
   // Connector + Companion Memory mark, appended after the app logo. Omitted
   // entirely (no dangling arrow) when the mark asset is unavailable.
   const cmGlyph = MEMORY_LOGO
@@ -688,8 +729,8 @@ function renderMemoryGateHtml(connectUrl) {
      can disconnect any time.</p>
   <div class="actions">
     <a class="btn primary" href="${escapeHtmlAttr(connectUrl)}">Sign in with Companion Intelligence</a>
-    <form method="POST" action="${MEMORY_DEFER_PATH}?t=${t}"><button class="btn secondary" type="submit">Maybe later</button></form>
-    <form method="POST" action="${MEMORY_SKIP_PATH}?t=${t}"><button class="btn secondary" type="submit">Don't ask again</button></form>
+    <form method="POST" action="${MEMORY_DEFER_PATH}"><input type="hidden" name="t" value="${MEMORY_ACTION_TOKEN}" /><button class="btn secondary" type="submit">Maybe later</button></form>
+    <form method="POST" action="${MEMORY_SKIP_PATH}"><input type="hidden" name="t" value="${MEMORY_ACTION_TOKEN}" /><button class="btn secondary" type="submit">Don't ask again</button></form>
   </div>
 </main></body></html>`;
 }
@@ -749,7 +790,9 @@ async function maybeServeMemoryGate(req, res, requestPath) {
 async function handleMemoryAction(req, res, requestPath) {
   if (requestPath !== MEMORY_DEFER_PATH && requestPath !== MEMORY_SKIP_PATH) return false;
 
-  if (req.method !== "POST" || !memoryActionTokenOk(req)) {
+  // POST-only + anti-CSWSH token carried in the body (byte-safe compare).
+  const body = req.method === "POST" ? await readFormBody(req) : new URLSearchParams();
+  if (req.method !== "POST" || !tokensMatch(body.get("t"), MEMORY_ACTION_TOKEN)) {
     res.writeHead(403, { "Content-Type": "text/plain" });
     res.end("Forbidden");
     return true;
