@@ -956,14 +956,9 @@ server.on("upgrade", (req, socket, head) => {
   }
 
   if (url.pathname === "/ci/api/terminal") {
-    // Validate anti-CSWSH token.
+    // Validate anti-CSWSH token (byte-safe compare; see tokensMatch).
     const provided = url.searchParams.get("token") || "";
-    const providedBuffer = Buffer.from(provided);
-    const tokenBuffer = Buffer.from(SETUP_TOKEN);
-    const tokenValid =
-      !!SETUP_TOKEN &&
-      providedBuffer.length === tokenBuffer.length &&
-      crypto.timingSafeEqual(providedBuffer, tokenBuffer);
+    const tokenValid = tokensMatch(provided, SETUP_TOKEN);
 
     const sameOrigin = isSameOriginUpgrade(req);
 
