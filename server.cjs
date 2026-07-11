@@ -942,49 +942,70 @@ wss.on("connection", (ws) => {
 });
 
 server.on("upgrade", (req, socket, head) => {
-  let url;
   try {
-    const hostHeader = String(req.headers.host || "");
-    if (!hostHeader) {
-      throw new Error("Missing Host header");
+    let url;
+    try {
+      const hostHeader = String(req.headers.host || "");
+      if (!hostHeader) {
+        throw new Error("Missing Host header");
+      }
+      url = new URL(req.url, `http://${hostHeader}`);
+    } catch (e) {
+      socket.write("HTTP/1.1 400 Bad Request\r\n\r\n");
+      socket.destroy();
+      return;
     }
-    url = new URL(req.url, `http://${hostHeader}`);
-  } catch (e) {
-    socket.write("HTTP/1.1 400 Bad Request\r\n\r\n");
-    socket.destroy();
-    return;
-  }
 
-  if (url.pathname === "/ci/api/terminal") {
-    // Validate anti-CSWSH token (byte-safe compare; see tokensMatch).
-    const provided = url.searchParams.get("token") || "";
-    const tokenValid = tokensMatch(provided, SETUP_TOKEN);
+    if (url.pathname === "/ci/api/terminal") {
+      // Validate anti-CSWSH token (byte-safe compare; see tokensMatch).
+      const provided = url.searchParams.get("token") || "";
+      const tokenValid = tokensMatch(provided, SETUP_TOKEN);
 
-    const sameOrigin = isSameOriginUpgrade(req);
+      const sameOrigin = isSameOriginUpgrade(req);
 
-    const allowSameOriginFallback = ALLOW_SAME_ORIGIN_WS_FALLBACK && sameOrigin;
-    if (!tokenValid && !allowSameOriginFallback) {
+      const allowSameOriginFallback = ALLOW_SAME_ORIGIN_WS_FALLBACK && sameOrigin;
+      if (!tokenValid && !allowSameOriginFallback) {
+        socket.write("HTTP/1.1 403 Forbidden\r\n\r\n");
+        socket.destroy();
+        return;
+      }
+      wss.handleUpgrade(req, socket, head, (ws) => {
+        wss.emit("connection", ws, req);
+      });
+      return;
+    }
+
+    if (!isSameOriginUpgrade(req)) {
       socket.write("HTTP/1.1 403 Forbidden\r\n\r\n");
       socket.destroy();
       return;
     }
-    wss.handleUpgrade(req, socket, head, (ws) => {
-      wss.emit("connection", ws, req);
-    });
-    return;
-  }
 
-  if (!isSameOriginUpgrade(req)) {
-    socket.write("HTTP/1.1 403 Forbidden\r\n\r\n");
-    socket.destroy();
-    return;
+    proxyDashboardUpgrade(req, socket, head);
+  } catch (err) {
+    // Defense in depth: never let an upgrade-handler throw escape as an uncaught
+    // exception (which would crash the wrapper). Reject the socket and move on.
+    console.error("[hermes] upgrade handler error:", err && err.message ? err.message : err);
+    try {
+      socket.destroy();
+    } catch {
+      /* socket already gone */
+    }
   }
-
-  proxyDashboardUpgrade(req, socket, head);
 });
 
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`Hermes terminal server listening on port ${PORT}`);
+});
+
+// Last-resort backstop: keep a stray throw/rejection (e.g. from an event
+// handler outside a request's try/catch) from hard-crashing the wrapper and
+// dropping the whole app. Log and keep serving.
+process.on("uncaughtException", (err) => {
+  console.error("[hermes] uncaughtException:", err && err.stack ? err.stack : err);
+});
+process.on("unhandledRejection", (reason) => {
+  console.error("[hermes] unhandledRejection:", reason);
 });
 
 // Graceful shutdown
