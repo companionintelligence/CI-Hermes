@@ -20,7 +20,7 @@ RUN cd /app && npm install --omit=dev
 # Bundle CI-managed context in the image. Hermes enables the runtime plugin
 # and external skill directory from config.yaml at startup; the files themselves
 # stay outside /opt/data so the agent cannot edit managed instructions.
-COPY server.cjs terminal.html logo.webp entrypoint.sh gateway-entrypoint.sh start-hermes.sh bootstrap-ci-context.sh bootstrap-from-hub.sh configure-ci-server.py configure-hub-mcp.py /app/
+COPY server.cjs memory-gate.cjs terminal.html logo.webp entrypoint.sh gateway-entrypoint.sh start-hermes.sh bootstrap-ci-context.sh bootstrap-from-hub.sh configure-ci-server.py configure-hub-mcp.py /app/
 COPY assets /app/assets
 COPY ci-context/skills /app/ci-context/skills
 COPY ci-context/plugins/ci-runtime /opt/hermes/plugins/ci-runtime
