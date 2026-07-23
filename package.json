@@ -5,5 +5,10 @@
   "dependencies": {
     "node-pty": "^1.0.0",
     "ws": "^8.18.0"
+  },
+  "scripts": {
+    "test": "npm run test:unit && npm run test:sh",
+    "test:unit": "node --test",
+    "test:sh": "for f in tests/*.test.sh; do [ -e \"$f\" ] || continue; bash \"$f\" || exit 1; done"
   }
 }
