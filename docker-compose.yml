@@ -2,7 +2,7 @@ services:
   # Web terminal UI + dashboard (proxied through Node server)
   web:
     build: .
-    image: ci-hermes:v2026.7.7.2
+    image: ci-hermes:v2026.7.20
     container_name: hermes-web
     hostname: hermes # Shell prompt shows "hermes@hermes" instead of "hermes@<container-id>"
     restart: unless-stopped
@@ -28,7 +28,7 @@ services:
 
   # Hermes messaging gateway
   gateway:
-    image: ci-hermes:v2026.7.7.2
+    image: ci-hermes:v2026.7.20
     container_name: hermes-gateway
     restart: unless-stopped
     init: true
