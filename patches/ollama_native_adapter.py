@@ -36,11 +36,17 @@ logger = logging.getLogger("ci.ollama_native")
 # through to the stock OpenAI client (today's /v1 behavior).
 FLAG_ENV = "CI_HERMES_OLLAMA_NATIVE"
 
-# Cache of base_url(root) -> (is_ollama, expires_at_monotonic_or_None). Positive
-# results never expire (an Ollama endpoint stays Ollama); negatives expire after a
-# short TTL so a transient blip (Ollama restart) recovers, while a persistent
-# misconfiguration (non-Ollama endpoint) isn't re-probed on every client build.
+# Cache of base_url(root) -> (is_ollama, expires_at_monotonic). Both outcomes are
+# bounded by a 1h TTL: a positive must not be pinned for the process lifetime (a
+# server swap on the same port — stop Ollama, start vLLM — is eventually
+# re-detected instead of hard-404ing every turn until restart), and a bounded
+# negative caps the probe at one round trip per endpoint per hour on the
+# client-build path instead of re-probing every minute.
 _OLLAMA_PROBE_CACHE: Dict[str, Tuple[bool, Optional[float]]] = {}
+_VERSION_PROBE_TTL = 3600.0  # seconds
+# Short failure TTL — serves both the /api/show thinking-probe failure cache below
+# AND indeterminate version-probe failures (transport blip, auth error, 5xx), so a
+# flaky endpoint recovers quickly while never adding a round trip to every chat call.
 _NEG_PROBE_TTL = 60.0  # seconds
 
 
@@ -57,17 +63,31 @@ def native_root(base_url: str) -> str:
     return b
 
 
-def _probe_is_ollama(root: str, *, timeout: float = 2.0) -> bool:
+def _probe_is_ollama(
+    root: str,
+    *,
+    timeout: float = 2.0,
+    headers: Optional[Dict[str, str]] = None,
+    params: Optional[Dict[str, Any]] = None,
+    verify: Any = None,
+) -> bool:
     """Positively identify Ollama via GET {root}/api/version. Cached per root.
 
     This is what keeps us from mis-routing other `provider="custom"` endpoints
     (vLLM / llama.cpp / LM Studio) — which have no /api/chat — to native mode.
 
-    Positive results are memoized for the process (an Ollama endpoint stays Ollama).
-    Negative results are cached only for a short TTL (`_NEG_PROBE_TTL`): a transient
-    blip (Ollama restart) recovers on the next probe after the TTL, while a persistent
-    misconfiguration (non-Ollama endpoint, or Ollama down) isn't re-probed on every
-    client construction — bounding the network round-trips on the hot path.
+    The probe sends the caller's auth headers / query params and honors the
+    caller's TLS ``verify`` — behind an authenticated reverse proxy or a private
+    CA an unconfigured probe would 401 / SSLError and native routing would
+    silently never engage for exactly the deployments that need it.
+
+    Definitive outcomes (positive, or provably-not-Ollama: 404 / wrong 200 shape)
+    are cached with the 1h `_VERSION_PROBE_TTL`: positives so a server swap on
+    the same port re-detects within the hour, definitive negatives so a
+    non-Ollama endpoint costs at most one probe per hour on the client-build
+    path. Indeterminate failures (transport blip, 401/403, 5xx) keep the short
+    `_NEG_PROBE_TTL` so a restarting Ollama or a fixed credential recovers
+    within a minute.
     """
     entry = _OLLAMA_PROBE_CACHE.get(root)
     if entry is not None:
@@ -75,30 +95,89 @@ def _probe_is_ollama(root: str, *, timeout: float = 2.0) -> bool:
         if expires_at is None or time.monotonic() < expires_at:
             return result
     ok = False
+    definitive_negative = False
     try:
-        resp = httpx.get(f"{root}/api/version", timeout=timeout)
-        # Validate the JSON shape ({"version": "<str>"}) rather than a substring
-        # match, so a non-Ollama server returning 200 text containing the word
-        # "version" can't false-positive into native routing.
-        ok = resp.status_code == 200 and isinstance(resp.json().get("version"), str)
-    except Exception as exc:  # network/timeout/non-ollama/non-JSON
+        kwargs: Dict[str, Any] = {"timeout": timeout}
+        if headers:
+            kwargs["headers"] = headers
+        if params:
+            kwargs["params"] = params
+        if verify is not None:
+            kwargs["verify"] = verify
+        resp = httpx.get(f"{root}/api/version", **kwargs)
+        if resp.status_code == 200:
+            # Validate the JSON shape ({"version": "<str>"}) rather than a
+            # substring match, so a non-Ollama server returning 200 text
+            # containing the word "version" can't false-positive into native
+            # routing. A 200 with the wrong shape is a definitive "not Ollama".
+            try:
+                ok = isinstance(resp.json().get("version"), str)
+            except Exception:
+                ok = False
+            definitive_negative = not ok
+        elif resp.status_code == 404:
+            # No /api/version route at all — definitive "not Ollama".
+            definitive_negative = True
+        elif resp.status_code in (401, 403):
+            # Indeterminate: the endpoint may be Ollama behind a misconfigured
+            # credential — keep the short retry TTL so a fixed key recovers fast.
+            logger.warning(
+                "Ollama /api/version probe got HTTP %s from %s — if this is an "
+                "authenticated Ollama endpoint, native routing stays disabled; "
+                "check the provider's api_key / extra_headers.",
+                resp.status_code,
+                root,
+            )
+    except Exception as exc:  # network/timeout — indeterminate
         logger.debug("Ollama /api/version probe failed for %s: %s", root, exc)
         ok = False
-    _OLLAMA_PROBE_CACHE[root] = (True, None) if ok else (False, time.monotonic() + _NEG_PROBE_TTL)
+    # Definitive answers (Ollama, or provably-not-Ollama) get the long TTL;
+    # indeterminate failures (transport blip, auth error, 5xx) get the short one
+    # so a transient outage (Ollama restarting) or a fixed credential recovers
+    # within a minute — and a weaker-credentialed caller can't poison the shared
+    # cache for long.
+    ttl = _VERSION_PROBE_TTL if (ok or definitive_negative) else _NEG_PROBE_TTL
+    _OLLAMA_PROBE_CACHE[root] = (ok, time.monotonic() + ttl)
     return ok
 
 
-def is_native_ollama_base_url(base_url: str) -> bool:
+def is_native_ollama_base_url(
+    base_url: str,
+    *,
+    api_key: Optional[str] = None,
+    default_headers: Optional[Dict[str, str]] = None,
+    default_query: Optional[Dict[str, Any]] = None,
+    verify: Any = None,
+) -> bool:
     """True when we should route this endpoint through native /api/chat.
 
     Gated on (a) the CI_HERMES_OLLAMA_NATIVE flag and (b) a positive Ollama
     identification via /api/version. Works whether the URL carries /v1 or not.
+
+    Pass the endpoint's auth material (``api_key`` / ``default_headers`` /
+    ``default_query``) and TLS ``verify`` so the probe can reach Ollama behind an
+    authenticated proxy or a private CA.
     """
     if not _flag_enabled():
         return False
     if not (base_url or "").strip():
         return False
-    return _probe_is_ollama(native_root(base_url))
+    headers: Dict[str, Any] = {}
+    if api_key and api_key != "ollama":
+        headers["Authorization"] = f"Bearer {api_key}"
+    if isinstance(default_headers, dict):
+        for k, v in default_headers.items():
+            # Same str/bytes filter as the client's _headers(): forward exactly
+            # the header values the real requests would carry (SDK Omit()/NotGiven
+            # sentinels are dropped), so probe auth matches request auth.
+            if isinstance(k, str) and isinstance(v, (str, bytes)):
+                headers.setdefault(k, v)
+    return _probe_is_ollama(
+        native_root(base_url),
+        headers=headers or None,
+        params=dict(default_query) if isinstance(default_query, dict) else None,
+        verify=verify,
+    )
 
 
 # Cache of (root, model) -> (supports_thinking, expires_at_monotonic_or_None).
@@ -134,6 +213,21 @@ def _coerce_text(content: Any) -> Tuple[str, List[str]]:
                 url = ((part.get("image_url") or {}).get("url")) if isinstance(part.get("image_url"), dict) else None
                 if isinstance(url, str) and url.startswith("data:") and "," in url:
                     images.append(url.split(",", 1)[1])  # strip data:...;base64,
+                elif isinstance(url, str) and url.startswith("data:"):
+                    # Malformed data: URL (no comma separator) — never splice the
+                    # potentially multi-MB base64 blob into the message text.
+                    logger.warning("Dropping malformed data: image URL (no comma separator)")
+                elif isinstance(url, str) and url:
+                    # Native /api/chat only accepts base64 images; a remote
+                    # http(s) URL can't be forwarded. Keep a visible marker in the
+                    # text and log, so the model isn't silently asked about an
+                    # image it never got.
+                    texts.append(f"[Image: {url[:200]}]")
+                    logger.warning(
+                        "Dropping non-base64 image_url for native Ollama "
+                        "(/api/chat requires base64 data: URLs): %s",
+                        url[:120],
+                    )
         return "".join(texts), images
     return str(content), []
 
@@ -368,6 +462,13 @@ def _make_stream_chunk(
 
 def translate_stream_line(line: Dict[str, Any], model: str, tool_idx: Dict[str, int]) -> List[_OllamaStreamChunk]:
     """Translate one Ollama NDJSON object into zero+ OpenAI-style chunks."""
+    # Ollama reports mid-stream failures (runner OOM, model crash) as an in-band
+    # {"error": "<str>"} frame on the already-200 stream. Surface the message —
+    # silently dropping the frame would end the stream looking like a clean close
+    # and lose the actual reason.
+    err = line.get("error")
+    if err:
+        raise OllamaAPIError(f"Ollama stream error: {str(err)[:500]}")
     chunks: List[_OllamaStreamChunk] = []
     msg = line.get("message") or {}
 
@@ -443,10 +544,12 @@ class OllamaAPIError(Exception):
 
 def _http_error(response: httpx.Response) -> OllamaAPIError:
     # Ollama's native API reports failures as {"error": "<str>"} — surface that
-    # message directly instead of the raw JSON blob; fall back to raw body text.
+    # message directly instead of the raw JSON blob; fall back to raw body text
+    # (an empty/unreadable body yields the "<unreadable>" sentinel, never a bare
+    # trailing colon in the message).
     body = "<unreadable>"
     try:
-        body = response.text[:500]
+        body = (response.text or "")[:500] or "<unreadable>"
         parsed = response.json()
         if isinstance(parsed, dict) and isinstance(parsed.get("error"), str):
             body = parsed["error"][:500]
@@ -489,6 +592,7 @@ class OllamaNativeClient:
         api_key: Optional[str] = None,
         base_url: Optional[str] = None,
         default_headers: Optional[Dict[str, str]] = None,
+        default_query: Optional[Dict[str, Any]] = None,
         timeout: Any = None,
         http_client: Optional[httpx.Client] = None,
         **_: Any,
@@ -496,6 +600,10 @@ class OllamaNativeClient:
         self.api_key = api_key or "ollama"
         self.base_url = native_root(base_url or "http://127.0.0.1:11434")
         self._default_headers = dict(default_headers or {})
+        # Query params the host extracted from a query-bearing base_url (URL-token
+        # auth, api-version params). The stock OpenAI client appends them to every
+        # request; mirror that or such gateways 401 on the native path.
+        self._default_query = dict(default_query or {})
         self.chat = _ChatNamespace(self)
         self.embeddings = _Embeddings(self)
         self.is_closed = False
@@ -553,8 +661,14 @@ class OllamaNativeClient:
         given, else our long default — so a request never silently falls back to
         httpx's 5s default (which applies when an external http_client was injected
         without one). Passing ``timeout=None`` to httpx DISABLES the timeout, which
-        we never want."""
-        return {"timeout": timeout if timeout is not None else self._default_timeout}
+        we never want. Also carries the client's default_query so URL-param auth
+        reaches every native request (the stock OpenAI client's behavior)."""
+        kwargs: Dict[str, Any] = {
+            "timeout": timeout if timeout is not None else self._default_timeout
+        }
+        if self._default_query:
+            kwargs["params"] = self._default_query
+        return kwargs
 
     def _model_supports_thinking(self, model: str) -> bool:
         """Whether the model advertises the "thinking" capability via /api/show.
@@ -580,6 +694,7 @@ class OllamaNativeClient:
                 f"{self.base_url}/api/show",
                 json={"model": model},
                 headers=self._headers(),
+                params=self._default_query or None,
                 timeout=2.0,
             )
             if resp.status_code == 200:
@@ -667,25 +782,27 @@ class OllamaNativeClient:
         url = f"{self.base_url}/api/chat"
 
         def _generator() -> Iterator[_OllamaStreamChunk]:
+            # Transport errors (ReadTimeout, ConnectError, RemoteProtocolError, ...)
+            # deliberately propagate with their concrete httpx types: Hermes's
+            # streaming worker classifies mid-stream reconnects on isinstance
+            # checks against those exact types, so wrapping them in OllamaAPIError
+            # would silently disable reconnects and misclassify a dropped peer.
             tool_idx: Dict[str, int] = {"n": 0}
-            try:
-                with self._http.stream("POST", url, json=request, headers=self._headers(), **self._timeout_kwargs(timeout)) as resp:
-                    if resp.status_code != 200:
-                        resp.read()
-                        raise _http_error(resp)
-                    for raw_line in resp.iter_lines():
-                        if not raw_line:
-                            continue
-                        try:
-                            obj = json.loads(raw_line)
-                        except (json.JSONDecodeError, TypeError):
-                            logger.debug("Non-JSON Ollama stream line: %s", str(raw_line)[:200])
-                            continue
-                        if isinstance(obj, dict):
-                            for chunk in translate_stream_line(obj, model, tool_idx):
-                                yield chunk
-            except httpx.HTTPError as exc:
-                raise OllamaAPIError(f"Ollama streaming request failed: {exc}") from exc
+            with self._http.stream("POST", url, json=request, headers=self._headers(), **self._timeout_kwargs(timeout)) as resp:
+                if resp.status_code != 200:
+                    resp.read()
+                    raise _http_error(resp)
+                for raw_line in resp.iter_lines():
+                    if not raw_line:
+                        continue
+                    try:
+                        obj = json.loads(raw_line)
+                    except (json.JSONDecodeError, TypeError):
+                        logger.debug("Non-JSON Ollama stream line: %s", str(raw_line)[:200])
+                        continue
+                    if isinstance(obj, dict):
+                        for chunk in translate_stream_line(obj, model, tool_idx):
+                            yield chunk
 
         return _generator()
 

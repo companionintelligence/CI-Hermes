@@ -63,11 +63,46 @@ def _patch_runtime(module) -> None:
             # fall through to the original unchanged (no exception, no warning spam).
             if isinstance(client_kwargs, dict):
                 base_url = str(client_kwargs.get("base_url", "") or "")
-                if base_url and is_native_ollama_base_url(base_url):
+                # Give the probe the same auth material and TLS trust the real
+                # client will use — an unauthenticated / default-trust probe would
+                # 401 or SSLError behind an authenticated proxy or a private CA
+                # and native routing would silently never engage. Only resolve
+                # verify when custom TLS settings are actually present, so the
+                # resolver's "verification DISABLED" warning isn't duplicated on
+                # every unrelated client build.
+                verify = None
+                if base_url and (
+                    client_kwargs.get("ssl_ca_cert") is not None
+                    or client_kwargs.get("ssl_verify") is not None
+                ):
+                    try:
+                        from agent.ssl_verify import resolve_httpx_verify
+
+                        verify = resolve_httpx_verify(
+                            ca_bundle=client_kwargs.get("ssl_ca_cert"),
+                            ssl_verify=client_kwargs.get("ssl_verify"),
+                        )
+                    except Exception:
+                        verify = None
+                if base_url and is_native_ollama_base_url(
+                    base_url,
+                    api_key=client_kwargs.get("api_key"),
+                    default_headers=client_kwargs.get("default_headers"),
+                    default_query=client_kwargs.get("default_query"),
+                    verify=verify,
+                ):
                     safe = {
                         k: v
                         for k, v in client_kwargs.items()
-                        if k in {"api_key", "base_url", "default_headers", "timeout", "http_client"}
+                        if k
+                        in {
+                            "api_key",
+                            "base_url",
+                            "default_headers",
+                            "default_query",
+                            "timeout",
+                            "http_client",
+                        }
                     }
                     # Mirror stock create_openai_client: give the native client the
                     # agent's keepalive http_client (TCP keepalives → dead-peer
@@ -77,7 +112,20 @@ def _patch_runtime(module) -> None:
                     if "http_client" not in safe:
                         try:
                             builder = getattr(agent, "_build_keepalive_http_client", None)
-                            keepalive = builder(base_url) if callable(builder) else None
+                            keepalive = None
+                            if callable(builder):
+                                # The REAL client must carry the same TLS trust
+                                # the probe used — otherwise a private-CA endpoint
+                                # passes the probe and then SSLErrors on every
+                                # request. Fall back for older builder signatures.
+                                try:
+                                    keepalive = (
+                                        builder(base_url, verify=verify)
+                                        if verify is not None
+                                        else builder(base_url)
+                                    )
+                                except TypeError:
+                                    keepalive = builder(base_url)
                             if keepalive is not None:
                                 safe["http_client"] = keepalive
                         except Exception:
@@ -125,11 +173,21 @@ def _native_swap(client):
         base = str(getattr(client, "base_url", "") or "")
     except Exception:
         base = ""
-    if not base or not is_native_ollama_base_url(base):
-        return None
     api_key = getattr(client, "api_key", None)
     if not isinstance(api_key, str) or not api_key:
         api_key = "ollama"
+    probe_headers = getattr(client, "default_headers", None)
+    if not isinstance(probe_headers, dict):
+        probe_headers = None
+    # The OpenAI SDK stores default_query privately as _custom_query — forward it
+    # so URL-token auth reaches both the probe and every aux native request.
+    probe_query = getattr(client, "_custom_query", None)
+    if not isinstance(probe_query, dict):
+        probe_query = None
+    if not base or not is_native_ollama_base_url(
+        base, api_key=api_key, default_headers=probe_headers, default_query=probe_query
+    ):
+        return None
     is_async = False
     try:
         import openai
@@ -147,7 +205,13 @@ def _native_swap(client):
     default_headers = getattr(client, "default_headers", None)
     if not isinstance(default_headers, dict):
         default_headers = None
-    sync = OllamaNativeClient(base_url=base, api_key=api_key, timeout=timeout, default_headers=default_headers)
+    sync = OllamaNativeClient(
+        base_url=base,
+        api_key=api_key,
+        timeout=timeout,
+        default_headers=default_headers,
+        default_query=probe_query,
+    )
     return AsyncOllamaNativeClient(sync) if is_async else sync
 
 
@@ -211,6 +275,70 @@ def _patch_aux(module) -> None:
             logger.info("CI ollama-native: Hook 2 installed (%s)", fname)
 
 
+def _named_custom_is_ollama(name: str) -> bool:
+    """Best-effort: is the "custom:<slug>" instance's endpoint actually Ollama?
+
+    Resolves the slug to its config.yaml `custom_providers` entry, then runs the
+    cached /api/version probe on its base_url. Fails OPEN (True) when the config
+    or entry can't be resolved — this shim is an explicit Ollama opt-in, so an
+    unresolvable instance is far more likely an Ollama one than not — and fails
+    CLOSED only on a positive "this endpoint is not Ollama" probe answer.
+    """
+    try:
+        from hermes_cli.config import load_config_readonly
+        from hermes_cli.providers import custom_provider_slug
+
+        import ollama_native_adapter as adapter
+        from ollama_native_adapter import is_native_ollama_base_url
+
+        name = str(name).strip().lower()  # match upstream's normalized slugs
+        cfg = load_config_readonly() or {}
+        # Prefer upstream's schema-merging accessor (legacy custom_providers list
+        # + the keyed providers: form); fall back to the raw legacy list.
+        try:
+            from hermes_cli.config import get_compatible_custom_providers
+
+            entries = get_compatible_custom_providers(cfg) or []
+        except Exception:
+            entries = cfg.get("custom_providers") or []
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            if custom_provider_slug(str(entry.get("name") or "")) != name:
+                continue
+            base = str(entry.get("base_url") or entry.get("url") or entry.get("api") or "")
+            if not base:
+                break
+            # Use the entry's full auth material: api_key (or its key_env
+            # env var) and any extra_headers (Cloudflare Access / proxy auth).
+            api_key = str(entry.get("api_key") or "") or None
+            if not api_key and entry.get("key_env"):
+                api_key = os.environ.get(str(entry.get("key_env"))) or None
+            extra_headers = entry.get("extra_headers")
+            ok = is_native_ollama_base_url(
+                base,
+                api_key=api_key,
+                default_headers=extra_headers if isinstance(extra_headers, dict) else None,
+            )
+            if ok:
+                return True
+            # A negative can be definitive (404 / wrong-shape 200 → long TTL) or
+            # indeterminate (auth/TLS/transport failure → short TTL). Fail CLOSED
+            # only on definitive "not Ollama"; stay open on indeterminate so an
+            # authenticated instance this helper can't fully authenticate against
+            # doesn't lose its num_ctx injection.
+            entry_cached = adapter._OLLAMA_PROBE_CACHE.get(adapter.native_root(base))
+            if entry_cached is not None:
+                _, expires_at = entry_cached
+                remaining = (expires_at or 0) - adapter.time.monotonic()
+                if remaining > adapter._NEG_PROBE_TTL:
+                    return False  # definitive non-Ollama
+            return True
+    except Exception:
+        pass
+    return True
+
+
 def _patch_profiles(module) -> None:
     """Hook 3 — resolve a named custom instance ("custom:<name>") to the "custom"
     provider profile so the request-builder injects num_ctx for it.
@@ -228,7 +356,14 @@ def _patch_profiles(module) -> None:
         profile = orig(name, *a, **k)
         try:
             if profile is None and _truthy(_FLAG) and str(name).startswith("custom:"):
-                return orig("custom", *a, **k)
+                # Only resolve to the "custom" profile when the named instance's
+                # endpoint actually is Ollama: the profile injects
+                # max_tokens/reasoning fields that non-Ollama /v1 gateways
+                # (vLLM, corp proxies) reject with HTTP 400. Best-effort: if the
+                # instance's base_url can't be resolved from config, fail open
+                # toward Ollama (this shim is an Ollama-targeting opt-in).
+                if _named_custom_is_ollama(str(name)):
+                    return orig("custom", *a, **k)
         except Exception as exc:
             logger.warning("CI ollama-native Hook 3 failed; using original: %s", exc)
         return profile
