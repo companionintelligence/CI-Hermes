@@ -66,21 +66,20 @@ def _patch_runtime(module) -> None:
                 # Give the probe the same auth material and TLS trust the real
                 # client will use — an unauthenticated / default-trust probe would
                 # 401 or SSLError behind an authenticated proxy or a private CA
-                # and native routing would silently never engage. Only resolve
-                # verify when custom TLS settings are actually present, so the
-                # resolver's "verification DISABLED" warning isn't duplicated on
-                # every unrelated client build.
+                # and native routing would silently never engage. Resolve verify
+                # unconditionally (like stock create_openai_client): the resolver
+                # also honors the HERMES_CA_BUNDLE / SSL_CERT_FILE / *_CA_BUNDLE
+                # env vars, which never appear in client_kwargs, and it only
+                # warns when ssl_verify is explicitly disabled.
                 verify = None
-                if base_url and (
-                    client_kwargs.get("ssl_ca_cert") is not None
-                    or client_kwargs.get("ssl_verify") is not None
-                ):
+                if base_url:
                     try:
                         from agent.ssl_verify import resolve_httpx_verify
 
                         verify = resolve_httpx_verify(
                             ca_bundle=client_kwargs.get("ssl_ca_cert"),
                             ssl_verify=client_kwargs.get("ssl_verify"),
+                            base_url=base_url,
                         )
                     except Exception:
                         verify = None
@@ -117,15 +116,23 @@ def _patch_runtime(module) -> None:
                                 # The REAL client must carry the same TLS trust
                                 # the probe used — otherwise a private-CA endpoint
                                 # passes the probe and then SSLErrors on every
-                                # request. Fall back for older builder signatures.
+                                # request. Detect older builder signatures by
+                                # inspection instead of catching TypeError, which
+                                # would also swallow a TypeError raised inside the
+                                # builder and silently drop the custom trust.
+                                import inspect
+
                                 try:
-                                    keepalive = (
-                                        builder(base_url, verify=verify)
-                                        if verify is not None
-                                        else builder(base_url)
+                                    accepts_verify = (
+                                        "verify" in inspect.signature(builder).parameters
                                     )
-                                except TypeError:
-                                    keepalive = builder(base_url)
+                                except (TypeError, ValueError):
+                                    accepts_verify = False
+                                keepalive = (
+                                    builder(base_url, verify=verify)
+                                    if (verify is not None and accepts_verify)
+                                    else builder(base_url)
+                                )
                             if keepalive is not None:
                                 safe["http_client"] = keepalive
                         except Exception:
@@ -309,16 +316,44 @@ def _named_custom_is_ollama(name: str) -> bool:
             base = str(entry.get("base_url") or entry.get("url") or entry.get("api") or "")
             if not base:
                 break
+            # A config base_url may carry query params (URL-token auth) — split
+            # them off so the probe URL stays well-formed and the token still
+            # reaches the probe as query params (mirrors agent_init's query
+            # extraction for the real client; native_root() only strips /v1).
+            query = None
+            if "?" in base:
+                from urllib.parse import parse_qsl, urlsplit
+
+                parts = urlsplit(base)
+                query = dict(parse_qsl(parts.query)) or None
+                base = parts._replace(query="", fragment="").geturl()
             # Use the entry's full auth material: api_key (or its key_env
             # env var) and any extra_headers (Cloudflare Access / proxy auth).
             api_key = str(entry.get("api_key") or "") or None
             if not api_key and entry.get("key_env"):
                 api_key = os.environ.get(str(entry.get("key_env"))) or None
             extra_headers = entry.get("extra_headers")
+            # TLS trust: the entry's own ssl fields, falling back to the
+            # HERMES_CA_BUNDLE / SSL_CERT_FILE / *_CA_BUNDLE env vars the
+            # resolver reads — a private-CA endpoint must not probe-fail as
+            # indeterminate on every get_provider_profile call.
+            verify = None
+            try:
+                from agent.ssl_verify import resolve_httpx_verify
+
+                verify = resolve_httpx_verify(
+                    ca_bundle=entry.get("ssl_ca_cert"),
+                    ssl_verify=entry.get("ssl_verify"),
+                    base_url=base,
+                )
+            except Exception:
+                verify = None
             ok = is_native_ollama_base_url(
                 base,
                 api_key=api_key,
                 default_headers=extra_headers if isinstance(extra_headers, dict) else None,
+                default_query=query,
+                verify=verify,
             )
             if ok:
                 return True

@@ -169,9 +169,12 @@ def is_native_ollama_base_url(
         for k, v in default_headers.items():
             # Same str/bytes filter as the client's _headers(): forward exactly
             # the header values the real requests would carry (SDK Omit()/NotGiven
-            # sentinels are dropped), so probe auth matches request auth.
+            # sentinels are dropped). default_headers OVERRIDE the api_key-derived
+            # Authorization, matching _headers() precedence — so a placeholder
+            # api_key plus real gateway auth in extra_headers probes with the
+            # same credentials the real requests will send.
             if isinstance(k, str) and isinstance(v, (str, bytes)):
-                headers.setdefault(k, v)
+                headers[k] = v
     return _probe_is_ollama(
         native_root(base_url),
         headers=headers or None,
@@ -211,9 +214,11 @@ def _coerce_text(content: Any) -> Tuple[str, List[str]]:
                 texts.append(part["text"])
             elif ptype == "image_url":
                 url = ((part.get("image_url") or {}).get("url")) if isinstance(part.get("image_url"), dict) else None
-                if isinstance(url, str) and url.startswith("data:") and "," in url:
+                # RFC 2397 scheme matching is case-insensitive; compare a bounded
+                # lowered prefix so a multi-MB base64 URL isn't copied to lower it.
+                if isinstance(url, str) and url[:5].lower() == "data:" and "," in url:
                     images.append(url.split(",", 1)[1])  # strip data:...;base64,
-                elif isinstance(url, str) and url.startswith("data:"):
+                elif isinstance(url, str) and url[:5].lower() == "data:":
                     # Malformed data: URL (no comma separator) — never splice the
                     # potentially multi-MB base64 blob into the message text.
                     logger.warning("Dropping malformed data: image URL (no comma separator)")
@@ -552,7 +557,9 @@ def _http_error(response: httpx.Response) -> OllamaAPIError:
         body = (response.text or "")[:500] or "<unreadable>"
         parsed = response.json()
         if isinstance(parsed, dict) and isinstance(parsed.get("error"), str):
-            body = parsed["error"][:500]
+            # An empty error string would resurrect the bare colon — keep the
+            # raw body (e.g. '{"error": ""}') as the more useful diagnostic.
+            body = parsed["error"][:500] or body
     except Exception:
         pass  # non-JSON body: keep the raw text captured above
     return OllamaAPIError(
