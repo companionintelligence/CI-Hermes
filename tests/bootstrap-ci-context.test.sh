@@ -16,6 +16,24 @@ SCRIPT="${HERE}/../bootstrap-ci-context.sh"
 PASS=0
 FAIL=0
 
+# GNU `stat -c` / `touch -d` are not portable to macOS (BSD). Prefer GNU when
+# present, otherwise use BSD forms so `pnpm test` works on contributor laptops.
+file_mtime() {
+  if stat -c %Y "$1" >/dev/null 2>&1; then
+    stat -c %Y "$1"
+  else
+    stat -f %m "$1"
+  fi
+}
+
+set_mtime() {
+  local path="$1"
+  if touch -d '2020-01-01 00:00:00' "$path" 2>/dev/null; then
+    return 0
+  fi
+  touch -t 202001010000 "$path"
+}
+
 assert_eq() {
   local label="$1" want="$2" got="$3"
   if [[ "${want}" == "${got}" ]]; then
@@ -356,10 +374,10 @@ data_dir="$(mktemp -d)"
 printf 'model:\n  provider: ollama\n' > "${data_dir}/config.yaml"
 printf 'HERMES_NUM_CTX=65536\n' > "${data_dir}/.env.hub-bootstrap"
 run_bootstrap "${data_dir}" "${CREDS[@]}"
-touch -d '2020-01-01 00:00:00' "${data_dir}/config.yaml"
-before="$(stat -c %Y "${data_dir}/config.yaml")"
+set_mtime "${data_dir}/config.yaml"
+before="$(file_mtime "${data_dir}/config.yaml")"
 run_bootstrap "${data_dir}" "${CREDS[@]}"
-after="$(stat -c %Y "${data_dir}/config.yaml")"
+after="$(file_mtime "${data_dir}/config.yaml")"
 assert_eq "config.yaml not rewritten when unchanged (mtime preserved)" "${before}" "${after}"
 rm -rf "${data_dir}"
 
