@@ -82,10 +82,15 @@ on:
         default: false
         type: boolean
 
-# Keyed on the tag, and never cancel-in-progress: a cancelled publish leaves a tag
-# whose artifacts are only half there.
+# One publish in flight per release, and never cancel-in-progress: a cancelled publish
+# leaves a tag whose artifacts are only half there.
+#
+# The key has to vary by trigger. `github.ref_name` is the tag on a tag push, but on a
+# `workflow_run` it resolves to the BRANCH the tagger ran on — so every bot-cut release
+# would land in one `npm-publish-master` group and queue behind the previous one. The
+# triggering run's head SHA identifies the release commit instead.
 concurrency:
-  group: npm-publish-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+  group: npm-publish-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.ref_name }}
   cancel-in-progress: false
 
 permissions:
