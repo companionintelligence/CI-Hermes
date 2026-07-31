@@ -75,3 +75,12 @@ jobs:
 
       - name: Shell tests
         run: npm run test:sh
+
+      # The memory plugin's own suite — 77 stdlib-unittest tests that stub the Hermes
+      # base class so the module imports standalone. Nothing in this repo ran them
+      # before, and this is the PR that starts publishing that exact code to a public
+      # registry, so gating the packaging while leaving the packaged code untested
+      # would guard the wrong half. No dependencies, ~10ms.
+      - name: Memory plugin tests
+        working-directory: ci-context/plugins/companionintelligence
+        run: python3 -m unittest discover -p '*_test.py' --verbose

@@ -93,8 +93,13 @@ would rather set them directly.
 narrowed with environment variables, all enabled by default:
 `CI_MEMORY_CONTEXT_ENABLED`, `CI_MEMORY_RECALL_ENABLED`, `CI_MEMORY_TURN_ENABLED`,
 `CI_MEMORY_WRITE_ENABLED`, `CI_INTENTS_ENABLED`, `CI_INTENT_TOOLS_ENABLED`. Set any to
-`false` to disable that behaviour. `CI_SERVER_ENABLED=false` turns the whole
-integration off without removing it.
+`false` to disable that behaviour.
+
+To stop the integration entirely without uninstalling, clear `memory.provider` in
+`config.yaml` and disable `companionintelligence` on the `/plugins` page. Setting
+every flag above to `false` also works. (`CI_SERVER_ENABLED` is **not** an
+off-switch here — it is read only by the packaged Companion Intelligence appliance,
+not by this plugin, so on a stock install it has no effect.)
 
 ## What it talks to
 

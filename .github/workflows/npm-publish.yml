@@ -1,8 +1,11 @@
 name: Publish memory plugin
 
-# Same trigger as docker-publish.yml, deliberately: a release tag is the release, and
-# the plugin and the image are two artifacts of it. One ritual — push the tag, verify
-# the artifacts — rather than a second, dispatch-only mechanism nobody remembers.
+# Fires on release tags, like docker-publish.yml, deliberately: a release tag is the
+# release, and the plugin and the image are two artifacts of it. One ritual — push the
+# tag, verify the artifacts — rather than a second, dispatch-only mechanism nobody
+# remembers. The globs are not identical: docker-publish.yml matches `*` (any tag),
+# this one only the release shape, so a scratch tag builds an image without also
+# reaching the registry. Every tag cut so far matches both.
 #
 # Hermes has no plugin registry, so the artifact is a tarball users extract into
 # $HERMES_HOME/plugins/. It is published to the npm registry purely as versioned
@@ -47,6 +50,18 @@ name: Publish memory plugin
 # NPM_CONFIG_PROVENANCE=false. Not adopted here because it is unverified for this
 # repo's shape; the token path above is known to work.
 on:
+  # Two triggers, because one is not enough in this repo. Release tags are normally
+  # pushed by tag-on-hermes-merge.yml using the default GITHUB_TOKEN, and GitHub
+  # deliberately does NOT start workflows from events a GITHUB_TOKEN created — so a
+  # bot release would fire `push: tags` for nobody and the plugin would never
+  # publish while the image did. docker-publish.yml carries the same workflow_run
+  # fallback for exactly this reason; omitting it here made the header's "same
+  # trigger as docker-publish.yml" claim false in the most expensive way.
+  workflow_run:
+    workflows:
+      - "Tag CI-Hermes Version On Merge"
+    types:
+      - completed
   push:
     tags:
       # Release tags are vYYYY.M.D with an optional same-day suffix (v2026.7.7.2 is
@@ -78,13 +93,20 @@ permissions:
 jobs:
   # Gate on the same suite that gates pull requests, run against the exact ref being
   # published, so the tested tree and the packed tree are the same commit.
+  #
+  # The ref is fully qualified as refs/tags/... on the dispatch path. actions/checkout
+  # resolves a BARE name as a branch before it tries a tag, so `ref: <input>` would
+  # check out a branch that shadows the tag — and the rev-parse guard further down
+  # would then happily confirm the tag exists while the tree under test came from the
+  # branch. Naming the ref refs/tags/... removes the ambiguity at the source.
   test:
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
     name: Tests
     uses: ./.github/workflows/ci.yml
     permissions:
       contents: read
     with:
-      ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+      ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.tag) || (github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.ref) }}
 
   publish:
     needs: test
@@ -95,7 +117,8 @@ jobs:
       - name: Checkout the tag being published
         uses: actions/checkout@v4
         with:
-          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+          # refs/tags/... rather than a bare name — see the note on the test job.
+          ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.tag) || (github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.ref) }}
           # Tags are needed so the next step can prove the dispatch input names a real
           # tag rather than a branch.
           fetch-depth: 0
@@ -129,7 +152,13 @@ jobs:
         run: |
           set -euo pipefail
 
-          if [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
+          if [[ "${GITHUB_EVENT_NAME}" == "workflow_run" ]]; then
+            # The tagger just pushed a tag at this commit; find it. Same derivation
+            # docker-publish.yml uses on its workflow_run path.
+            tag="$(git tag --points-at HEAD | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+' | head -n1 || true)"
+            [[ -n "${tag}" ]] \
+              || { echo "::notice::no release tag points at this commit; nothing to publish"; echo "skip=true" >> "$GITHUB_OUTPUT"; exit 0; }
+          elif [[ "${GITHUB_EVENT_NAME}" == "workflow_dispatch" ]]; then
             tag="${INPUT_TAG}"
             # Without this, `ref: <input>` happily checks out a BRANCH. Anyone with
             # write access could push a branch named v9999.1.1, dispatch, and publish
@@ -165,9 +194,11 @@ jobs:
 
       - name: Decide whether this release changes the plugin
         id: decide
+        if: steps.version.outputs.skip != 'true'
         env:
           PACKAGE: "@companionintelligence/hermes-memory"
           VERSION: ${{ steps.version.outputs.version }}
+          RELEASE_TAG: ${{ steps.version.outputs.tag }}
         run: |
           set -euo pipefail
           candidate="$(scripts/pack-memory-plugin.sh --pack --version "${VERSION}" --out "${RUNNER_TEMP}/candidate")"
@@ -197,10 +228,18 @@ jobs:
           # A rerun of an already-published tag must be a no-op rather than a failed
           # publish: npm rejects a duplicate version, and that failure would read as a
           # broken release rather than "already done".
-          if npm view "${PACKAGE}@${VERSION}" version >/dev/null 2>&1; then
+          # Same discrimination as above rather than `>/dev/null 2>&1`: swallowing a
+          # 5xx here would read as "not published yet" and turn a rerun of a finished
+          # release into a duplicate-version publish failure — the exact outcome this
+          # guard exists to prevent.
+          if npm view "${PACKAGE}@${VERSION}" version >/dev/null 2>"${RUNNER_TEMP}/view2.err"; then
             echo "publish=false" >> "$GITHUB_OUTPUT"
             echo "::notice::${PACKAGE}@${VERSION} is already published; nothing to do."
             exit 0
+          elif ! grep -qiE 'E404|is not in this registry|404 Not Found' "${RUNNER_TEMP}/view2.err"; then
+            echo "::error::could not query the registry for ${PACKAGE}@${VERSION}"
+            cat "${RUNNER_TEMP}/view2.err"
+            exit 1
           fi
 
           # `npm pack --pack-destination` does NOT create a missing directory: it
@@ -220,14 +259,43 @@ jobs:
           case "${status}" in
             0)
               echo "publish=false" >> "$GITHUB_OUTPUT"
-              echo "::notice::Plugin is identical to ${PACKAGE}@${published_latest}; skipping the publish for ${{ steps.version.outputs.tag }}. This is an image-only release."
+              echo "::notice::Plugin is identical to ${PACKAGE}@${published_latest}; skipping the publish for ${RELEASE_TAG}. This is an image-only release."
               ;;
             1)
               echo "publish=true" >> "$GITHUB_OUTPUT"
               echo "::notice::Plugin changed since ${published_latest}; publishing ${VERSION}."
               # npm publish always claims the `latest` dist-tag. Republishing an OLD
               # tag by dispatch therefore repoints `latest` at older plugin code.
-              newest="$(printf '%s\n%s\n' "${published_latest}" "${VERSION}" | sort -V | tail -n1)"
+              #
+              # Compared with semver precedence, not `sort -V`. They disagree on exactly
+              # the versions this repo mints: `sort -V` ranks 2026.7.7-2 ABOVE 2026.7.7,
+              # semver ranks it below. That inverted the warning on the same-day-suffix
+              # case the version mapper exists to support — silent when `latest` really
+              # did move backwards, noisy when it did not.
+              newest="$(VERSION="${VERSION}" PUBLISHED="${published_latest}" node -e '
+                const parse = (v) => {
+                  const s = String(v);
+                  // Split on the FIRST hyphen only: a prerelease may itself contain
+                  // hyphens (2026.8.1-rc-1), and split("-", 2) would silently drop the
+                  // tail rather than keep it.
+                  const i = s.indexOf("-");
+                  const core = (i < 0 ? s : s.slice(0, i)).split(".").map(Number);
+                  return { core, pre: i < 0 ? undefined : s.slice(i + 1) };
+                };
+                const cmp = (a, b) => {
+                  const x = parse(a), y = parse(b);
+                  for (let i = 0; i < 3; i++) {
+                    if ((x.core[i] || 0) !== (y.core[i] || 0)) return (x.core[i] || 0) - (y.core[i] || 0);
+                  }
+                  // A release outranks any prerelease of the same core version.
+                  if (x.pre === undefined && y.pre !== undefined) return 1;
+                  if (x.pre !== undefined && y.pre === undefined) return -1;
+                  if (x.pre === y.pre) return 0;
+                  return String(x.pre) < String(y.pre) ? -1 : 1;
+                };
+                const v = process.env.VERSION, p = process.env.PUBLISHED;
+                console.log(cmp(v, p) >= 0 ? v : p);
+              ')"
               if [[ "${newest}" != "${VERSION}" ]]; then
                 echo "::warning::${VERSION} sorts below the currently published ${published_latest}. Publishing will move the npm 'latest' tag BACKWARDS to this older release."
               fi
@@ -248,6 +316,10 @@ jobs:
           # Publish the tarball that was compared, not a fresh pack, so the artifact
           # on the registry is exactly the one the decision was made about.
           tarball="$(find "${RUNNER_TEMP}/candidate" -name '*.tgz' -print -quit)"
+          # Guarded like the published-tarball lookup above. `npm publish ""` does not
+          # fail cleanly: npm resolves the empty spec to the registry package literally
+          # named `undefined` and tries to publish that.
+          [[ -n "${tarball}" ]] || { echo "::error::no packed tarball in ${RUNNER_TEMP}/candidate"; exit 1; }
           npm publish "${tarball}" --access public
           echo "Published ${VERSION}"
 
@@ -263,7 +335,12 @@ jobs:
           url="https://registry.npmjs.org/@companionintelligence/hermes-memory/-/hermes-memory-${VERSION}.tgz"
           for attempt in 1 2 3 4 5; do
             if curl -fsSL "${url}" -o "${RUNNER_TEMP}/published-check.tgz"; then
-              tar -tzf "${RUNNER_TEMP}/published-check.tgz" | grep -qx 'package/plugin.yaml'
+              # Listed into a variable rather than piped into `grep -q`. Under pipefail
+              # a `grep -q` that matches early closes the pipe, tar dies of SIGPIPE, and
+              # the 141 fails this step even though the check passed.
+              contents="$(tar -tzf "${RUNNER_TEMP}/published-check.tgz")"
+              grep -qxF 'package/plugin.yaml' <<<"${contents}" \
+                || { echo "::error::${url} does not contain package/plugin.yaml"; exit 1; }
               echo "Confirmed ${url} downloads and contains plugin.yaml."
               exit 0
             fi

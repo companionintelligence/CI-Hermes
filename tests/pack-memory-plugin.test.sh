@@ -26,7 +26,13 @@ PLUGIN_DIR="${HERE}/../ci-context/plugins/companionintelligence"
 PASS=0
 FAIL=0
 WORK="$(mktemp -d)"
-trap 'rm -rf "${WORK}"' EXIT
+# The allowlist probe below is the one thing this suite writes OUTSIDE its temp dir —
+# it has to land in the real plugin directory to be seen by the check under test. So
+# it is cleaned up by the same trap: interrupt the suite (Ctrl-C, a cancelled CI job)
+# between creating and removing it and it stays in the checkout, after which every
+# subsequent `--pack` fails with exit 2 until somebody works out why.
+STRAY="${PLUGIN_DIR}/__packaging_probe.py"
+trap 'rm -rf "${WORK}"; rm -f "${STRAY}"' EXIT
 
 assert_eq() {
   local label="$1" want="$2" got="$3"
@@ -70,6 +76,13 @@ assert_eq "plain CalVer passes through" "2026.7.29" "$("${SCRIPT}" --npm-version
 assert_eq "same-day suffix becomes a prerelease" "2026.7.7-2" "$("${SCRIPT}" --npm-version 2026.7.7.2)"
 assert_eq "a leading v is tolerated" "2026.8.1" "$("${SCRIPT}" --npm-version v2026.8.1)"
 assert_eq "a non-release tag is a setup error" "2" "$(run_status "${SCRIPT}" --npm-version latest)"
+assert_eq "a zero-padded tag is refused" "2" "$(run_status "${SCRIPT}" --npm-version v2026.08.01)"
+# The two validators must agree. They did not: npm_version allowed a hyphen inside the
+# prerelease and --pack did not, so v2026.8.1-rc-1 mapped cleanly and then failed the
+# pack — after the whole CI gate had run. Assert the round trip, not each half.
+assert_eq "a hyphenated prerelease maps" "2026.8.1-rc-1" "$("${SCRIPT}" --npm-version v2026.8.1-rc-1)"
+assert_eq "and the version it maps to is one --pack accepts" "0" \
+  "$(run_status "${SCRIPT}" --pack --version "$("${SCRIPT}" --npm-version v2026.8.1-rc-1)" --out "${WORK}/pre")"
 
 echo "packing"
 TGZ_A="$("${SCRIPT}" --pack --version 2026.8.1 --out "${WORK}/a")"
@@ -108,10 +121,11 @@ echo "the files allowlist covers the plugin directory"
 # image, omits it from the tarball, and makes every future release compare as
 # "identical" and skip — leaving stock users importing a module that is not there,
 # on a permanently green pipeline.
-STRAY="${PLUGIN_DIR}/__packaging_probe.py"
 printf 'PROBE = 1\n' >"${STRAY}"
-STRAY_STATUS="$(run_status "${SCRIPT}" --pack --version 2026.8.2 --out "${WORK}/stray")"
-STRAY_OUT="$("${SCRIPT}" --pack --version 2026.8.2 --out "${WORK}/stray" 2>&1 || true)"
+# One pack, not two: status and output come from the same run, so they cannot describe
+# different invocations and the suite does not stage and pack the plugin twice.
+STRAY_STATUS=0
+STRAY_OUT="$("${SCRIPT}" --pack --version 2026.8.2 --out "${WORK}/stray" 2>&1)" || STRAY_STATUS=$?
 rm -f "${STRAY}"
 assert_eq "an unlisted file in the plugin dir fails the pack" "2" "${STRAY_STATUS}"
 assert_contains "and names the offending file" "__packaging_probe.py" "${STRAY_OUT}"
@@ -121,10 +135,27 @@ assert_contains "and names the offending file" "__packaging_probe.py" "${STRAY_O
 assert_eq "the plugin's own Python tests do not trip it" "0" \
   "$(run_status "${SCRIPT}" --pack --version 2026.8.3 --out "${WORK}/ok")"
 
+# The guard has to fail CLOSED. It did not: the listing was piped straight into a
+# `while` via process substitution, whose exit status is discarded, so a `find` that
+# failed — BSD/macOS have no -printf — produced zero lines, an empty `missing`, and a
+# green pack that shipped a short tarball. Simulated with a find that always fails,
+# which is exactly what a non-GNU find does with -printf.
+FAKEBIN="${WORK}/fakebin"
+mkdir -p "${FAKEBIN}"
+printf '#!/bin/sh\necho "find: -printf: unknown primary or operator" >&2\nexit 1\n' >"${FAKEBIN}/find"
+chmod +x "${FAKEBIN}/find"
+FAILCLOSED=0
+PATH="${FAKEBIN}:${PATH}" "${SCRIPT}" --pack --version 2026.8.4 --out "${WORK}/failclosed" \
+  >/dev/null 2>&1 || FAILCLOSED=$?
+assert_eq "a listing failure is a setup error, not a silent pass" "2" "${FAILCLOSED}"
+
 echo "the documented install"
-# Exactly what the README tells a user to run, against a plugin dir that already has
-# a config.json — the upgrade case, where clobbering the user's credentials would be
-# the worst possible failure.
+# Exactly what the README tells a user to run, over a plugin dir that already holds an
+# unrelated file — the upgrade case, asserting the extract only adds the archive's own
+# entries. config.json stands in for that file because it is the shape someone would
+# expect to find here; note the plugin actually keeps it in
+# $HERMES_HOME/companionintelligence/, OUTSIDE this directory, which is precisely why
+# the README can tell users to `rm -rf` the plugin dir before upgrading.
 HERMES_PLUGIN="${WORK}/hermes/plugins/companionintelligence"
 mkdir -p "${HERMES_PLUGIN}"
 printf '{"url":"https://memory.example.com"}\n' >"${HERMES_PLUGIN}/config.json"
@@ -138,7 +169,7 @@ assert_eq "the provider module lands beside it" "yes" \
   "$([[ -f "${HERMES_PLUGIN}/__init__.py" ]] && echo yes || echo no)"
 assert_eq "no stray package/ directory" "no" \
   "$([[ -d "${HERMES_PLUGIN}/package" ]] && echo yes || echo no)"
-assert_eq "an existing config.json survives the extract" '{"url":"https://memory.example.com"}' \
+assert_eq "an unrelated existing file survives the extract" '{"url":"https://memory.example.com"}' \
   "$(cat "${HERMES_PLUGIN}/config.json")"
 
 echo "comparing"
@@ -167,6 +198,15 @@ assert_eq "a sed-hostile --version is refused" "2" \
   "$(run_status "${SCRIPT}" --pack --version '1.0.0-x&y' --out "${WORK}/hostile")"
 assert_eq "a slash in --version is refused" "2" \
   "$(run_status "${SCRIPT}" --pack --version 'a/b' --out "${WORK}/hostile2")"
+# `tar --strip-components=1` drops single-component members and still exits 0, so a
+# differently rooted tarball extracts to nothing. Two of those must not compare equal.
+mkdir -p "${WORK}/flat"
+printf 'name: x\nversion: 1.0.0\n' >"${WORK}/flat/plugin.yaml"
+tar -czf "${WORK}/flat1.tgz" -C "${WORK}/flat" plugin.yaml
+tar -czf "${WORK}/flat2.tgz" -C "${WORK}/flat" plugin.yaml
+assert_eq "two empty extractions are not called identical" "2" \
+  "$(run_status "${SCRIPT}" --compare "${WORK}/flat1.tgz" "${WORK}/flat2.tgz")"
+
 assert_eq "no mode is a usage error" "2" "$(run_status "${SCRIPT}")"
 
 echo

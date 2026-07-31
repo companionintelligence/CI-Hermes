@@ -30,8 +30,12 @@ npm install
 # Start development server / service
 docker compose up --build
 
-# Run tests
-# no unit tests — validate via docker compose up
+# Run tests (gated by .github/workflows/ci.yml)
+npm test                 # unit (node --test) + shell suites in tests/
+npm run test:unit
+npm run test:sh          # needs python3 + PyYAML
+# memory plugin's own suite
+cd ci-context/plugins/companionintelligence && python3 -m unittest discover -p '*_test.py'
 
 # Build for production
 docker compose build
