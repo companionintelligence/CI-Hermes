@@ -65,9 +65,10 @@ on:
   push:
     tags:
       # Release tags are vYYYY.M.D with an optional same-day suffix (v2026.7.7.2 is
-      # a real tag in this repo). Note a glob is not a regex — `v[0-9]*` alone would
-      # also match `v1-scratch`, which would burn a full CI gate before the version
-      # mapper rejected it, so match the shape properly.
+      # a real tag in this repo). This is a coarse filter, not validation: a glob is
+      # not a regex, so `v1-scratch.0.0` still matches and only `--npm-version`
+      # rejects it. It is here to stop the obvious non-release tags — bare `v[0-9]*`
+      # would match `v1-scratch` and burn a full CI gate before the mapper ran.
       - "v[0-9]*.[0-9]*.[0-9]*"
   workflow_dispatch:
     inputs:
@@ -282,6 +283,28 @@ jobs:
                   const core = (i < 0 ? s : s.slice(0, i)).split(".").map(Number);
                   return { core, pre: i < 0 ? undefined : s.slice(i + 1) };
                 };
+                // Semver rank for the prerelease part. This scheme mints a plain
+                // number there (2026.7.7.10 becomes 2026.7.7-10), and a string
+                // compare is backwards for exactly that case: 10 sorts under 2.
+                const cmpPre = (a, b) => {
+                  const A = a.split("."), B = b.split(".");
+                  for (let i = 0; i < Math.max(A.length, B.length); i++) {
+                    // A longer identifier list outranks a shorter one when every
+                    // preceding identifier is equal.
+                    if (A[i] === undefined) return -1;
+                    if (B[i] === undefined) return 1;
+                    const na = /^[0-9]+$/.test(A[i]), nb = /^[0-9]+$/.test(B[i]);
+                    if (na && nb) {
+                      if (Number(A[i]) !== Number(B[i])) return Number(A[i]) < Number(B[i]) ? -1 : 1;
+                    } else if (na !== nb) {
+                      // Numeric identifiers always rank below alphanumeric ones.
+                      return na ? -1 : 1;
+                    } else if (A[i] !== B[i]) {
+                      return A[i] < B[i] ? -1 : 1;
+                    }
+                  }
+                  return 0;
+                };
                 const cmp = (a, b) => {
                   const x = parse(a), y = parse(b);
                   for (let i = 0; i < 3; i++) {
@@ -291,7 +314,7 @@ jobs:
                   if (x.pre === undefined && y.pre !== undefined) return 1;
                   if (x.pre !== undefined && y.pre === undefined) return -1;
                   if (x.pre === y.pre) return 0;
-                  return String(x.pre) < String(y.pre) ? -1 : 1;
+                  return cmpPre(String(x.pre), String(y.pre));
                 };
                 const v = process.env.VERSION, p = process.env.PUBLISHED;
                 console.log(cmp(v, p) >= 0 ? v : p);
