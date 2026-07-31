@@ -63,6 +63,10 @@ The wizard runs a connection test against `GET /api/health` and **saves nothing 
 fails**. On success it writes the key to `.env`, the URL to
 `companionintelligence/config.json`, and sets `memory.provider` in `config.yaml`.
 
+The URL it offers by default is `http://127.0.0.1:8642`, which is correct only when
+Hermes runs on the hub host itself. See [Which URL do I use?](#which-url-do-i-use) for
+the address to give it otherwise.
+
 Finally, open the Hermes **`/plugins`** page and enable `companionintelligence`.
 
 > `hermes memory setup` is a command-line command, not a chat message. Typed at the
@@ -77,6 +81,48 @@ reason given above.
 Your settings survive: `hermes memory setup` writes them to `$HERMES_HOME/.env` and
 `$HERMES_HOME/companionintelligence/config.json`, both of which live **outside** the
 plugin directory you are replacing.
+
+## Which URL do I use?
+
+Companion Memory runs as an app on your Companion Hub, and a hub can answer on more than
+one address at the same time. Which one you give the wizard depends on where Hermes runs,
+not on which address is the "real" one. The plugin calls the server from the Hermes
+process rather than from a browser, so no origin or CORS restriction applies: any address
+the Hermes machine can route to will work.
+
+The app's exposure is set in the hub under **App → Settings**. Each setting produces a
+different address:
+
+| Exposure | Address shape | Reachable from |
+| --- | --- | --- |
+| Local network (default) | `http://ci-memory.ci.lan` — or `http://<hub-ip>:8642` if Traefik routing is not set up | Devices on the hub's LAN |
+| Private VPN (Tailscale) | `https://<hub>.<tailnet>.ts.net:8642` | Any device signed into your tailnet |
+| Public (**Expose app**) | `https://<the domain you configured>` | Anywhere |
+
+`ci.lan` is the default local domain and can be changed in **Settings → General**; `8642`
+is Companion Memory's app port, and the reason the wizard's default is `127.0.0.1:8642`.
+
+This value is written to `config.json` once and never re-resolved, so it does not follow
+you between networks. A Hermes install that always runs on the hub's LAN is served by the
+local address, and its traffic never leaves your network. A Hermes install on a machine
+that moves — a laptop that leaves the house — keeps working only on an address reachable
+from wherever it goes, which means joining the tailnet or exposing the app publicly;
+exposing it puts the memory server on the internet, where its API key is the only thing
+guarding it. The three forms differ in reach and in what they ask of you, not in what the
+plugin can do with them.
+
+### If the wizard refuses to save
+
+Because it saves nothing on a failed health check, a wrong address ends as a rejected
+setup rather than a broken install. Two causes are common:
+
+- **A missing scheme.** The wizard prepends `http://` to anything typed without one, so
+  `hub.tailnet.ts.net` becomes `http://hub.tailnet.ts.net` and fails against an
+  HTTPS-only address. Type `https://` yourself for the VPN and public forms.
+- **The default.** Pressing Enter accepts `http://127.0.0.1:8642`, which cannot work
+  unless Hermes is running on the hub host.
+
+A timeout or a refused connection points at the address; a `401` points at the key.
 
 ## Configuration
 
