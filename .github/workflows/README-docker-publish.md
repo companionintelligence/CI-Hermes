@@ -89,14 +89,21 @@ The workflow uses the default `GITHUB_TOKEN` for `docker login ghcr.io`.
 
 ## Quick Verification
 
-1. Push a test tag:
-   - `git tag test-publish-1`
-   - `git push origin test-publish-1`
-2. Watch the `Docker Build and Push` run in Actions.
-3. Verify package tags in GitHub Packages:
-  - expected tags include `test-publish-1`
-4. Verify a published release exists in the Releases tab:
-  - expected release/tag include `test-publish-1`
+> **Do not push a throwaway tag to test this workflow.** This section used to say to
+> push `test-publish-1`. That built and pushed a real image to GHCR and created a
+> public GitHub Release named after the test tag — there is no dry-run path, so a
+> "test" publish is a real publish. The workflow now only triggers on `v[0-9]*`, so a
+> tag like `test-publish-1` does nothing at all.
+
+Verify against a real release instead, as part of cutting one:
+
+1. Cut a release following the runbook above.
+2. Watch the `Docker Build and Push` run in Actions for that tag.
+3. Verify the image tag in GitHub Packages matches the release tag.
+4. Verify a published release exists in the Releases tab for the same tag.
+
+If you need to re-run a build for a tag that already exists, re-run the failed job
+from the Actions UI rather than pushing a new tag.
 
 ## Notes
 
