@@ -41,8 +41,76 @@ set -euo pipefail
 
 PLUGIN_DIR="$(cd "$(dirname "$0")/.." && pwd)/ci-context/plugins/companionintelligence"
 NORMALIZED="0.0.0-normalized"
+# Files that legitimately live in the plugin directory but must not ship. Anything
+# in the directory matching none of these MUST appear in the tarball — see
+# assert_files_cover_plugin_dir for why that check exists at all.
+NOT_PUBLISHED=('*_test.py' '*.pyc' '__pycache__/*' 'config.json')
 
 die() { echo "$*" >&2; exit 2; }
+
+# Temp dirs are registered here and removed by a single EXIT trap. A per-function
+# `trap ... RETURN` does not fire when the function exits (every `die`) or when
+# errexit aborts it, which leaked a full copy of the plugin source per failure.
+TMPDIRS=()
+cleanup() {
+  local d
+  for d in "${TMPDIRS[@]:-}"; do
+    if [[ -n "${d}" && -d "${d}" ]]; then rm -rf "${d}"; fi
+  done
+  # Explicit: the trap's exit status becomes the script's, so a falsy last command
+  # here turns a successful run into a failure.
+  return 0
+}
+trap cleanup EXIT
+
+# Sets MKTEMP_DIR rather than printing it. A `$(mktempdir)` would run in a subshell,
+# where the TMPDIRS append is discarded and the directory is never cleaned up.
+MKTEMP_DIR=""
+mktempdir() {
+  MKTEMP_DIR="$(mktemp -d)" || die "mktemp failed"
+  TMPDIRS+=("${MKTEMP_DIR}")
+}
+
+# Fail if the plugin directory contains a file the tarball does not ship.
+#
+# THIS IS THE MOST IMPORTANT CHECK IN THE SCRIPT. `files` in package.json is a
+# hand-maintained allowlist, but the appliance image copies the whole directory. Split
+# a module out of __init__.py without touching `files`, and: the image gets it, the
+# tarball does not, --compare finds the two tarballs identical so the release is
+# logged as "image-only" and skipped, and every later release repeats the skip. Stock
+# users are left on a version whose remaining files import a module that is not
+# there. It never self-heals and the job stays green throughout.
+assert_files_cover_plugin_dir() {
+  local tarball="${1}"
+  local shipped missing=()
+  shipped="$(tar -tzf "${tarball}" | sed 's|^package/||' | grep -v '/$' | LC_ALL=C sort)" \
+    || die "could not list ${tarball}"
+
+  # Plain `if`s throughout: under errexit a bare `[[ ... ]] && cmd` whose test is
+  # false returns non-zero and aborts the function rather than skipping the line.
+  local rel skip pattern
+  while IFS= read -r rel; do
+    skip=0
+    for pattern in "${NOT_PUBLISHED[@]}"; do
+      # shellcheck disable=SC2053 -- glob match is intended
+      if [[ "${rel}" == ${pattern} ]]; then
+        skip=1
+      fi
+    done
+    if [[ "${skip}" -eq 0 ]]; then
+      if ! grep -qxF "${rel}" <<<"${shipped}"; then
+        missing+=("${rel}")
+      fi
+    fi
+  done < <(cd "${PLUGIN_DIR}" && find . -type f -printf '%P\n' | LC_ALL=C sort)
+
+  if [[ "${#missing[@]}" -gt 0 ]]; then
+    printf 'These files are in the plugin directory but the published tarball does not ship them:\n' >&2
+    printf '  %s\n' "${missing[@]}" >&2
+    printf 'Add them to "files" in package.json, or to NOT_PUBLISHED in %s if they are deliberately excluded.\n' "$0" >&2
+    exit 2
+  fi
+}
 
 # Map a release tag to a valid npm version.
 #
@@ -72,9 +140,11 @@ npm_version() {
 stamp_plugin_yaml() {
   local path="${1}" version="${2}"
   grep -qE '^version:' "${path}" || die "no version: line in ${path}"
-  # A temp file plus mv, because in-place sed differs between GNU and BSD.
-  sed -E "s/^version:.*/version: ${version}/" "${path}" >"${path}.tmp"
-  mv "${path}.tmp" "${path}"
+  # A temp file plus mv, because in-place sed differs between GNU and BSD. The
+  # version is validated by the caller, so it carries no sed metacharacters.
+  sed -E "s/^version:.*/version: ${version}/" "${path}" >"${path}.tmp" \
+    || die "could not rewrite ${path}"
+  mv "${path}.tmp" "${path}" || die "could not replace ${path}"
 }
 
 stamp_package_json() {
@@ -84,8 +154,13 @@ stamp_package_json() {
     const p = process.argv[1];
     const doc = JSON.parse(fs.readFileSync(p, "utf8"));
     doc.version = process.env.VERSION;
+    // `private: true` stays in the working tree so a stray `npm publish` from the
+    // plugin directory refuses; it is stripped only here, in the staging copy that
+    // becomes the published artifact. Without that, a local publish would burn a
+    // version number AND move the `latest` dist-tag the change-guard reads.
+    if (process.env.STRIP_PRIVATE === "1") { delete doc.private; }
     fs.writeFileSync(p, JSON.stringify(doc, null, 2) + "\n");
-  ' "${path}"
+  ' "${path}" || die "could not stamp $(basename "${path}")"
 }
 
 do_pack() {
@@ -93,23 +168,35 @@ do_pack() {
   [[ -n "${version}" ]] || die "--pack needs --version"
   [[ -n "${outdir}" ]] || die "--pack needs --out"
   [[ -d "${PLUGIN_DIR}" ]] || die "no plugin directory at ${PLUGIN_DIR}"
+  # Validate rather than trust. This is load-bearing beyond hygiene: the version is
+  # substituted into a `sed` replacement below, where an `&` expands to the whole
+  # match and a `/` ends the expression — one produces a corrupt manifest at exit 0,
+  # the other an error that collides with the documented exit codes. Rejecting the
+  # input up front is simpler than escaping it.
+  [[ "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$ ]] \
+    || die "--version '${version}' is not a valid release version"
 
-  mkdir -p "${outdir}"
+  mkdir -p "${outdir}" || die "could not create ${outdir}"
+  # Absolute, because npm pack runs after `cd "${stage}"` and would otherwise
+  # resolve a relative --out inside the staging dir, which is then deleted.
+  outdir="$(cd "${outdir}" && pwd)" || die "could not resolve ${outdir}"
+
   local stage
-  stage="$(mktemp -d)"
-  trap 'rm -rf "${stage}"' RETURN
+  mktempdir; stage="${MKTEMP_DIR}"
 
   cp -R "${PLUGIN_DIR}/." "${stage}/"
   [[ -f "${stage}/plugin.yaml" ]] || die "expected plugin.yaml in the plugin directory"
   [[ -f "${stage}/package.json" ]] || die "expected package.json in the plugin directory"
   stamp_plugin_yaml "${stage}/plugin.yaml" "${version}"
-  stamp_package_json "${stage}/package.json" "${version}"
+  STRIP_PRIVATE=1 stamp_package_json "${stage}/package.json" "${version}"
 
   # `npm pack` applies the `files` allowlist, which is what keeps the plugin's own
   # ~39KB of Python tests out of the published artifact.
   local tarball
-  tarball="$(cd "${stage}" && npm pack --silent --pack-destination "${outdir}")"
+  tarball="$(cd "${stage}" && npm pack --silent --pack-destination "${outdir}")" \
+    || die "npm pack failed"
   [[ -n "${tarball}" ]] || die "npm pack produced no tarball"
+  assert_files_cover_plugin_dir "${outdir%/}/${tarball}"
   printf '%s\n' "${outdir%/}/${tarball}"
 }
 
@@ -118,23 +205,28 @@ do_pack() {
 #
 # Network-free by design: the publish workflow downloads the published tarball and
 # hands both paths here, so the seam stays testable offline.
+#
+# Every failure in here `die`s with 2 rather than being allowed to surface as 1.
+# Exit 1 means one thing to the caller — "the plugin changed, publish it" — so an
+# internal error leaking out as 1 would silently turn into a release. Only the final
+# diff may produce 1.
 do_compare() {
   local a="${1}" b="${2}"
   [[ -f "${a}" ]] || die "no such tarball: ${a}"
   [[ -f "${b}" ]] || die "no such tarball: ${b}"
 
   local work
-  work="$(mktemp -d)"
-  trap 'rm -rf "${work}"' RETURN
+  mktempdir; work="${MKTEMP_DIR}"
 
   # Plain `if`s rather than `[[ ... ]] && cmd`: under `set -e` a false test makes the
   # whole && list return non-zero, which aborts the function instead of skipping.
   local side src
   for side in a b; do
-    mkdir -p "${work}/${side}"
+    mkdir -p "${work}/${side}" || die "could not create ${work}/${side}"
     if [[ "${side}" == "b" ]]; then src="${b}"; else src="${a}"; fi
     # npm tarballs root everything under package/; strip it so the trees compare directly.
-    tar -xzf "${src}" -C "${work}/${side}" --strip-components=1
+    tar -xzf "${src}" -C "${work}/${side}" --strip-components=1 \
+      || die "could not extract ${src}"
     if [[ -f "${work}/${side}/plugin.yaml" ]]; then
       stamp_plugin_yaml "${work}/${side}/plugin.yaml" "${NORMALIZED}"
     fi
@@ -146,7 +238,9 @@ do_compare() {
   if diff -r "${work}/a" "${work}/b" >/dev/null 2>&1; then
     return 0
   fi
-  diff -r "${work}/a" "${work}/b" >&2 || true
+  # --brief: the payload is a 35KB __init__.py and a full unified diff of it helps
+  # nobody in a workflow log.
+  diff -rq "${work}/a" "${work}/b" >&2 || true
   return 1
 }
 

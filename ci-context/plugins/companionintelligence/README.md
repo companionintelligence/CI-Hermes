@@ -24,15 +24,33 @@ registry, and it never looks in `site-packages` — so installing means putting 
 directory there:
 
 ```sh
+rm -rf ~/.hermes/plugins/companionintelligence
 mkdir -p ~/.hermes/plugins/companionintelligence
-curl -L https://registry.npmjs.org/@companionintelligence/hermes-memory/-/hermes-memory-<version>.tgz \
+curl -fL https://registry.npmjs.org/@companionintelligence/hermes-memory/-/hermes-memory-<version>.tgz \
   | tar -xz -C ~/.hermes/plugins/companionintelligence --strip-components=1
 ```
 
-`--strip-components=1` drops the `package/` prefix the archive carries, so the files
-land at the top level of the plugin directory, which is where the loader expects
-them. The archive is hosted on the npm registry purely as versioned tarball hosting;
-you do not need Node or npm installed, and nothing is installed into a Node project.
+Replace `<version>` with a published version — `2026.8.1`, for example. The list of
+published versions is on
+[the package page](https://www.npmjs.com/package/@companionintelligence/hermes-memory?activeTab=versions).
+Not every appliance release has a matching plugin version: releases that do not
+change the plugin do not publish one.
+
+Three details in those commands are deliberate:
+
+- **`rm -rf` first.** `tar -x` overwrites files but never removes them, so extracting
+  over an old install leaves behind modules that a later version deleted or renamed
+  — along with their stale `__pycache__` — in a directory Python imports from. Start
+  clean. Your credentials are not in this directory (see below), so this is safe.
+- **`curl -fL`, not `curl -L`.** Without `-f`, curl exits 0 on a 404 and pipes the
+  registry's JSON error page into `tar`, which then fails with a confusing "not in
+  gzip format" instead of "that version does not exist".
+- **`--strip-components=1`** drops the `package/` prefix the archive carries, so the
+  files land at the top level of the plugin directory, which is where the loader
+  looks.
+
+The archive is hosted on the npm registry purely as versioned tarball hosting; you do
+not need Node or npm installed, and nothing is installed into a Node project.
 
 Then configure it, from a terminal:
 
@@ -53,8 +71,12 @@ Finally, open the Hermes **`/plugins`** page and enable `companionintelligence`.
 
 ### Upgrading
 
-Re-run the same two commands with the new version. Your `config.json` is not part of
-the archive, so extracting over an existing install cannot overwrite it.
+Re-run the same commands with the new version — including the `rm -rf`, for the
+reason given above.
+
+Your settings survive: `hermes memory setup` writes them to `$HERMES_HOME/.env` and
+`$HERMES_HOME/companionintelligence/config.json`, both of which live **outside** the
+plugin directory you are replacing.
 
 ## Configuration
 
@@ -82,12 +104,21 @@ No third-party services.
 
 ## Uninstall
 
+Removing the plugin directory is not enough — `hermes memory setup` wrote settings in
+two other places, and one of them holds your API key:
+
 ```sh
-rm -rf ~/.hermes/plugins/companionintelligence
+rm -rf ~/.hermes/plugins/companionintelligence   # the plugin itself
+rm -rf ~/.hermes/companionintelligence           # the saved server URL
 ```
 
-Then clear `memory.provider` in `config.yaml`. Your data on the Companion Memory
-server is untouched.
+Then edit `~/.hermes/config.yaml` to clear `memory.provider` and drop
+`companionintelligence` from `plugins.enabled`, and **remove `CI_SERVER_TOKEN` from
+`~/.hermes/.env`** — otherwise a live Companion Memory API key stays on disk after you
+believe you have uninstalled. Revoke it in the server's web UI if you no longer need
+it.
+
+Your data on the Companion Memory server is untouched by any of this.
 
 ## A note on `package.json`
 
