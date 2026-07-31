@@ -50,11 +50,22 @@ jobs:
           node-version: "22"
 
       - name: Install the shell suites' one dependency
-        # Several bootstrap tests assert on generated config.yaml by parsing it with
-        # python3 + PyYAML. Installing it explicitly rather than relying on whatever
-        # the runner image happens to ship keeps the suite from depending on the
-        # image's contents.
-        run: python3 -m pip install --quiet pyyaml
+        # Several bootstrap tests assert on the generated config.yaml by parsing it
+        # with python3 + PyYAML, so it has to be present rather than assumed.
+        #
+        # Ubuntu 24.04 ships an externally-managed Python (PEP 668) where a bare
+        # `pip install` can refuse with "externally-managed-environment". The current
+        # hosted image allows it — verified in an actual run — but that is a property
+        # of the image, not a guarantee, so fall back rather than break the day it
+        # changes.
+        run: |
+          set -euo pipefail
+          if python3 -c "import yaml" 2>/dev/null; then
+            echo "PyYAML already available"
+          else
+            python3 -m pip install --quiet pyyaml \
+              || python3 -m pip install --quiet --break-system-packages pyyaml
+          fi
 
       # Deliberately no `npm ci`: the suites are dependency-free by design, and the
       # scripts under test must not start requiring node-pty/ws, which the container
