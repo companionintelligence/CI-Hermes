@@ -1,0 +1,66 @@
+name: CI
+
+# This repo had no test gate at all until now: docker-publish.yml was the only
+# workflow, so the suites in tests/ had never been run by anything but a human
+# remembering to. They pass; nothing was keeping them passing.
+#
+# Scope note, deliberate: this gates pull requests and the npm publish. It does NOT
+# yet gate docker-publish.yml. Wiring a never-before-run suite into the image release
+# path is a separate change with its own risk, and it should happen once this has
+# been observed green for a while — not in the same PR that introduces it.
+on:
+  pull_request:
+  push:
+    branches: [master, main]
+  workflow_dispatch:
+  # Called by npm-publish.yml, which passes the exact ref it is about to publish so
+  # the tested tree and the packaged tree cannot disagree.
+  workflow_call:
+    inputs:
+      ref:
+        description: >-
+          Ref to test. Leave empty to test the ref that triggered the run.
+        type: string
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  # github.workflow resolves to the CALLER's name for a called workflow, so a publish
+  # gate lands in its own group and cannot collide with a CI run on the same ref.
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  # Only supersede in-flight PR runs: a cancelled publish gate must never read as a
+  # passed one.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    name: Unit + shell tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install the shell suites' one dependency
+        # Several bootstrap tests assert on generated config.yaml by parsing it with
+        # python3 + PyYAML. Installing it explicitly rather than relying on whatever
+        # the runner image happens to ship keeps the suite from depending on the
+        # image's contents.
+        run: python3 -m pip install --quiet pyyaml
+
+      # Deliberately no `npm ci`: the suites are dependency-free by design, and the
+      # scripts under test must not start requiring node-pty/ws, which the container
+      # resolves by absolute path.
+      - name: Unit tests
+        run: npm run test:unit
+
+      - name: Shell tests
+        run: npm run test:sh

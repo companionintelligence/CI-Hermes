@@ -1,0 +1,174 @@
+name: Publish memory plugin
+
+# Same trigger as docker-publish.yml, deliberately: a release tag is the release, and
+# the plugin and the image are two artifacts of it. One ritual — push the tag, verify
+# the artifacts — rather than a second, dispatch-only mechanism nobody remembers.
+#
+# Hermes has no plugin registry, so the artifact is a tarball users extract into
+# $HERMES_HOME/plugins/. It is published to the npm registry purely as versioned
+# tarball hosting with a predictable, anonymous URL; the documented install is a
+# curl, and no user needs Node. See scripts/pack-memory-plugin.sh for why not a
+# GitHub Release asset (private repo) and why not PyPI (no predictable file URL).
+#
+# Most release tags do NOT change the plugin, so this compares the packed plugin
+# against what is already published and skips when nothing changed. A skip is always
+# logged; it is never silent.
+on:
+  push:
+    tags:
+      # Release tags are vYYYY.M.D with an optional same-day suffix (v2026.7.7.2 is
+      # a real tag in this repo). Narrower than docker-publish.yml's `*` on purpose:
+      # `*` means the runbook's own "push a test tag to verify" recipe would publish.
+      # CI-OpenClaw hit exactly that and tightened its pattern; no reason to inherit
+      # the wart in a new workflow. Fixing docker-publish.yml is a separate change.
+      - "v[0-9]*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing release tag to publish (for example v2026.8.1)"
+        required: true
+        type: string
+      dry_run:
+        description: "Pack and compare, but do not publish"
+        required: false
+        default: false
+        type: boolean
+
+# Keyed on the tag, and never cancel-in-progress: a cancelled publish leaves a tag
+# whose artifacts are only half there.
+concurrency:
+  group: npm-publish-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  # Gate on the same suite that gates pull requests, run against the exact ref being
+  # published, so the tested tree and the packed tree are the same commit.
+  test:
+    name: Tests
+    uses: ./.github/workflows/ci.yml
+    permissions:
+      contents: read
+    with:
+      ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+
+  publish:
+    needs: test
+    name: Publish to npm
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout the tag being published
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Resolve the release tag and version
+        id: version
+        run: |
+          set -euo pipefail
+          tag="${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}"
+          # The mapper strips the v prefix and rejects anything that is not a release
+          # tag, so a hand-typed dispatch input cannot publish from a stray tag.
+          version="$(scripts/pack-memory-plugin.sh --npm-version "${tag}")"
+          echo "tag=${tag}" >> "$GITHUB_OUTPUT"
+          echo "version=${version}" >> "$GITHUB_OUTPUT"
+          echo "Release tag ${tag} publishes as ${version}"
+
+      - name: Decide whether this release changes the plugin
+        id: decide
+        env:
+          PACKAGE: "@companionintelligence/hermes-memory"
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          candidate="$(scripts/pack-memory-plugin.sh --pack --version "${VERSION}" --out "${RUNNER_TEMP}/candidate")"
+          echo "Packed ${candidate}"
+
+          # `npm view` exits non-zero when the package has never been published; that
+          # is the first-publish case, not an error.
+          published_latest="$(npm view "${PACKAGE}" version 2>/dev/null || true)"
+          if [[ -z "${published_latest}" ]]; then
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+            echo "::notice::${PACKAGE} has never been published; publishing ${VERSION}."
+            exit 0
+          fi
+
+          # A rerun of an already-published tag must be a no-op rather than a failed
+          # publish: npm rejects a duplicate version, and that failure would read as a
+          # broken release rather than "already done".
+          if npm view "${PACKAGE}@${VERSION}" version >/dev/null 2>&1; then
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            echo "::notice::${PACKAGE}@${VERSION} is already published; nothing to do."
+            exit 0
+          fi
+
+          npm pack "${PACKAGE}@${published_latest}" --silent --pack-destination "${RUNNER_TEMP}/published" >/dev/null
+          published_tgz="$(find "${RUNNER_TEMP}/published" -name '*.tgz' -print -quit)"
+
+          # --compare ignores the stamped version fields, so this answers "did the
+          # plugin change". Exit 0 = same, 1 = differs; anything else is a real error
+          # and must not read as "same".
+          status=0
+          scripts/pack-memory-plugin.sh --compare "${published_tgz}" "${candidate}" || status=$?
+          case "${status}" in
+            0)
+              echo "publish=false" >> "$GITHUB_OUTPUT"
+              echo "::notice::Plugin is identical to ${PACKAGE}@${published_latest}; skipping the publish for ${{ steps.version.outputs.tag }}. This is an image-only release."
+              ;;
+            1)
+              echo "publish=true" >> "$GITHUB_OUTPUT"
+              echo "::notice::Plugin changed since ${published_latest}; publishing ${VERSION}."
+              ;;
+            *)
+              echo "::error::comparison failed with status ${status}"
+              exit "${status}"
+              ;;
+          esac
+
+      - name: Publish
+        if: steps.decide.outputs.publish == 'true' && !(github.event_name == 'workflow_dispatch' && inputs.dry_run)
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          # Publish the tarball that was compared, not a fresh pack, so the artifact
+          # on the registry is exactly the one the decision was made about.
+          tarball="$(find "${RUNNER_TEMP}/candidate" -name '*.tgz' -print -quit)"
+          npm publish "${tarball}" --access public
+          echo "Published ${VERSION}"
+
+      - name: Confirm the tarball is fetchable at its documented URL
+        if: steps.decide.outputs.publish == 'true' && !(github.event_name == 'workflow_dispatch' && inputs.dry_run)
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          # The README hands users this exact URL, so verify the URL rather than just
+          # the registry metadata. A tag must never imply an artifact that is not
+          # actually downloadable.
+          url="https://registry.npmjs.org/@companionintelligence/hermes-memory/-/hermes-memory-${VERSION}.tgz"
+          for attempt in 1 2 3 4 5; do
+            if curl -fsSL "${url}" -o "${RUNNER_TEMP}/published-check.tgz"; then
+              tar -tzf "${RUNNER_TEMP}/published-check.tgz" | grep -qx 'package/plugin.yaml'
+              echo "Confirmed ${url} downloads and contains plugin.yaml."
+              exit 0
+            fi
+            echo "Not fetchable yet (attempt ${attempt}); waiting for registry propagation."
+            sleep 10
+          done
+          echo "::error::${url} was not fetchable after publishing."
+          exit 1
+
+      - name: Dry run summary
+        if: github.event_name == 'workflow_dispatch' && inputs.dry_run
+        run: |
+          echo "Dry run: would publish=${{ steps.decide.outputs.publish }} version=${{ steps.version.outputs.version }}"

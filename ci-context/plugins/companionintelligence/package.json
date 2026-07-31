@@ -1,0 +1,26 @@
+{
+  "name": "@companionintelligence/hermes-memory",
+  "version": "1.0.0",
+  "description": "Companion Intelligence memory provider for Hermes — passively ingests conversation context into a self-hosted knowledge graph.",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/companionintelligence/CI-Hermes.git",
+    "directory": "ci-context/plugins/companionintelligence"
+  },
+  "keywords": [
+    "hermes",
+    "hermes-agent",
+    "memory",
+    "companion-intelligence"
+  ],
+  "files": [
+    "plugin.yaml",
+    "__init__.py",
+    "intent_catalog.py",
+    "README.md"
+  ],
+  "publishConfig": {
+    "access": "public"
+  }
+}
