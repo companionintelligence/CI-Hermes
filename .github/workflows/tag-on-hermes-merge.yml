@@ -1,9 +1,13 @@
 name: Tag CI-Hermes Version On Merge
 
+# >>> ci-local:gated original triggers below, restore with `ci-local restore`
+# on:
+#   pull_request_target:
+#     types:
+#       - closed
+# <<< ci-local:gated
 on:
-  pull_request_target:
-    types:
-      - closed
+  workflow_dispatch:
 
 jobs:
   tag-merged-pr:
