@@ -5,16 +5,21 @@ on:
   # including the throwaway `test-publish-1` tag this workflow's own runbook used to
   # tell you to push as a verification step.
   #
-  # Every release tag is vYYYY.M.D with an optional same-day suffix (v2026.7.7.2), so
-  # they all start with `v` followed by a digit. Checked against all 25 tags in the
-  # repo at the time of this change: none is excluded by the narrower pattern.
+  # Every release tag is vYYYY.M.D with an optional same-day suffix (v2026.7.7.2).
+  # Narrowed to three segments, matching npm-publish.yml so a release tag means the
+  # same thing to both. Checked against all 25 tags this repo has ever had, plus the
+  # since-deleted `v2026.5.16-1`: every one matches, so nothing that ever released is
+  # excluded. The trailing `*` absorbs the same-day `.N` suffix.
+  #
+  # Still a coarse filter, not validation — a glob is not a regex, so `v1-scratch.0.0`
+  # gets through. It only limits how much machinery a junk tag can start.
   #
   # This does not affect the bot path below. Tags pushed by the tagger workflow use
   # GITHUB_TOKEN, which deliberately does not trigger further workflows — which is
   # exactly why the workflow_run trigger exists.
   push:
     tags:
-      - "v[0-9]*"
+      - "v[0-9]*.[0-9]*.[0-9]*"
   workflow_run:
     workflows:
       - "Tag CI-Hermes Version On Merge"
