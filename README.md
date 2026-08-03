@@ -166,12 +166,15 @@ If Hub MCP is disabled on the Hub, run `cihub mcp setup` and restart the Hermes 
 
 ## Error reporting
 
-The wrapper can report its own crashes to Sentry. It is **opt-in and off by
-default**: with no `SENTRY_DSN` the SDK is never loaded and the container makes
-no outbound connection. `CI_TELEMETRY=off` or `CI_LOCAL_ONLY=true` disable it
-again without a rebuild, and `GET /__ci_telemetry/config` reports which switch is
-in effect. Only `server.cjs` is instrumented — not the upstream Hermes dashboard
-or gateway.
+The wrapper reports its own crashes to Sentry. It is **opt-out**: on any build
+configured with a `SENTRY_DSN` — as release images are — reporting is on until
+the user turns it off. With no `SENTRY_DSN` (a source checkout, a local
+`docker compose up`) the SDK is never loaded and the container makes no outbound
+connection; that is the absence of configuration, not a privacy setting. The app
+store's **Share crash reports** toggle, `CI_TELEMETRY=off` or
+`CI_LOCAL_ONLY=true` turn it off without a rebuild, and
+`GET /__ci_telemetry/config` reports which switch is in effect. Only
+`server.cjs` is instrumented — not the upstream Hermes dashboard or gateway.
 
 See [docs/operations/error-reporting.md](docs/operations/error-reporting.md) for
 the privacy posture and the full redaction rules.

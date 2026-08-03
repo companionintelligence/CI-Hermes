@@ -1,11 +1,13 @@
 /**
  * Telemetry (Sentry) settings resolution.
  *
- * Error reporting in CI-Hermes is **opt-in and off by default**: with no
- * `SENTRY_DSN` nothing is initialised, the SDK is never even `require`d, and no
- * network call is ever made. Two kill switches disable reporting even when a
- * DSN has been baked into an image (which is how a Hub-installed app receives
- * one), so an operator can always turn telemetry off without rebuilding:
+ * Error reporting in CI-Hermes is **opt-out** — on wherever a DSN is
+ * configured, and the user turns it off. With no `SENTRY_DSN` nothing is
+ * initialised, the SDK is never even `require`d, and no network call is ever
+ * made: that is the absence of configuration, not a privacy setting. Two kill
+ * switches disable reporting even when a DSN has been baked into an image
+ * (which is how a Hub-installed app receives one), so an operator can always
+ * turn telemetry off without rebuilding:
  *
  *   - `CI_TELEMETRY=off`   — explicit opt-out
  *   - `CI_LOCAL_ONLY=true` — local-only mode must mean zero phone-home, see

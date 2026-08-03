@@ -5,10 +5,10 @@
  * the SDK patches Node's http internals on init, and instrumentation applied
  * after those modules are loaded misses everything they set up at require time.
  *
- * Reporting is opt-in. With no `SENTRY_DSN` this module resolves the gate,
- * returns, and never even `require`s `@sentry/node` — so a DSN-less container
- * pays nothing and makes no outbound connection. See `settings.cjs` for the
- * kill switches.
+ * Reporting is opt-out: on wherever a DSN is configured, off when the user says
+ * so. With no `SENTRY_DSN` this module resolves the gate, returns, and never
+ * even `require`s `@sentry/node` — so a DSN-less container pays nothing and
+ * makes no outbound connection. See `settings.cjs` for the kill switches.
  *
  * Nothing here may change how the wrapper behaves: every entry point is wrapped
  * so a telemetry fault can never crash the app, alter an exit code, or hold
@@ -37,9 +37,10 @@ const MANUALLY_HANDLED_INTEGRATIONS = new Set(["OnUncaughtException", "OnUnhandl
 const LEAKY_INTEGRATIONS = new Set(["Console", "LocalVariables", "LocalVariablesAsync"]);
 
 // Release-health sessions are sent on start and exit even when nothing ever goes
-// wrong. "Opt-in error reporting" should mean the appliance talks to Sentry when
-// it has a crash to report and not otherwise, so the background session stream
-// is dropped and reporting stays strictly error-driven.
+// wrong, and session envelopes do NOT pass through `beforeSend` — the scrubber
+// that every other payload from this process goes through cannot vouch for them.
+// So the background session stream is dropped and reporting stays strictly
+// error-driven.
 const NON_ERROR_INTEGRATIONS = new Set(["ProcessSession"]);
 
 /**

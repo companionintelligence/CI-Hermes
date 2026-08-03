@@ -51,8 +51,8 @@ describe("init: the four gate conditions", () => {
     assert.equal(result.disabledReason, "no-dsn");
     assert.equal(result.reporting, false);
     assert.equal(result.hasClient, false);
-    // The strongest form of "off by default": the dependency is not resolved,
-    // so there is no transport, no queue and no outbound socket.
+    // The strongest form of "a DSN-less build cannot report": the dependency is
+    // not resolved, so there is no transport, no queue and no outbound socket.
     assert.equal(result.sdkLoaded, false);
   });
 
