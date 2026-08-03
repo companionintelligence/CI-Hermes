@@ -237,6 +237,44 @@ describe("scrubEvent: message, exception and stack frames", () => {
     // being scrubbed here — see telemetry/index.cjs.
   });
 
+  // `contextLinesIntegration` is a DEFAULT integration and `sendDefaultPii` does
+  // not gate it: it reads the throwing file off disk and attaches the offending
+  // line plus the lines either side. That is real program text — a hardcoded
+  // provider key, a connection string with its password, a literal home path all
+  // live there — and unlike `filename` these fields play no part in Sentry's
+  // grouping, so there is nothing to preserve by leaving them alone.
+  test("scrubs the source context around the throwing line", () => {
+    const scrubbed = scrubEvent({
+      exception: {
+        values: [
+          {
+            value: "boom",
+            stacktrace: {
+              frames: [
+                {
+                  filename: "/Users/liam/devel/ci/server.cjs",
+                  context_line: "  const key = 'sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAA';",
+                  pre_context: ["  const db = 'postgres://ci:pgs3cure@db:5432/hermes';"],
+                  post_context: ["  log('/Users/liam/secrets/notes.txt');"],
+                },
+              ],
+            },
+          },
+        ],
+      },
+    });
+
+    const frame = scrubbed.exception.values[0].stacktrace.frames[0];
+
+    assert.doesNotMatch(frame.context_line, /sk-ant-api03-AAAAAAAAAAAAAAAAAAAAAA/);
+    assert.match(frame.context_line, /\[Filtered\]/);
+    assert.doesNotMatch(frame.pre_context[0], /pgs3cure/);
+    assert.doesNotMatch(frame.post_context[0], /\/Users\/liam/);
+    // The frame's own path stays navigable — the grouping guarantee above is
+    // not weakened by this.
+    assert.equal(frame.filename, "~/devel/ci/server.cjs");
+  });
+
   test("removes the machine hostname", () => {
     assert.equal(scrubEvent({ server_name: "hermes-household.local" }).server_name, undefined);
   });
