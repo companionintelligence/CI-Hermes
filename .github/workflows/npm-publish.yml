@@ -3,9 +3,9 @@ name: Publish memory plugin
 # Fires on release tags, like docker-publish.yml, deliberately: a release tag is the
 # release, and the plugin and the image are two artifacts of it. One ritual — push the
 # tag, verify the artifacts — rather than a second, dispatch-only mechanism nobody
-# remembers. The globs are not identical: docker-publish.yml matches `*` (any tag),
-# this one only the release shape, so a scratch tag builds an image without also
-# reaching the registry. Every tag cut so far matches both.
+# remembers. The globs are identical to docker-publish.yml's — one release-tag shape,
+# so a tag either produces both artifacts or neither, and there is no tag that quietly
+# builds an image without also reaching the registry.
 #
 # Hermes has no plugin registry, so the artifact is a tarball users extract into
 # $HERMES_HOME/plugins/. It is published to the npm registry purely as versioned
@@ -126,8 +126,12 @@ jobs:
           # refs/tags/... rather than a bare name — see the note on the test job.
           ref: ${{ github.event_name == 'workflow_dispatch' && format('refs/tags/{0}', inputs.tag) || (github.event_name == 'workflow_run' && github.event.workflow_run.head_sha || github.ref) }}
           # Tags are needed so the next step can prove the dispatch input names a real
-          # tag rather than a branch.
+          # tag rather than a branch, and so the workflow_run path can find the tag the
+          # tagger just pushed. Neither works on fetch-depth alone: on that path `ref`
+          # is a bare 40-hex SHA, and actions/checkout fetches a bare SHA with
+          # `--no-tags`, leaving the clone with no tag refs at all.
           fetch-depth: 0
+          fetch-tags: true
 
       - uses: actions/setup-node@v4
         with:
