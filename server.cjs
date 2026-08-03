@@ -1,3 +1,11 @@
+// Opt-in error reporting. Deliberately the first statement in the file: the
+// Sentry SDK patches Node's http internals when it initialises, so anything
+// required before it (http, ws) would go uninstrumented. Without SENTRY_DSN this
+// resolves the gate, returns, and never loads the SDK — see
+// docs/operations/error-reporting.md.
+const telemetry = require("./telemetry/index.cjs");
+telemetry.init();
+
 const http = require("http");
 const fs = require("fs");
 const path = require("path");
@@ -19,6 +27,11 @@ const SETUP_TOKEN = process.env.APP_SEED || "";
 // boot and carried in the POST body (never the URL) so it can't leak via proxy
 // logs / Referer / history.
 const MEMORY_ACTION_TOKEN = crypto.randomBytes(32).toString("hex");
+
+// Minted per boot, so no pattern can recognise it: hand the literal value to the
+// scrubber so it can never ride out inside a captured error. APP_SEED and the
+// Hub/memory credentials are picked up from the environment automatically.
+telemetry.registerSecret(MEMORY_ACTION_TOKEN);
 
 /**
  * Byte-safe constant-time token compare: compares BYTE lengths before
@@ -273,6 +286,8 @@ function startPtyIfNeeded() {
       }
     } catch (e) {
       console.error("Error sending PTY output:", e.message);
+      // No payload in the context: `data` here is the terminal's own output.
+      telemetry.captureError(e, { where: "pty-output-send" });
     }
   });
 
@@ -285,6 +300,7 @@ function startPtyIfNeeded() {
       }
     } catch (e) {
       console.error("Error sending exit message:", e.message);
+      telemetry.captureError(e, { where: "pty-exit-notify" });
     }
     if (wasActiveSession) {
       ptyProcess = null;
@@ -593,6 +609,38 @@ function proxyDashboardUpgrade(req, socket, head) {
   proxy.end();
 }
 
+// ── Error-reporting status ──────────────────────────────────────────────────
+// Says whether crash reporting is on and, when it is not, why — so an operator
+// (or the Hub's "Share crash reports" toggle) can confirm the kill switch
+// actually took effect without shelling into the container. Never returns the
+// DSN, and never anything user-derived.
+//
+// Deliberately NOT at the fleet's `/api/config/telemetry`: `/api/*` on this
+// wrapper belongs to the upstream Hermes dashboard it proxies, so an endpoint
+// there would shadow whatever upstream adds under that path. `/__ci_*` is this
+// repo's existing namespace for wrapper-owned routes (see /__ci_memory below).
+const TELEMETRY_CONFIG_PATH = "/__ci_telemetry/config";
+
+function handleTelemetryConfig(req, res) {
+  const state = telemetry.status();
+  const body = state.enabled
+    ? {
+        enabled: true,
+        // `reporting` is false if the SDK could not be loaded — the operator
+        // asked for reporting but the process is not doing it.
+        reporting: state.reporting,
+        environment: state.environment,
+        release: state.release,
+      }
+    : { enabled: false, reason: state.disabledReason };
+
+  res.writeHead(200, {
+    "Content-Type": "application/json; charset=utf-8",
+    "Cache-Control": "no-store",
+  });
+  res.end(JSON.stringify(body));
+}
+
 // ── Companion Memory connect interstitial ───────────────────────────────────
 // Shown before the dashboard when memory is not yet connected, so the user can
 // connect (or dismiss) rather than silently running without long-term memory.
@@ -836,6 +884,13 @@ const server = http.createServer(async (req, res) => {
   const requestUrl = new URL(req.url || "/", "http://localhost");
   const requestPath = requestUrl.pathname.replace(/\/+$/, "");
 
+  // Ahead of the memory gate: a status probe must answer with its JSON even
+  // when the connect interstitial would otherwise take over the response.
+  if (req.method === "GET" && requestPath === TELEMETRY_CONFIG_PATH) {
+    handleTelemetryConfig(req, res);
+    return;
+  }
+
   // Companion Memory connect interstitial: handle its local actions, then offer
   // the gate on the top-level dashboard load (before proxying to the dashboard).
   if (await handleMemoryAction(req, res, requestPath)) {
@@ -934,6 +989,16 @@ wss.on("connection", (ws) => {
       }
     } catch (e) {
       console.error("Error processing terminal input:", e.message);
+      // A malformed frame is the likeliest error on this socket, and V8 echoes
+      // a slice of the offending input — the user's keystrokes or pasted text —
+      // straight back in the SyntaxError message. Report that it happened, not
+      // what was typed: the stack for a JSON.parse failure says nothing the
+      // handler name doesn't. The scrubber also filters this message shape, but
+      // never constructing the payload is the guarantee that doesn't depend on
+      // V8's wording.
+      const reportable =
+        e instanceof SyntaxError ? new Error("Malformed terminal frame (JSON parse failed)") : e;
+      telemetry.captureError(reportable, { where: "terminal-input" });
     }
   });
 
@@ -991,6 +1056,7 @@ server.on("upgrade", (req, socket, head) => {
     // Defense in depth: never let an upgrade-handler throw escape as an uncaught
     // exception (which would crash the wrapper). Reject the socket and move on.
     console.error("[hermes] upgrade handler error:", err && err.message ? err.message : err);
+    telemetry.captureError(err, { where: "ws-upgrade" });
     try {
       socket.destroy();
     } catch {
@@ -1006,11 +1072,21 @@ server.listen(PORT, "0.0.0.0", () => {
 // Last-resort backstop: keep a stray throw/rejection (e.g. from an event
 // handler outside a request's try/catch) from hard-crashing the wrapper and
 // dropping the whole app. Log and keep serving.
+//
+// Reporting must not change that: these handlers capture and return, exactly as
+// before. The SDK's own uncaughtException/unhandledRejection integrations are
+// filtered out at init precisely because they would report the crash twice and
+// can terminate the process themselves.
 process.on("uncaughtException", (err) => {
   console.error("[hermes] uncaughtException:", err && err.stack ? err.stack : err);
+  telemetry.captureError(err, { where: "uncaughtException" });
 });
 process.on("unhandledRejection", (reason) => {
   console.error("[hermes] unhandledRejection:", reason);
+  telemetry.captureError(
+    reason instanceof Error ? reason : new Error(String(reason ?? "Unknown unhandled rejection")),
+    { where: "unhandledRejection" },
+  );
 });
 
 // Graceful shutdown
@@ -1025,4 +1101,9 @@ process.on("SIGTERM", () => {
   clearPtyCleanupTimer();
   killPty();
   server.close();
+  // Bounded (2s, and the internal timer is unref'd) so a wedged network can
+  // never hold the container open past its stop grace period. Not awaited:
+  // nothing after this depends on it, and the process still exits as soon as
+  // the loop drains.
+  void telemetry.flush(2000);
 });
