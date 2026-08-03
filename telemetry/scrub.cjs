@@ -56,11 +56,15 @@ const JSON_PARSE_REPLACEMENT = "Unexpected token, [Filtered], is not valid JSON"
 
 // `api[-_ ]?key` (not the literals `apikey|api_key`) so the hyphenated header
 // forms match too — `x-api-key` is Companion Memory's API-key header, and the
-// SDK ships request headers even with sendDefaultPii disabled. `hub[-_]user`
-// covers CI-Hub's `X-CI-Hub-User`, which carries the household username, and
-// `seed` covers this app's own `APP_SEED`.
+// SDK ships request headers even with sendDefaultPii disabled. `signature`
+// covers webhook HMACs (`x-hub-signature-256`, `x-webhook-signature`), which are
+// replayable against the verifier and so are credentials in their own right.
+// Everything up to `signature` is byte-identical to CI-Server's copy — keep it
+// that way and let the Hermes-local terms trail: `hub[-_]user` covers CI-Hub's
+// `X-CI-Hub-User`, which carries the household username, and `seed` covers this
+// app's own `APP_SEED`.
 const SENSITIVE_KEY_PATTERN =
-  /password|secret|token|authorization|cookie|jwt|api[-_ ]?key|dsn|pepper|private[-_]?key|hub[-_]user|app[-_]?seed/i;
+  /password|secret|token|authorization|cookie|jwt|api[-_ ]?key|dsn|pepper|private[-_]?key|signature|hub[-_]user|app[-_]?seed/i;
 
 // Headers whose value is a URL the user navigated from — same query-string
 // exposure as request.url, and not caught by SENSITIVE_KEY_PATTERN.

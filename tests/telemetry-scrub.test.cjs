@@ -323,6 +323,32 @@ describe("scrubEvent: request data", () => {
     assert.equal(scrubbed.request.headers["x-ci-hub-user"], "[Filtered]");
     assert.equal(scrubbed.request.headers["x-ci-hub-user-signature"], "[Filtered]");
   });
+
+  test("filters generic signature headers, not just CI-Hub's", () => {
+    // The CI-Hub triple was already covered, but only incidentally: `hub[-_]user`
+    // is unanchored, so it matches `x-ci-hub-user-signature` on the *user* half.
+    // A signature header that does not carry `hub-user` in its name matched no
+    // rule at all and shipped in cleartext. An HMAC is a credential — it is the
+    // proof-of-authenticity for a request body and replayable against the
+    // verifier, so it is redacted like any other.
+    const scrubbed = scrubEvent({
+      request: {
+        headers: {
+          "x-hub-signature-256": "sha256=abc123",
+          "x-webhook-signature": "deadbeef",
+          Signature: "keyId=hermes,signature=abc",
+          "user-agent": "curl/8",
+        },
+      },
+    });
+
+    assert.equal(scrubbed.request.headers["x-hub-signature-256"], "[Filtered]");
+    assert.equal(scrubbed.request.headers["x-webhook-signature"], "[Filtered]");
+    assert.equal(scrubbed.request.headers.Signature, "[Filtered]");
+    // The header name is not a substring of anything diagnostic — ordinary
+    // headers still survive alongside it.
+    assert.equal(scrubbed.request.headers["user-agent"], "curl/8");
+  });
 });
 
 describe("scrubEvent: breadcrumbs", () => {
