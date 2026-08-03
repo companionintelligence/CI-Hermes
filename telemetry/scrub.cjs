@@ -252,6 +252,13 @@ function scrubEvent(event) {
       // Node's stack parser keeps the absolute path in `filename`/`abs_path`,
       // which leaks the account name outside Docker, and `vars` holds captured
       // locals — in this wrapper those are terminal frames and the setup token.
+      //
+      // `context_line`/`pre_context`/`post_context` are the source lines around
+      // the throw, attached by `contextLinesIntegration` — a DEFAULT integration
+      // that `sendDefaultPii` does not gate. It reads the file off disk, so those
+      // fields carry real program text: hardcoded provider keys, connection
+      // strings with their passwords, literal paths. They play no part in
+      // grouping (that keys off `filename`), so scrubbing them costs nothing.
       const frames = (exception.stacktrace && exception.stacktrace.frames) || [];
 
       for (const frame of frames) {
@@ -261,6 +268,26 @@ function scrubEvent(event) {
 
         if (typeof frame.abs_path === "string") {
           frame.abs_path = scrubString(frame.abs_path);
+        }
+
+        if (typeof frame.module === "string") {
+          frame.module = scrubString(frame.module);
+        }
+
+        if (typeof frame.context_line === "string") {
+          frame.context_line = scrubString(frame.context_line);
+        }
+
+        if (Array.isArray(frame.pre_context)) {
+          frame.pre_context = frame.pre_context.map((line) =>
+            typeof line === "string" ? scrubString(line) : line,
+          );
+        }
+
+        if (Array.isArray(frame.post_context)) {
+          frame.post_context = frame.post_context.map((line) =>
+            typeof line === "string" ? scrubString(line) : line,
+          );
         }
 
         if (frame.vars) {
