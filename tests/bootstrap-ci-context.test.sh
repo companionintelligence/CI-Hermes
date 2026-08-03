@@ -78,6 +78,13 @@ count_child_key() {
   grep -cE "^  ${key}:" "${file}" || true
 }
 
+# Read a file's mtime as a Unix timestamp. `stat -c %Y` is GNU coreutils and
+# BSD/macOS stat rejects it outright ("illegal option -- c"), so try the GNU
+# form first and fall back to the BSD `-f %m` spelling.
+mtime_of() {
+  stat -c %Y "$1" 2>/dev/null || stat -f %m "$1"
+}
+
 # Run the bootstrap with HERMES_HOME pointed at data_dir; remaining args are
 # extra KEY=VALUE env assignments (e.g. CI_SERVER_URL=...). The bootstrap is
 # expected to exit 0 in these fixtures; we do NOT swallow a non-zero exit so a
@@ -357,9 +364,9 @@ printf 'model:\n  provider: ollama\n' > "${data_dir}/config.yaml"
 printf 'HERMES_NUM_CTX=65536\n' > "${data_dir}/.env.hub-bootstrap"
 run_bootstrap "${data_dir}" "${CREDS[@]}"
 touch -d '2020-01-01 00:00:00' "${data_dir}/config.yaml"
-before="$(stat -c %Y "${data_dir}/config.yaml")"
+before="$(mtime_of "${data_dir}/config.yaml")"
 run_bootstrap "${data_dir}" "${CREDS[@]}"
-after="$(stat -c %Y "${data_dir}/config.yaml")"
+after="$(mtime_of "${data_dir}/config.yaml")"
 assert_eq "config.yaml not rewritten when unchanged (mtime preserved)" "${before}" "${after}"
 rm -rf "${data_dir}"
 
