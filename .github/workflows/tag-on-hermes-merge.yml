@@ -9,6 +9,10 @@ name: Tag CI-Hermes Version On Merge
 on:
   workflow_dispatch:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   tag-merged-pr:
     if: >-
