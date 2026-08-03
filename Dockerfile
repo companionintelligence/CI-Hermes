@@ -23,9 +23,27 @@ RUN cd /app && npm install --omit=dev
 COPY server.cjs memory-gate.cjs terminal.html logo.webp entrypoint.sh gateway-entrypoint.sh start-hermes.sh bootstrap-ci-context.sh bootstrap-from-hub.sh configure-ci-server.py configure-hub-mcp.py /app/
 COPY assets /app/assets
 # Opt-out Sentry error reporting for the wrapper. Required by server.cjs on every
-# boot; inert without SENTRY_DSN. No build ARG needed — unlike the fleet's web
-# bundles this DSN is read at runtime, never baked into the image, so the
-# CI_TELEMETRY kill switch always reaches it.
+# boot; inert without SENTRY_DSN.
+#
+# This DSN is read from the process env at runtime — there is no web bundle here,
+# so nothing is compiled in the way the fleet's Vite apps are. But nothing supplies
+# it at runtime either: the marketplace runs this published image as-is, which is
+# why the wrapper has reported nothing since telemetry landed. Released images are
+# therefore built with `--build-arg SENTRY_DSN=…` and the value is re-exported as
+# ENV below, so a marketplace install reports out of the box.
+#
+# Built without the arg (local `docker build`) the ARG default is empty, which
+# resolveTelemetrySettings already treats as unset (disabledReason "no-dsn") —
+# nothing initialises and no outbound connection is opened.
+#
+# Baking the DSN does not weaken the kill switches: CI_TELEMETRY=off (what the
+# marketplace "Share crash reports" toggle sets) and CI_LOCAL_ONLY=true are
+# separate runtime vars and both still beat a baked-in DSN. A runtime
+# `-e SENTRY_DSN=…` also still overrides this value.
+ARG SENTRY_DSN=""
+ARG SENTRY_RELEASE=""
+ENV SENTRY_DSN=${SENTRY_DSN} \
+    SENTRY_RELEASE=${SENTRY_RELEASE}
 COPY telemetry /app/telemetry
 COPY ci-context/skills /app/ci-context/skills
 COPY ci-context/plugins/ci-runtime /opt/hermes/plugins/ci-runtime
