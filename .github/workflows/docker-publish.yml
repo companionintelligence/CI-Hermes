@@ -101,12 +101,28 @@ jobs:
       - name: Setup Docker buildx
         run: docker buildx create --use
 
+      # The wrapper reads SENTRY_DSN from its process env at start-up, but nothing
+      # supplies one to a marketplace install — so until now every published image
+      # reported nothing. Baking it here is what makes the opt-out default real.
+      #
+      # A missing secret must not fail the publish: `--build-arg SENTRY_DSN=` is a
+      # valid empty value, the Dockerfile ARG default takes over, and the image is
+      # simply unconfigured (disabledReason "no-dsn") exactly as before.
       - name: Run Docker buildx
         shell: bash
+        env:
+          SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
         run: |
           set -euo pipefail
+          if [ -z "${SENTRY_DSN}" ]; then
+            echo "::notice::SENTRY_DSN secret is not set — publishing an image with no DSN compiled in. Error reporting stays inert (disabledReason: no-dsn)."
+          else
+            echo "SENTRY_DSN is set — baking it into ${IMAGE_NAME}:${TAG}."
+          fi
           docker buildx build \
             --platform linux/amd64,linux/arm64 \
+            --build-arg "SENTRY_DSN=${SENTRY_DSN}" \
+            --build-arg "SENTRY_RELEASE=ci-hermes-server@${TAG}" \
             --tag "${IMAGE_NAME}:${TAG}" \
             --push .
 
