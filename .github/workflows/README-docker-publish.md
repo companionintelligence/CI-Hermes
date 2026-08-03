@@ -50,8 +50,14 @@ Tags are date-based with a `v` prefix: `vYYYY.M.D` (e.g. `v2026.6.20`). Use
 ## What The Workflow Does
 
 The workflow runs when:
-- a git tag is pushed
-- the `Tag CI-Hermes Version On Merge` workflow completes successfully
+- a release tag is pushed — the glob is `v[0-9]*.[0-9]*.[0-9]*`, so a tag must have at
+  least three dot-separated segments after the `v`. `v2026.6.20` and `v2026.6.20.2`
+  match; `v2026.6` and `test-publish-1` do not, and produce no run at all — no red X,
+  no notification. If nothing appears in Actions after a tag push, check the tag shape
+  first.
+- the `Tag CI-Hermes Version On Merge` workflow completes successfully. This trigger is
+  wired but not currently live: that workflow is gated to `workflow_dispatch` and its
+  only job requires a merged pull request, so it cannot cut a tag today.
 
 It builds multi-arch images (`linux/amd64`, `linux/arm64`) and pushes:
 - `${IMAGE_NAME}:${TAG}`
@@ -92,8 +98,8 @@ The workflow uses the default `GITHUB_TOKEN` for `docker login ghcr.io`.
 > **Do not push a throwaway tag to test this workflow.** This section used to say to
 > push `test-publish-1`. That built and pushed a real image to GHCR and created a
 > public GitHub Release named after the test tag — there is no dry-run path, so a
-> "test" publish is a real publish. The workflow now only triggers on `v[0-9]*`, so a
-> tag like `test-publish-1` does nothing at all.
+> "test" publish is a real publish. The workflow now only triggers on
+> `v[0-9]*.[0-9]*.[0-9]*`, so a tag like `test-publish-1` does nothing at all.
 
 Verify against a real release instead, as part of cutting one:
 
