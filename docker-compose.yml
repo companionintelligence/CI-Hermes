@@ -16,6 +16,15 @@ services:
       # Route local Ollama through the native /api/chat API (honors num_ctx) instead
       # of the OpenAI-compat /v1 endpoint (which ignores it). Empty = off (stock /v1).
       CI_HERMES_OLLAMA_NATIVE: ${CI_HERMES_OLLAMA_NATIVE:-}
+      # Opt-in error reporting for the wrapper (server.cjs). No DSN = the SDK is
+      # never loaded and nothing leaves the container; CI_TELEMETRY/CI_LOCAL_ONLY
+      # switch it off again without a rebuild. docs/operations/error-reporting.md
+      SENTRY_DSN: ${SENTRY_DSN:-}
+      SENTRY_ENV: ${SENTRY_ENV:-}
+      SENTRY_RELEASE: ${SENTRY_RELEASE:-}
+      CI_HERMES_VERSION: ${CI_HERMES_VERSION:-}
+      CI_TELEMETRY: ${CI_TELEMETRY:-}
+      CI_LOCAL_ONLY: ${CI_LOCAL_ONLY:-}
     ports:
       # Expose local dev on 18790 to match the CI app port; the Node server listens on 18789.
       - "18790:18789"

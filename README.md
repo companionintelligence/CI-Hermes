@@ -160,6 +160,18 @@ bash tests/configure-hub-mcp.test.sh
 
 If Hub MCP is disabled on the Hub, run `cihub mcp setup` and restart the Hermes app to pick up new credentials.
 
+## Error reporting
+
+The wrapper can report its own crashes to Sentry. It is **opt-in and off by
+default**: with no `SENTRY_DSN` the SDK is never loaded and the container makes
+no outbound connection. `CI_TELEMETRY=off` or `CI_LOCAL_ONLY=true` disable it
+again without a rebuild, and `GET /__ci_telemetry/config` reports which switch is
+in effect. Only `server.cjs` is instrumented — not the upstream Hermes dashboard
+or gateway.
+
+See [docs/operations/error-reporting.md](docs/operations/error-reporting.md) for
+the privacy posture and the full redaction rules.
+
 ## License
 
 MIT
