@@ -67,7 +67,15 @@ The URL it offers by default is `http://127.0.0.1:8642`, which is correct only w
 Hermes runs on the hub host itself. See [Which URL do I use?](#which-url-do-i-use) for
 the address to give it otherwise.
 
-Finally, open the Hermes **`/plugins`** page and enable `companionintelligence`.
+That is the whole activation — `memory.provider` is what Hermes reads when it starts a
+session. Confirm with `hermes memory status`.
+
+`hermes plugins list` and the `/plugins` page will still show this plugin as **not
+enabled**, which looks like a missed step but is not one. That registry is the general
+plugin loader, and Hermes deliberately routes memory providers away from it (it coerces
+them to `kind: exclusive`, because the general plugin context has no
+`register_memory_provider`). Enabling it there activates nothing extra, and prompts you
+to grant a built-in tool override — a privileged capability this plugin never uses.
 
 > `hermes memory setup` is a command-line command, not a chat message. Typed at the
 > chat prompt (`❯`), Hermes will simply answer it like a question and nothing gets
@@ -141,9 +149,9 @@ narrowed with environment variables, all enabled by default:
 `CI_MEMORY_WRITE_ENABLED`, `CI_INTENTS_ENABLED`, `CI_INTENT_TOOLS_ENABLED`. Set any to
 `false` to disable that behaviour.
 
-To stop the integration entirely without uninstalling, clear `memory.provider` in
-`config.yaml` and disable `companionintelligence` on the `/plugins` page. Setting
-every flag above to `false` also works. (`CI_SERVER_ENABLED` is **not** an
+To stop the integration entirely without uninstalling, run `hermes memory off`, which
+clears `memory.provider` in `config.yaml`. That alone is enough — the `/plugins` page
+does not gate this plugin (see above). Setting every flag above to `false` also works. (`CI_SERVER_ENABLED` is **not** an
 off-switch here — it is read only by the packaged Companion Intelligence appliance,
 not by this plugin, so on a stock install it has no effect.)
 
