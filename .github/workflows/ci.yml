@@ -1,0 +1,86 @@
+name: CI
+
+# This repo had no test gate at all until now: docker-publish.yml was the only
+# workflow, so the suites in tests/ had never been run by anything but a human
+# remembering to. They pass; nothing was keeping them passing.
+#
+# Scope note, deliberate: this gates pull requests and the npm publish. It does NOT
+# yet gate docker-publish.yml. Wiring a never-before-run suite into the image release
+# path is a separate change with its own risk, and it should happen once this has
+# been observed green for a while — not in the same PR that introduces it.
+on:
+  pull_request:
+  push:
+    branches: [master, main]
+  workflow_dispatch:
+  # Called by npm-publish.yml, which passes the exact ref it is about to publish so
+  # the tested tree and the packaged tree cannot disagree.
+  workflow_call:
+    inputs:
+      ref:
+        description: >-
+          Ref to test. Leave empty to test the ref that triggered the run.
+        type: string
+        required: false
+        default: ""
+
+permissions:
+  contents: read
+
+concurrency:
+  # github.workflow resolves to the CALLER's name for a called workflow, so a publish
+  # gate lands in its own group and cannot collide with a CI run on the same ref.
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  # Only supersede in-flight PR runs: a cancelled publish gate must never read as a
+  # passed one.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  test:
+    name: Unit + shell tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install the shell suites' one dependency
+        # Several bootstrap tests assert on the generated config.yaml by parsing it
+        # with python3 + PyYAML, so it has to be present rather than assumed.
+        #
+        # Ubuntu 24.04 ships an externally-managed Python (PEP 668) where a bare
+        # `pip install` can refuse with "externally-managed-environment". The current
+        # hosted image allows it — verified in an actual run — but that is a property
+        # of the image, not a guarantee, so fall back rather than break the day it
+        # changes.
+        run: |
+          set -euo pipefail
+          if python3 -c "import yaml" 2>/dev/null; then
+            echo "PyYAML already available"
+          else
+            python3 -m pip install --quiet pyyaml \
+              || python3 -m pip install --quiet --break-system-packages pyyaml
+          fi
+
+      # Deliberately no `npm ci`: the suites are dependency-free by design, and the
+      # scripts under test must not start requiring node-pty/ws, which the container
+      # resolves by absolute path.
+      - name: Unit tests
+        run: npm run test:unit
+
+      - name: Shell tests
+        run: npm run test:sh
+
+      # The memory plugin's own suite — 77 stdlib-unittest tests that stub the Hermes
+      # base class so the module imports standalone. Nothing in this repo ran them
+      # before, and this is the PR that starts publishing that exact code to a public
+      # registry, so gating the packaging while leaving the packaged code untested
+      # would guard the wrong half. No dependencies, ~10ms.
+      - name: Memory plugin tests
+        working-directory: ci-context/plugins/companionintelligence
+        run: python3 -m unittest discover -p '*_test.py' --verbose
