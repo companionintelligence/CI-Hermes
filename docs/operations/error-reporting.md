@@ -1,8 +1,21 @@
 # Error reporting (Sentry)
 
-The CI-Hermes wrapper can report its own crashes to [Sentry](https://sentry.io).
-It is **opt-in and off by default**: with no DSN configured, `@sentry/node` is
-never even loaded and the container makes no outbound connection.
+The CI-Hermes wrapper reports its own crashes to [Sentry](https://sentry.io). It
+is **opt-out**: on any build configured with a DSN, reporting is **on by
+default**, and the user turns it off with the **Share crash reports** toggle in
+the app store (or `CI_TELEMETRY=off` directly).
+
+Two statements are both true here and easy to conflate:
+
+- **Configured with a DSN → reporting is on** unless the user turns it off. That
+  is the shipped appliance: release images carry a DSN.
+- **No DSN → nothing initialises**, `@sentry/node` is never even loaded, and the
+  container makes no outbound connection. That is a source checkout, a local
+  `docker compose up`, or any build made without `SENTRY_DSN`. It is the absence
+  of configuration, not a privacy setting.
+
+So "opt-out" describes what a user of the appliance experiences. It does not
+mean a DSN-less build quietly reports — it cannot.
 
 This follows the fleet contract set by CI-Server
 (`docs/operations/error-reporting.md` there); CI-Import-Tools and
@@ -47,26 +60,31 @@ Four default integrations are removed at init (`telemetry/index.cjs`):
   handlers that log and **keep serving**. The SDK's would report the same crash
   twice and can exit the process; reporting is not allowed to change behaviour.
 - **`ProcessSession`** — release-health sessions phone home on start and exit
-  even when nothing has gone wrong. Opt-in error reporting should mean the
-  appliance talks to Sentry when it has a crash to report, and not otherwise.
+  even when nothing has gone wrong, and session envelopes do **not** pass
+  through `beforeSend`. Everything else this app sends is scrubbed on the way
+  out; a stream that bypasses the scrubber entirely is the one thing the privacy
+  posture above cannot vouch for, so it is dropped and reporting stays strictly
+  error-driven.
 
-## Kill switches
+## Turning it off
 
-Two switches disable reporting even when a DSN is baked into an image (which is
-how a Hub-installed app receives one), so an operator can turn it off without a
-rebuild:
+Three ways, in the order most users will reach for them. All of them work
+against a DSN baked into an image (which is how a Hub-installed app receives
+one), so reporting can always be stopped without a rebuild:
 
-| Variable | Effect |
+| How | Effect |
 |---|---|
-| `CI_TELEMETRY=off` | Explicit opt-out (also `false`, `0`, `no`, `disabled`). |
+| **Share crash reports** toggle in the app store | The user-facing control. Sets `CI_TELEMETRY` on the container. |
+| `CI_TELEMETRY=off` | The same switch, set directly (also `false`, `0`, `no`, `disabled`). |
 | `CI_LOCAL_ONLY=true` | Local-only mode means zero phone-home (also `1`, `yes`, `on`, `enabled`). |
 
 `CI_LOCAL_ONLY` takes precedence over `CI_TELEMETRY`, which takes precedence over
 the DSN. The resolved reason is reported as `local-only`, `opt-out` or `no-dsn`.
 
-Because the only Sentry SDK here runs in the container, the marketplace "Share
-crash reports" toggle — which sets `CI_TELEMETRY` on the container — applies
-directly, with no build-time consent problem to solve.
+Because the only Sentry SDK here runs in the container, the **Share crash
+reports** toggle applies directly, with no build-time consent problem to solve —
+unlike the fleet's browser bundles, which have to consult a consent endpoint
+because a DSN compiled into a bundle cannot be revoked afterwards.
 
 ## Checking the gate at runtime
 
@@ -189,7 +207,7 @@ placed in `require.cache`.
 
 | Path | Role |
 |---|---|
-| `telemetry/settings.cjs` | Resolves the opt-in gate from env |
+| `telemetry/settings.cjs` | Resolves the telemetry gate from env |
 | `telemetry/scrub.cjs` | `beforeSend` scrubber |
 | `telemetry/fixtures.cjs` | Redaction cases shared with the rest of the fleet (drift guard) |
 | `telemetry/index.cjs` | `Sentry.init`, capture helper, bounded flush |

@@ -1,4 +1,4 @@
-// Opt-in error reporting. Deliberately the first statement in the file: the
+// Opt-out error reporting. Deliberately the first statement in the file: the
 // Sentry SDK patches Node's http internals when it initialises, so anything
 // required before it (http, ws) would go uninstrumented. Without SENTRY_DSN this
 // resolves the gate, returns, and never loads the SDK — see

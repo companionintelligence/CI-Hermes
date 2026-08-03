@@ -8,14 +8,15 @@ const {
 } = require("../telemetry/settings.cjs");
 
 // ---------------------------------------------------------------------------
-// The gate is the whole privacy promise: "opt-in, off by default, and turnable
-// off again without rebuilding the image". A DSN is baked into a Hub-installed
-// image, so the kill switches are the only thing an operator has left.
+// The gate is the whole privacy promise: "on wherever a DSN is configured, and
+// turnable off again without rebuilding the image". A DSN is baked into a
+// Hub-installed image, so the kill switches are the only thing an operator has
+// left.
 // ---------------------------------------------------------------------------
 
 const DSN = "https://abc123@o1.ingest.us.sentry.io/9999999";
 
-describe("resolveTelemetrySettings: the opt-in gate", () => {
+describe("resolveTelemetrySettings: the telemetry gate", () => {
   test("is off with no DSN, and says why", () => {
     const settings = resolveTelemetrySettings({}, "ci-hermes-web");
 

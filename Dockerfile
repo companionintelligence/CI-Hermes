@@ -22,9 +22,10 @@ RUN cd /app && npm install --omit=dev
 # stay outside /opt/data so the agent cannot edit managed instructions.
 COPY server.cjs memory-gate.cjs terminal.html logo.webp entrypoint.sh gateway-entrypoint.sh start-hermes.sh bootstrap-ci-context.sh bootstrap-from-hub.sh configure-ci-server.py configure-hub-mcp.py /app/
 COPY assets /app/assets
-# Opt-in Sentry error reporting for the wrapper. Required by server.cjs on every
+# Opt-out Sentry error reporting for the wrapper. Required by server.cjs on every
 # boot; inert without SENTRY_DSN. No build ARG needed — unlike the fleet's web
-# bundles this DSN is read at runtime, never baked into the image.
+# bundles this DSN is read at runtime, never baked into the image, so the
+# CI_TELEMETRY kill switch always reaches it.
 COPY telemetry /app/telemetry
 COPY ci-context/skills /app/ci-context/skills
 COPY ci-context/plugins/ci-runtime /opt/hermes/plugins/ci-runtime
