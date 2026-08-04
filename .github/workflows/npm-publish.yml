@@ -365,14 +365,31 @@ jobs:
       - name: Confirm the tarball is fetchable at its documented URL
         if: steps.decide.outputs.publish == 'true' && steps.version.outputs.dry_run == 'false'
         env:
+          PACKAGE: "@companionintelligence/hermes-memory"
           VERSION: ${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
           # The README hands users this exact URL, so verify the URL rather than just
           # the registry metadata. A tag must never imply an artifact that is not
           # actually downloadable.
-          url="https://registry.npmjs.org/@companionintelligence/hermes-memory/-/hermes-memory-${VERSION}.tgz"
-          for attempt in 1 2 3 4 5; do
+          #
+          # The window is 5 minutes, not the 50 seconds this used to allow. On the
+          # v2026.8.4 release the publish itself succeeded and this step still failed:
+          # every one of the five attempts 404'd, and the tarball was serving shortly
+          # after. A green publish followed by a red confirmation is worse than no check
+          # at all — it marks a good release as broken. CI-OpenClaw hit the same wall on
+          # its 2026.8.3 release and widened to the same 5 minutes (#68); this is that
+          # fix, kept on the stronger gate below.
+          #
+          # The gate stays the tarball AND its contents, rather than `npm view`. The
+          # packument only says a version resolves; it cannot say the artifact carries
+          # plugin.yaml, which is what makes the tarball installable as a plugin. The
+          # packument is probed only to sharpen the failure message.
+          #
+          # Derived from PACKAGE rather than spelled out again, so the scope and the
+          # tarball path cannot drift apart if the package is ever renamed.
+          url="https://registry.npmjs.org/${PACKAGE}/-/${PACKAGE##*/}-${VERSION}.tgz"
+          for attempt in $(seq 1 20); do
             if curl -fsSL "${url}" -o "${RUNNER_TEMP}/published-check.tgz"; then
               # Listed into a variable rather than piped into `grep -q`. Under pipefail
               # a `grep -q` that matches early closes the pipe, tar dies of SIGPIPE, and
@@ -383,10 +400,24 @@ jobs:
               echo "Confirmed ${url} downloads and contains plugin.yaml."
               exit 0
             fi
-            echo "Not fetchable yet (attempt ${attempt}); waiting for registry propagation."
-            sleep 10
+            echo "Not fetchable yet (attempt ${attempt}/20); waiting for registry propagation."
+            sleep 15
           done
-          echo "::error::${url} was not fetchable after publishing."
+
+          # Deliberately not a silent pass. The guidance has to be right, though, and
+          # "never re-run" would be wrong here: the `decide` step guards on
+          # `npm view "${PACKAGE}@${VERSION}"`, so once the packument propagates a
+          # re-run sets publish=false, skips both the publish and this step, and goes
+          # green. Re-running is the fix, not the trap.
+          #
+          # The trap is re-running IMMEDIATELY, while the packument is still 404ing.
+          # Then that guard does not fire, the job publishes a version that already
+          # exists, and npm rejects it with E403. So the instruction is to wait for the
+          # registry to show the version and only then re-run.
+          echo "::error::${url} was not fetchable within 5 minutes. The publish step itself succeeded, so ${VERSION} is almost certainly on the registry already. Do NOT re-run immediately: wait until https://www.npmjs.com/package/${PACKAGE} shows ${VERSION}, then re-run — the already-published guard will detect it, skip the publish, and this job will pass. Re-running while the registry is still catching up bypasses that guard and fails with E403 cannot publish over an existing version."
+          if npm view "${PACKAGE}@${VERSION}" version >/dev/null 2>&1; then
+            echo "::error::${PACKAGE}@${VERSION} already resolves on the registry, so the publish landed and only the tarball URL is lagging — a re-run now will hit the guard and pass."
+          fi
           exit 1
 
       - name: Dry run summary
