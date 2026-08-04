@@ -365,14 +365,29 @@ jobs:
       - name: Confirm the tarball is fetchable at its documented URL
         if: steps.decide.outputs.publish == 'true' && steps.version.outputs.dry_run == 'false'
         env:
+          PACKAGE: "@companionintelligence/hermes-memory"
           VERSION: ${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
           # The README hands users this exact URL, so verify the URL rather than just
           # the registry metadata. A tag must never imply an artifact that is not
           # actually downloadable.
+          #
+          # The window is 5 minutes, not the 50 seconds this used to allow. On the
+          # v2026.8.4 release the publish itself succeeded and this step still failed:
+          # every one of the five attempts 404'd, and the tarball was serving shortly
+          # after. A green publish followed by a red confirmation is worse than no check
+          # at all — it marks a good release as broken and invites the one response that
+          # cannot work, because npm versions are immutable. CI-OpenClaw hit the same
+          # wall on its 2026.8.3 release and widened to the same 5 minutes (#68); this
+          # is that fix, kept on the stronger gate below.
+          #
+          # The gate stays the tarball AND its contents, rather than `npm view`. The
+          # packument only says a version resolves; it cannot say the artifact carries
+          # plugin.yaml, which is what makes the tarball installable as a plugin. The
+          # packument is probed only to sharpen the failure message.
           url="https://registry.npmjs.org/@companionintelligence/hermes-memory/-/hermes-memory-${VERSION}.tgz"
-          for attempt in 1 2 3 4 5; do
+          for attempt in $(seq 1 20); do
             if curl -fsSL "${url}" -o "${RUNNER_TEMP}/published-check.tgz"; then
               # Listed into a variable rather than piped into `grep -q`. Under pipefail
               # a `grep -q` that matches early closes the pipe, tar dies of SIGPIPE, and
@@ -383,10 +398,17 @@ jobs:
               echo "Confirmed ${url} downloads and contains plugin.yaml."
               exit 0
             fi
-            echo "Not fetchable yet (attempt ${attempt}); waiting for registry propagation."
-            sleep 10
+            echo "Not fetchable yet (attempt ${attempt}/20); waiting for registry propagation."
+            sleep 15
           done
-          echo "::error::${url} was not fetchable after publishing."
+
+          # Deliberately not a silent pass. But the message has to stop the obvious next
+          # move: the publish step above already succeeded, so re-running this job
+          # republishes an existing version and dies on E403.
+          echo "::error::${url} was not fetchable within 5 minutes. The publish step itself succeeded, so the version is almost certainly on the registry already — DO NOT re-run this job, it will fail with E403 cannot publish over an existing version. Check https://www.npmjs.com/package/${PACKAGE} and, if the version is there with a working tarball, this release is fine."
+          if npm view "${PACKAGE}@${VERSION}" version >/dev/null 2>&1; then
+            echo "::error::${PACKAGE}@${VERSION} DOES resolve on the registry, so the publish landed and only the tarball URL is lagging."
+          fi
           exit 1
 
       - name: Dry run summary
