@@ -27,6 +27,7 @@ import sys
 import threading
 import urllib.error
 import urllib.request
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from agent.memory_provider import MemoryProvider
@@ -115,6 +116,63 @@ def _normalize_base_url(base_url: str) -> str:
 # HTTP client — urllib only, zero extra dependencies
 # ---------------------------------------------------------------------------
 
+def _plugin_version() -> str:
+    """The version stamped into ``plugin.yaml``, or ``"unknown"``.
+
+    Read with a line match rather than a YAML parser: this plugin declares no pip
+    dependencies, so PyYAML is not guaranteed to be importable, and
+    ``scripts/pack-memory-plugin.sh`` writes the field as a plain ``version: <x>``
+    line at pack time. Never raises — an unreadable manifest must cost the
+    User-Agent its version, not break every request.
+    """
+    try:
+        manifest = Path(__file__).with_name("plugin.yaml")
+        for line in manifest.read_text(encoding="utf-8").splitlines():
+            if line.startswith("version:"):
+                value = line.split(":", 1)[1].strip().strip("\"'")
+                if value:
+                    return value
+    except Exception:
+        pass
+    return "unknown"
+
+
+# Every request names itself. urllib's default is ``Python-urllib/<x.y>``, and edge
+# proxies in front of a CI-Server deployment block that signature as a scripted client:
+# Cloudflare's managed rules answer it 403 ("Error 1010") before the request reaches the
+# server at all. Nothing in this plugin would surface that. Writes are swallowed rather
+# than allowed to break a session, so a blocked plugin is indistinguishable from a
+# working one with nothing to say — setup passes, and memory simply never accumulates.
+# Naming the client clears those rules and makes the plugin identifiable in an
+# operator's access log.
+_USER_AGENT = f"companionintelligence-hermes-memory/{_plugin_version()}"
+
+
+def _build_request(
+    url: str,
+    token: str,
+    *,
+    method: str,
+    data: Optional[bytes] = None,
+) -> urllib.request.Request:
+    """Build a CI-Server request carrying the full standard header set.
+
+    Every outbound call in this module goes through here, so a header can never be
+    added on one path and forgotten on another — which is exactly how the
+    User-Agent came to be missing from all four of them.
+    """
+    req = urllib.request.Request(url, data=data, method=method)
+    req.add_header("x-api-key", token)
+    req.add_header("Accept", "application/json")
+    # urllib tests for its own default under the capitalized key, and add_header
+    # stores "User-Agent" as "User-agent" — which is why setting it here is what
+    # suppresses Python-urllib/x.y rather than sitting alongside it.
+    req.add_header("User-Agent", _USER_AGENT)
+    if data is not None:
+        req.add_header("Content-Type", "application/json")
+    return req
+
+
 class _CIClient:
     def __init__(self, base_url: str, token: str, timeout: float = _REQUEST_TIMEOUT):
         self._base = _normalize_base_url(base_url)
@@ -193,8 +251,7 @@ class _CIClient:
 
     def health(self) -> bool:
         try:
-            req = urllib.request.Request(f"{self._base}/api/health")
-            req.add_header("x-api-key", self._token)
+            req = _build_request(f"{self._base}/api/health", self._token, method="GET")
             with urllib.request.urlopen(req, timeout=3.0) as resp:
                 return resp.status == 200
         except Exception:
@@ -204,9 +261,7 @@ class _CIClient:
 
     def _get(self, path: str) -> dict:
         url = f"{self._base}{path}"
-        req = urllib.request.Request(url, method="GET")
-        req.add_header("x-api-key", self._token)
-        req.add_header("Accept", "application/json")
+        req = _build_request(url, self._token, method="GET")
         try:
             with urllib.request.urlopen(req, timeout=self._timeout) as resp:
                 body = resp.read().decode("utf-8", errors="replace")
@@ -222,10 +277,7 @@ class _CIClient:
     def _post(self, path: str, payload: dict) -> dict:
         url = f"{self._base}{path}"
         data = json.dumps(payload).encode("utf-8")
-        req = urllib.request.Request(url, data=data, method="POST")
-        req.add_header("x-api-key", self._token)
-        req.add_header("Content-Type", "application/json")
-        req.add_header("Accept", "application/json")
+        req = _build_request(url, self._token, method="POST", data=data)
         try:
             with urllib.request.urlopen(req, timeout=self._timeout) as resp:
                 body = resp.read().decode("utf-8", errors="replace")
@@ -271,7 +323,6 @@ class CompanionIntelligenceProvider(MemoryProvider):
         return bool(cfg.get("url") and cfg.get("token"))
 
     def save_config(self, values: dict, hermes_home: str) -> None:
-        from pathlib import Path
         config_dir = Path(hermes_home) / "companionintelligence"
         config_dir.mkdir(parents=True, exist_ok=True)
         config_path = config_dir / "config.json"
@@ -311,7 +362,6 @@ class CompanionIntelligenceProvider(MemoryProvider):
         fails.
         """
         import stat
-        from pathlib import Path
 
         try:
             from hermes_cli.config import save_config as hermes_save_config
@@ -357,9 +407,7 @@ class CompanionIntelligenceProvider(MemoryProvider):
         print(f"\n  Testing connection: GET {health_url} ...")
 
         try:
-            req = urllib.request.Request(health_url, method="GET")
-            req.add_header("x-api-key", token)
-            req.add_header("Accept", "application/json")
+            req = _build_request(health_url, token, method="GET")
             with urllib.request.urlopen(req, timeout=6.0) as resp:
                 status = resp.status
                 body = resp.read().decode("utf-8", errors="replace")[:200]
@@ -374,6 +422,13 @@ class CompanionIntelligenceProvider(MemoryProvider):
             print(f"  ✗ HTTP {exc.code} {exc.reason}")
             if body:
                 print(f"    {body}")
+            # CI-Server answers in JSON. An HTML error body means something in front of
+            # it refused the request and the server never saw it — the distinction that
+            # decides whether to go re-mint the key or change the address.
+            if "<html" in body.lower():
+                print("    That is an HTML error page, so it came from a CDN or proxy in front of")
+                print("    CI-Server rather than from CI-Server itself. Your key is not the problem;")
+                print("    try the server's LAN or VPN address instead of its public URL.")
             print("  Nothing was saved — run 'hermes memory setup' again when ready.\n")
             return
         except urllib.error.URLError as exc:

@@ -8,9 +8,11 @@ memory-client drift fixes, and the intent-catalog injection) with mocks.
 Run: ``python3 -m unittest provider_test`` from this directory.
 """
 
+import io
 import json
 import os
 import sys
+import tempfile
 import threading
 import types
 import unittest
@@ -330,6 +332,148 @@ class MemoryTransportTests(unittest.TestCase):
             self.assertEqual(cap["accept"], "application/json")
             self.assertEqual(cap["content_type"], "application/json")
             self.assertEqual(cap["api_key"], "tok")
+
+
+class UserAgentTests(unittest.TestCase):
+    """Every request must name itself.
+
+    urllib defaults to ``Python-urllib/<x.y>``, which edge proxies in front of a
+    CI-Server deployment block outright — Cloudflare answers that signature 403
+    ("Error 1010") before the request reaches the server. Nothing in the plugin
+    surfaces it: writes are swallowed rather than allowed to break a session, so a
+    blocked plugin is indistinguishable from a working one that has nothing to
+    say. These tests exist because that failure has no other symptom.
+    """
+
+    def _capture_ua(self, body=b"{}"):
+        captured = {}
+
+        def fake_urlopen(req, timeout=None):
+            captured["user_agent"] = req.get_header("User-agent")
+            return _FakeResp(body)
+
+        return captured, fake_urlopen
+
+    def test_every_client_path_sends_the_product_user_agent(self):
+        # Named individually rather than trusting the shared helper: the bug being
+        # fixed was one path missing a header the others had.
+        client = ci._CIClient("http://ci-server:8642", "tok")
+        for label, op in (
+            ("context", lambda: client.context()),
+            ("recall", lambda: client.recall("q")),
+            ("turn", lambda: client.turn([{"role": "user", "content": "u"}])),
+            ("write", lambda: client.write("note")),
+            ("intent", lambda: client.invoke_intent("memory_search", {})),
+            ("health", lambda: client.health()),
+        ):
+            cap, fake = self._capture_ua()
+            with mock.patch("urllib.request.urlopen", fake):
+                op()
+            self.assertEqual(cap["user_agent"], ci._USER_AGENT, f"{label} sent {cap.get('user_agent')!r}")
+            self.assertNotIn("Python-urllib", cap["user_agent"] or "", label)
+
+    def test_user_agent_names_the_package_and_a_version(self):
+        self.assertRegex(ci._USER_AGENT, r"^companionintelligence-hermes-memory/\S+$")
+
+    def test_explicit_header_suppresses_urllibs_default(self):
+        # Load-bearing and subtle: urllib looks for its own default under the
+        # CAPITALIZED key, and add_header stores "User-Agent" as "User-agent". If
+        # those ever stopped agreeing, urllib would re-add Python-urllib and the
+        # 403 would come back with every other test still passing.
+        req = ci._build_request("http://ci-server:8642/api/health", "tok", method="GET")
+        self.assertTrue(req.has_header("User-agent"))
+        self.assertEqual(req.get_header("User-agent"), ci._USER_AGENT)
+
+    def test_content_type_is_set_only_when_there_is_a_body(self):
+        get = ci._build_request("http://h/x", "tok", method="GET")
+        post = ci._build_request("http://h/x", "tok", method="POST", data=b"{}")
+        self.assertIsNone(get.get_header("Content-type"))
+        self.assertEqual(post.get_header("Content-type"), "application/json")
+        for req in (get, post):
+            self.assertEqual(req.get_header("X-api-key"), "tok")
+            self.assertEqual(req.get_header("Accept"), "application/json")
+
+
+class PluginVersionTests(unittest.TestCase):
+    def test_reads_the_version_stamped_into_plugin_yaml(self):
+        # scripts/pack-memory-plugin.sh rewrites this line at release time, so the
+        # User-Agent reports whatever version was actually packed.
+        stamped = ""
+        with open(os.path.join(_HERE, "plugin.yaml"), encoding="utf-8") as fh:
+            for line in fh:
+                if line.startswith("version:"):
+                    stamped = line.split(":", 1)[1].strip()
+                    break
+        self.assertTrue(stamped, "plugin.yaml has no version: line to stamp")
+        self.assertEqual(ci._plugin_version(), stamped)
+
+    def test_unreadable_manifest_degrades_to_unknown(self):
+        # A missing manifest costs the User-Agent its version. It must not raise:
+        # this runs at import time, so an exception here disables the plugin.
+        with mock.patch.object(ci.Path, "read_text", side_effect=OSError("nope")):
+            self.assertEqual(ci._plugin_version(), "unknown")
+
+
+class SetupProbeTests(unittest.TestCase):
+    """`hermes memory setup`'s own connection test — the first request a user makes."""
+
+    def _run_setup(self, urlopen, url="http://ci-server:8642", token="tok"):
+        """Drive post_setup end to end, returning (stdout, saved config.yaml dict)."""
+        hermes_cli = types.ModuleType("hermes_cli")
+        config_mod = types.ModuleType("hermes_cli.config")
+        saved = {}
+        config_mod.save_config = lambda cfg: saved.update(cfg)
+        hermes_cli.config = config_mod
+
+        config = {}
+        out = io.StringIO()
+        with tempfile.TemporaryDirectory() as home:
+            with mock.patch.dict(sys.modules, {"hermes_cli": hermes_cli, "hermes_cli.config": config_mod}), \
+                 mock.patch("urllib.request.urlopen", urlopen), \
+                 mock.patch.object(sys, "stdin", io.StringIO(f"{url}\n{token}\n")), \
+                 mock.patch.object(sys, "stdout", out):
+                ci.CompanionIntelligenceProvider().post_setup(home, config)
+        return out.getvalue(), saved
+
+    def test_probe_sends_the_product_user_agent(self):
+        # The user-visible bug: this probe was the request Cloudflare rejected, so
+        # setup failed with a 403 on a key and URL that were both correct.
+        seen = {}
+
+        def fake_urlopen(req, timeout=None):
+            seen["user_agent"] = req.get_header("User-agent")
+            seen["url"] = req.full_url
+            return _FakeResp(b'{"status":"ok"}')
+
+        text, saved = self._run_setup(fake_urlopen)
+        self.assertEqual(seen["user_agent"], ci._USER_AGENT)
+        self.assertTrue(seen["url"].endswith("/api/health"))
+        self.assertIn("Connected", text)
+        self.assertEqual(saved["memory"]["provider"], "companionintelligence")
+
+    def test_html_error_body_is_named_as_a_proxy_not_a_bad_key(self):
+        # CI-Server answers in JSON. An HTML body means the request never reached
+        # it — the difference between re-minting a key and changing the address.
+        def fake_urlopen(req, timeout=None):
+            raise urllib.error.HTTPError(
+                req.full_url, 403, "Forbidden", None,
+                io.BytesIO(b"<html><head><title>Access denied</title></head></html>"),
+            )
+
+        text, saved = self._run_setup(fake_urlopen)
+        self.assertIn("CDN or proxy in front of", text)
+        self.assertIn("Nothing was saved", text)
+        self.assertEqual(saved, {})
+
+    def test_json_error_body_gets_no_proxy_hint(self):
+        def fake_urlopen(req, timeout=None):
+            raise urllib.error.HTTPError(
+                req.full_url, 403, "Forbidden", None, io.BytesIO(b'{"error":"insufficient scope"}'),
+            )
+
+        text, _ = self._run_setup(fake_urlopen)
+        self.assertNotIn("CDN or proxy", text)
+        self.assertIn("insufficient scope", text)
 
 
 class ContextAndIntentGatingTests(unittest.TestCase):

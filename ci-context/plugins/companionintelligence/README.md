@@ -129,6 +129,11 @@ setup rather than a broken install. Two causes are common:
   HTTPS-only address. Type `https://` yourself for the VPN and public forms.
 - **The default.** Pressing Enter accepts `http://127.0.0.1:8642`, which cannot work
   unless Hermes is running on the hub host.
+- **A `403` whose body is an HTML page.** Companion Memory answers in JSON, so an HTML
+  error came from a CDN or proxy in front of it and the server never saw the request —
+  your key is not the problem. The wizard says so when it sees one. Use the app's LAN or
+  VPN address instead of its public URL, or allow this plugin through at the edge (it
+  identifies itself; see below).
 
 A timeout or a refused connection points at the address; a `401` points at the key.
 
@@ -160,6 +165,12 @@ not by this plugin, so on a stock install it has no effect.)
 `GET /api/health`, `GET /api/memory/context`, `POST /api/memory/recall`,
 `POST /api/memory/write`, `POST /api/memory/turn`, and the agent intents endpoints.
 No third-party services.
+
+Every request is sent with `User-Agent: companionintelligence-hermes-memory/<version>`,
+so the plugin is identifiable in an access log and can be allowed through a proxy by
+name. This matters more than it sounds: a bot rule that rejects the requests instead has
+no visible symptom, because capture failures are swallowed rather than allowed to break a
+session — setup passes and memory just never accumulates.
 
 ## Uninstall
 
