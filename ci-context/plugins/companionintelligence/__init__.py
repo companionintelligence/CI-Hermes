@@ -148,6 +148,30 @@ def _plugin_version() -> str:
 _USER_AGENT = f"companionintelligence-hermes-memory/{_plugin_version()}"
 
 
+# Every request goes direct, never through a system proxy.
+#
+# ``urlopen`` uses the default opener, which installs a ProxyHandler built from
+# ``getproxies()``. On Windows that falls back to the WinINET registry proxy when no
+# ``*_proxy`` env vars are set, and its "bypass local addresses" rule
+# (``proxy_bypass_registry``) only exempts DOTLESS hostnames — so ``127.0.0.1``, the
+# default CI-Server address this plugin ships with, is NOT bypassed. On a corporate
+# laptop with a static proxy configured, requests to a CI-Server running on the same
+# machine get handed to the proxy as an absolute-URI GET and never arrive. macOS has
+# the analogous behaviour via ``getproxies_macosx_sysconf``.
+#
+# That failure is invisible: capture errors are swallowed rather than allowed to break
+# a session (see the User-Agent note above), so setup passes and memory just never
+# accumulates. CI-Server is a LAN or loopback appliance by design and there is no
+# deployment where routing it through an enterprise proxy is correct, so the opener
+# below has an empty ProxyHandler — proxies are ignored on every platform.
+_DIRECT_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
+def _urlopen(req: urllib.request.Request, timeout: float):
+    """Open *req* directly, bypassing any system/environment proxy."""
+    return _DIRECT_OPENER.open(req, timeout=timeout)
+
+
 def _build_request(
     url: str,
     token: str,
@@ -252,7 +276,7 @@ class _CIClient:
     def health(self) -> bool:
         try:
             req = _build_request(f"{self._base}/api/health", self._token, method="GET")
-            with urllib.request.urlopen(req, timeout=3.0) as resp:
+            with _urlopen(req, timeout=3.0) as resp:
                 return resp.status == 200
         except Exception:
             return False
@@ -263,7 +287,7 @@ class _CIClient:
         url = f"{self._base}{path}"
         req = _build_request(url, self._token, method="GET")
         try:
-            with urllib.request.urlopen(req, timeout=self._timeout) as resp:
+            with _urlopen(req, timeout=self._timeout) as resp:
                 body = resp.read().decode("utf-8", errors="replace")
                 return json.loads(body) if body else {}
         except urllib.error.HTTPError as exc:
@@ -279,7 +303,7 @@ class _CIClient:
         data = json.dumps(payload).encode("utf-8")
         req = _build_request(url, self._token, method="POST", data=data)
         try:
-            with urllib.request.urlopen(req, timeout=self._timeout) as resp:
+            with _urlopen(req, timeout=self._timeout) as resp:
                 body = resp.read().decode("utf-8", errors="replace")
                 return json.loads(body) if body else {}
         except urllib.error.HTTPError as exc:
@@ -408,7 +432,7 @@ class CompanionIntelligenceProvider(MemoryProvider):
 
         try:
             req = _build_request(health_url, token, method="GET")
-            with urllib.request.urlopen(req, timeout=6.0) as resp:
+            with _urlopen(req, timeout=6.0) as resp:
                 status = resp.status
                 body = resp.read().decode("utf-8", errors="replace")[:200]
             if status == 200:

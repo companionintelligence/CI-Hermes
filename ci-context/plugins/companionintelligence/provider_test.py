@@ -8,6 +8,7 @@ memory-client drift fixes, and the intent-catalog injection) with mocks.
 Run: ``python3 -m unittest provider_test`` from this directory.
 """
 
+import http.server
 import io
 import json
 import os
@@ -256,7 +257,7 @@ class MemoryTransportTests(unittest.TestCase):
 
     def test_context_issues_authenticated_get(self):
         cap, fake = self._capture(b'{"block":"PROFILE"}')
-        with mock.patch("urllib.request.urlopen", fake):
+        with mock.patch.object(ci, "_urlopen", fake):
             out = self._client().context()
         self.assertTrue(cap["url"].endswith("/api/memory/context"))
         self.assertEqual(cap["method"], "GET")
@@ -266,7 +267,7 @@ class MemoryTransportTests(unittest.TestCase):
 
     def test_recall_posts_query_and_capped_results(self):
         cap, fake = self._capture()
-        with mock.patch("urllib.request.urlopen", fake):
+        with mock.patch.object(ci, "_urlopen", fake):
             self._client().recall("hello", 7)
         self.assertTrue(cap["url"].endswith("/api/memory/recall"))
         self.assertEqual(cap["method"], "POST")
@@ -275,7 +276,7 @@ class MemoryTransportTests(unittest.TestCase):
 
     def test_turn_payload_includes_session_and_platform(self):
         cap, fake = self._capture()
-        with mock.patch("urllib.request.urlopen", fake):
+        with mock.patch.object(ci, "_urlopen", fake):
             self._client().turn([{"role": "user", "content": "u"}], session_id="s1", platform="hermes")
         body = json.loads(cap["body"])
         self.assertEqual(body["messages"], [{"role": "user", "content": "u"}])
@@ -284,7 +285,7 @@ class MemoryTransportTests(unittest.TestCase):
 
     def test_turn_payload_omits_empty_session_and_platform(self):
         cap, fake = self._capture()
-        with mock.patch("urllib.request.urlopen", fake):
+        with mock.patch.object(ci, "_urlopen", fake):
             self._client().turn([{"role": "user", "content": "u"}])
         body = json.loads(cap["body"])
         self.assertNotIn("sessionId", body)
@@ -292,7 +293,7 @@ class MemoryTransportTests(unittest.TestCase):
 
     def test_write_payload_includes_supplied_fields_only(self):
         cap, fake = self._capture()
-        with mock.patch("urllib.request.urlopen", fake):
+        with mock.patch.object(ci, "_urlopen", fake):
             self._client().write("note text", source="MEMORY.md", title="T", session_id="s")
         self.assertTrue(cap["url"].endswith("/api/memory/write"))
         self.assertEqual(
@@ -302,20 +303,20 @@ class MemoryTransportTests(unittest.TestCase):
 
     def test_write_payload_omits_empty_optionals(self):
         cap, fake = self._capture()
-        with mock.patch("urllib.request.urlopen", fake):
+        with mock.patch.object(ci, "_urlopen", fake):
             self._client().write("just content")
         self.assertEqual(json.loads(cap["body"]), {"content": "just content"})
 
     def test_empty_body_parses_to_empty_dict(self):
         _, fake = self._capture(b"")
-        with mock.patch("urllib.request.urlopen", fake):
+        with mock.patch.object(ci, "_urlopen", fake):
             self.assertEqual(self._client().context(), {})
 
     def test_http_error_propagates(self):
         def fake(req, timeout=None):
             raise urllib.error.HTTPError(req.full_url, 500, "err", None, None)
 
-        with mock.patch("urllib.request.urlopen", fake):
+        with mock.patch.object(ci, "_urlopen", fake):
             with self.assertRaises(urllib.error.HTTPError):
                 self._client().context()
 
@@ -327,7 +328,7 @@ class MemoryTransportTests(unittest.TestCase):
             lambda c: c.write("note"),
         ):
             cap, fake = self._capture()
-            with mock.patch("urllib.request.urlopen", fake):
+            with mock.patch.object(ci, "_urlopen", fake):
                 op(self._client())
             self.assertEqual(cap["accept"], "application/json")
             self.assertEqual(cap["content_type"], "application/json")
@@ -367,7 +368,7 @@ class UserAgentTests(unittest.TestCase):
             ("health", lambda: client.health()),
         ):
             cap, fake = self._capture_ua()
-            with mock.patch("urllib.request.urlopen", fake):
+            with mock.patch.object(ci, "_urlopen", fake):
                 op()
             self.assertEqual(cap["user_agent"], ci._USER_AGENT, f"{label} sent {cap.get('user_agent')!r}")
             self.assertNotIn("Python-urllib", cap["user_agent"] or "", label)
@@ -429,7 +430,7 @@ class SetupProbeTests(unittest.TestCase):
         out = io.StringIO()
         with tempfile.TemporaryDirectory() as home:
             with mock.patch.dict(sys.modules, {"hermes_cli": hermes_cli, "hermes_cli.config": config_mod}), \
-                 mock.patch("urllib.request.urlopen", urlopen), \
+                 mock.patch.object(ci, "_urlopen", urlopen), \
                  mock.patch.object(sys, "stdin", io.StringIO(f"{url}\n{token}\n")), \
                  mock.patch.object(sys, "stdout", out):
                 ci.CompanionIntelligenceProvider().post_setup(home, config)
@@ -474,6 +475,48 @@ class SetupProbeTests(unittest.TestCase):
         text, _ = self._run_setup(fake_urlopen)
         self.assertNotIn("CDN or proxy", text)
         self.assertIn("insufficient scope", text)
+
+
+class ProxyBypassTests(unittest.TestCase):
+    """CI-Server is a loopback/LAN appliance; no proxy is ever the right route to it.
+
+    urllib's default opener honours the WinINET registry proxy on Windows, and its
+    "bypass local addresses" rule exempts only DOTLESS hosts — so ``127.0.0.1``, the
+    default address this plugin ships with, is handed to a corporate proxy and never
+    arrives. Capture failures are swallowed by design, so the symptom is memory that
+    silently never accumulates.
+    """
+
+    def test_requests_go_direct_even_with_a_proxy_configured(self):
+        received = []
+
+        class _Handler(http.server.BaseHTTPRequestHandler):
+            def do_GET(self):
+                received.append(self.path)
+                body = b'{"status":"ok"}'
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *args):
+                pass
+
+        srv = http.server.HTTPServer(("127.0.0.1", 0), _Handler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        try:
+            port = srv.server_address[1]
+            # Port 1 answers nothing. If the plugin honoured this proxy the request
+            # would fail instead of reaching the server started above.
+            with mock.patch.dict(os.environ, {"http_proxy": "http://127.0.0.1:1"}):
+                self.assertTrue(ci._CIClient(f"http://127.0.0.1:{port}", "tok").health())
+        finally:
+            srv.shutdown()
+            srv.server_close()
+
+        # A proxied request arrives as an absolute URI; a direct one as a bare path.
+        self.assertEqual(received, ["/api/health"])
 
 
 class ContextAndIntentGatingTests(unittest.TestCase):
