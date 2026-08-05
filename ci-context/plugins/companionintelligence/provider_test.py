@@ -633,11 +633,23 @@ class ProxyBypassTests(unittest.TestCase):
         self.addCleanup(srv.shutdown)
         return srv.server_address[1], handler.received
 
+    def _only_proxy(self, proxy_url: str):
+        """Patch the environment down to *proxy_url* as its single proxy setting.
+
+        ``clear=True`` matters: ``patch.dict`` otherwise MERGES, leaving the runner's
+        own proxy environment to decide the outcome. An ambient ``NO_PROXY=*`` — the
+        norm on exactly the corporate-proxy machines this fix targets, and the default
+        in several CI images — sends urllib through ``proxy_bypass_environment``, which
+        bypasses the proxy injected here and fails the public-host test on a correct
+        tree. Nothing under test reads any other variable.
+        """
+        return mock.patch.dict(os.environ, {"http_proxy": proxy_url}, clear=True)
+
     def test_a_loopback_server_is_reached_despite_a_configured_proxy(self):
         port, received = self._serve()
         # Port 1 answers nothing. If the plugin honoured this proxy for loopback the
         # request would fail instead of reaching the server started above.
-        with mock.patch.dict(os.environ, {"http_proxy": "http://127.0.0.1:1"}):
+        with self._only_proxy("http://127.0.0.1:1"):
             self.assertTrue(ci._CIClient(f"http://127.0.0.1:{port}", "tok").health())
         # A proxied request arrives as an absolute URI; a direct one as a bare path.
         self.assertEqual(received, ["/api/health"])
@@ -647,7 +659,7 @@ class ProxyBypassTests(unittest.TestCase):
         # the only route to an exposed CI-Server, and the hostname below resolves
         # nowhere, so this can only pass if the proxy was actually used.
         port, received = self._serve()
-        with mock.patch.dict(os.environ, {"http_proxy": f"http://127.0.0.1:{port}"}):
+        with self._only_proxy(f"http://127.0.0.1:{port}"):
             self.assertTrue(ci._CIClient("http://memory.example.com", "tok").health())
         self.assertEqual(received, ["http://memory.example.com/api/health"])
 
