@@ -8,6 +8,7 @@ memory-client drift fixes, and the intent-catalog injection) with mocks.
 Run: ``python3 -m unittest provider_test`` from this directory.
 """
 
+import http.server
 import io
 import json
 import os
@@ -17,6 +18,7 @@ import threading
 import types
 import unittest
 import urllib.error
+from pathlib import Path
 from unittest import mock
 
 # --- Stub the Hermes base so ``import companionintelligence`` works standalone ---
@@ -39,6 +41,12 @@ if _PARENT not in sys.path:
     sys.path.insert(0, _PARENT)
 
 import companionintelligence as ci  # noqa: E402
+
+# The UTF-8 BOM, spelled as the bytes it actually is. Every BOM fixture below builds
+# on this rather than embedding a U+FEFF in a string literal, where it is invisible in
+# review and one editor normalization away from vanishing — taking the whole point of
+# the test with it and leaving it green.
+_UTF8_BOM = b"\xef\xbb\xbf"
 
 _FLAGS = (
     "CI_MEMORY_CONTEXT_ENABLED",
@@ -256,7 +264,7 @@ class MemoryTransportTests(unittest.TestCase):
 
     def test_context_issues_authenticated_get(self):
         cap, fake = self._capture(b'{"block":"PROFILE"}')
-        with mock.patch("urllib.request.urlopen", fake):
+        with mock.patch.object(ci, "_urlopen", fake):
             out = self._client().context()
         self.assertTrue(cap["url"].endswith("/api/memory/context"))
         self.assertEqual(cap["method"], "GET")
@@ -266,7 +274,7 @@ class MemoryTransportTests(unittest.TestCase):
 
     def test_recall_posts_query_and_capped_results(self):
         cap, fake = self._capture()
-        with mock.patch("urllib.request.urlopen", fake):
+        with mock.patch.object(ci, "_urlopen", fake):
             self._client().recall("hello", 7)
         self.assertTrue(cap["url"].endswith("/api/memory/recall"))
         self.assertEqual(cap["method"], "POST")
@@ -275,7 +283,7 @@ class MemoryTransportTests(unittest.TestCase):
 
     def test_turn_payload_includes_session_and_platform(self):
         cap, fake = self._capture()
-        with mock.patch("urllib.request.urlopen", fake):
+        with mock.patch.object(ci, "_urlopen", fake):
             self._client().turn([{"role": "user", "content": "u"}], session_id="s1", platform="hermes")
         body = json.loads(cap["body"])
         self.assertEqual(body["messages"], [{"role": "user", "content": "u"}])
@@ -284,7 +292,7 @@ class MemoryTransportTests(unittest.TestCase):
 
     def test_turn_payload_omits_empty_session_and_platform(self):
         cap, fake = self._capture()
-        with mock.patch("urllib.request.urlopen", fake):
+        with mock.patch.object(ci, "_urlopen", fake):
             self._client().turn([{"role": "user", "content": "u"}])
         body = json.loads(cap["body"])
         self.assertNotIn("sessionId", body)
@@ -292,7 +300,7 @@ class MemoryTransportTests(unittest.TestCase):
 
     def test_write_payload_includes_supplied_fields_only(self):
         cap, fake = self._capture()
-        with mock.patch("urllib.request.urlopen", fake):
+        with mock.patch.object(ci, "_urlopen", fake):
             self._client().write("note text", source="MEMORY.md", title="T", session_id="s")
         self.assertTrue(cap["url"].endswith("/api/memory/write"))
         self.assertEqual(
@@ -302,20 +310,20 @@ class MemoryTransportTests(unittest.TestCase):
 
     def test_write_payload_omits_empty_optionals(self):
         cap, fake = self._capture()
-        with mock.patch("urllib.request.urlopen", fake):
+        with mock.patch.object(ci, "_urlopen", fake):
             self._client().write("just content")
         self.assertEqual(json.loads(cap["body"]), {"content": "just content"})
 
     def test_empty_body_parses_to_empty_dict(self):
         _, fake = self._capture(b"")
-        with mock.patch("urllib.request.urlopen", fake):
+        with mock.patch.object(ci, "_urlopen", fake):
             self.assertEqual(self._client().context(), {})
 
     def test_http_error_propagates(self):
         def fake(req, timeout=None):
             raise urllib.error.HTTPError(req.full_url, 500, "err", None, None)
 
-        with mock.patch("urllib.request.urlopen", fake):
+        with mock.patch.object(ci, "_urlopen", fake):
             with self.assertRaises(urllib.error.HTTPError):
                 self._client().context()
 
@@ -327,7 +335,7 @@ class MemoryTransportTests(unittest.TestCase):
             lambda c: c.write("note"),
         ):
             cap, fake = self._capture()
-            with mock.patch("urllib.request.urlopen", fake):
+            with mock.patch.object(ci, "_urlopen", fake):
                 op(self._client())
             self.assertEqual(cap["accept"], "application/json")
             self.assertEqual(cap["content_type"], "application/json")
@@ -367,7 +375,7 @@ class UserAgentTests(unittest.TestCase):
             ("health", lambda: client.health()),
         ):
             cap, fake = self._capture_ua()
-            with mock.patch("urllib.request.urlopen", fake):
+            with mock.patch.object(ci, "_urlopen", fake):
                 op()
             self.assertEqual(cap["user_agent"], ci._USER_AGENT, f"{label} sent {cap.get('user_agent')!r}")
             self.assertNotIn("Python-urllib", cap["user_agent"] or "", label)
@@ -429,7 +437,7 @@ class SetupProbeTests(unittest.TestCase):
         out = io.StringIO()
         with tempfile.TemporaryDirectory() as home:
             with mock.patch.dict(sys.modules, {"hermes_cli": hermes_cli, "hermes_cli.config": config_mod}), \
-                 mock.patch("urllib.request.urlopen", urlopen), \
+                 mock.patch.object(ci, "_urlopen", urlopen), \
                  mock.patch.object(sys, "stdin", io.StringIO(f"{url}\n{token}\n")), \
                  mock.patch.object(sys, "stdout", out):
                 ci.CompanionIntelligenceProvider().post_setup(home, config)
@@ -474,6 +482,254 @@ class SetupProbeTests(unittest.TestCase):
         text, _ = self._run_setup(fake_urlopen)
         self.assertNotIn("CDN or proxy", text)
         self.assertIn("insufficient scope", text)
+
+
+class SetupConsoleAndFileHygieneTests(unittest.TestCase):
+    """Hazards that only appear off a UTF-8 POSIX box: console codec, EOLs, BOMs.
+
+    `hermes memory setup` is run from a terminal, and on Windows that terminal is
+    frequently Git Bash — where stdout is a cp1252-encoded PIPE, not a console.
+    """
+
+    @staticmethod
+    def _narrow_stdout():
+        """Stand in for Git Bash's stdout: cp1252, strict, and it is a pipe."""
+        return io.TextIOWrapper(io.BytesIO(), encoding="cp1252", newline="")
+
+    def _run(self, urlopen, *, home, stdout=None, url="http://ci-server:8642", token="tok"):
+        """post_setup against a real temp home; returns (stdout_text, saved)."""
+        hermes_cli = types.ModuleType("hermes_cli")
+        config_mod = types.ModuleType("hermes_cli.config")
+        saved = {}
+        config_mod.save_config = lambda cfg: saved.update(cfg)
+        hermes_cli.config = config_mod
+        out = stdout if stdout is not None else io.StringIO()
+
+        with mock.patch.dict(sys.modules, {"hermes_cli": hermes_cli, "hermes_cli.config": config_mod}), \
+             mock.patch.object(ci, "_urlopen", urlopen), \
+             mock.patch.object(sys, "stdin", io.StringIO(f"{url}\n{token}\n")), \
+             mock.patch.object(sys, "stdout", out):
+            ci.CompanionIntelligenceProvider().post_setup(home, {})
+
+        if isinstance(out, io.StringIO):
+            return out.getvalue(), saved
+        out.flush()
+        return out.buffer.getvalue().decode("cp1252"), saved
+
+    def test_wizard_survives_a_cp1252_console(self):
+        # The whole wizard used to die here, on its second print, before the first
+        # prompt: '─' has no cp1252 mapping, so print() raised UnicodeEncodeError
+        # and the user got a traceback instead of a setup flow.
+        with tempfile.TemporaryDirectory() as home:
+            text, saved = self._run(
+                lambda req, timeout=None: _FakeResp(b'{"status":"ok"}'),
+                home=home,
+                stdout=self._narrow_stdout(),
+            )
+        self.assertIn("[ok]", text, "glyphs must degrade to ASCII, not raise")
+        self.assertIn("Connected", text)
+        self.assertEqual(saved["memory"]["provider"], "companionintelligence")
+
+    def test_say_never_raises_on_an_unencodable_character(self):
+        # Backstop for prose and server-supplied strings the glyph constants do not
+        # cover — a CJK character has no cp1252 mapping at all.
+        out = self._narrow_stdout()
+        with mock.patch.object(sys, "stdout", out):
+            ci._say("server said: 日本語")
+        out.flush()
+        self.assertIn("server said:", out.buffer.getvalue().decode("cp1252"))
+
+    def test_env_file_is_written_lf_on_every_platform(self):
+        # Text mode translates \n to os.linesep, so without newline="" this file
+        # goes out CRLF on Windows and a shell consumer that sources it exports the
+        # token with a trailing \r.
+        with tempfile.TemporaryDirectory() as home:
+            self._run(lambda req, timeout=None: _FakeResp(b'{"status":"ok"}'), home=home)
+            raw = (Path(home) / ".env").read_bytes()
+        self.assertNotIn(b"\r\n", raw)
+        self.assertIn(b"CI_SERVER_TOKEN=tok\n", raw)
+
+    def test_bom_prefixed_env_file_replaces_the_token_rather_than_duplicating_it(self):
+        # Notepad's default is UTF-8-with-BOM. Read as plain utf-8 the BOM stays glued
+        # to the first line, so the first key reads as U+FEFF + "CI_SERVER_TOKEN"
+        # rather than "CI_SERVER_TOKEN", the replace missed, and a SECOND token line
+        # was appended — setup reported success while a first-wins loader kept using
+        # the stale key.
+        with tempfile.TemporaryDirectory() as home:
+            env_path = Path(home) / ".env"
+            env_path.write_bytes(_UTF8_BOM + b"CI_SERVER_TOKEN=stale\nOTHER=keep\n")
+            self._run(
+                lambda req, timeout=None: _FakeResp(b'{"status":"ok"}'),
+                home=home,
+                token="fresh",
+            )
+            lines = env_path.read_text(encoding="utf-8-sig").splitlines()
+        self.assertEqual([ln for ln in lines if ln.startswith("CI_SERVER_TOKEN=")], ["CI_SERVER_TOKEN=fresh"])
+        self.assertIn("OTHER=keep", lines)
+
+    def test_an_error_quoting_the_key_does_not_print_the_key(self):
+        # http.client raises ValueError("Invalid header value b'<token>\\r'") for a
+        # \r-tainted key. That reached the generic handler, which printed the
+        # exception verbatim — writing the user's live credential to the terminal.
+        secret = "sk-live-abcdef123456"
+
+        def fake_urlopen(req, timeout=None):
+            raise ValueError(f"Invalid header value {secret!r}")
+
+        with tempfile.TemporaryDirectory() as home:
+            text, saved = self._run(fake_urlopen, home=home, token=secret)
+        self.assertNotIn(secret, text)
+        self.assertIn("Unexpected error", text)
+        self.assertIn("3456", text, "a tail stub should survive, to identify the key")
+        self.assertEqual(saved, {})
+
+    def test_save_config_keeps_other_settings_when_the_file_has_a_bom(self):
+        # Reading with the locale codec (cp1252 on Windows) raised on non-ASCII,
+        # the bare except treated that as "no config", and the write-back silently
+        # dropped every key it was not currently saving.
+        with tempfile.TemporaryDirectory() as home:
+            cfg_dir = Path(home) / "companionintelligence"
+            cfg_dir.mkdir(parents=True)
+            # _UTF8_BOM as explicit bytes, not a U+FEFF in the literal: an invisible
+            # character is exactly what an editor or a formatter silently strips, and
+            # the test would keep passing while no longer testing a BOM at all.
+            (cfg_dir / "config.json").write_bytes(
+                _UTF8_BOM + '{"url": "http://old", "note": "café"}'.encode("utf-8")
+            )
+            ci.CompanionIntelligenceProvider().save_config({"url": "http://new"}, home)
+            data = json.loads((cfg_dir / "config.json").read_text(encoding="utf-8-sig"))
+        self.assertEqual(data["url"], "http://new")
+        self.assertEqual(data["note"], "café", "unrelated settings must survive the write")
+
+
+class LoadConfigTests(unittest.TestCase):
+    """``_load_config`` is the runtime READ path — ``is_available()``, client
+    construction and every session start go through it, and every failure in it is
+    swallowed by design. A regression here is silent: no traceback, no warning, just
+    a plugin that quietly stops using the settings the user saved.
+    """
+
+    def _home_with_config(self, raw: bytes) -> str:
+        """Write *raw* as the config file of a throwaway Hermes home, and point
+        ``_load_config`` at it by stubbing the module it imports lazily."""
+        home = tempfile.TemporaryDirectory()
+        self.addCleanup(home.cleanup)
+        cfg_dir = Path(home.name) / "companionintelligence"
+        cfg_dir.mkdir(parents=True)
+        (cfg_dir / "config.json").write_bytes(raw)
+
+        stub = types.ModuleType("hermes_constants")
+        stub.get_hermes_home = lambda: Path(home.name)
+        sys.modules["hermes_constants"] = stub
+        self.addCleanup(sys.modules.pop, "hermes_constants", None)
+        return home.name
+
+    def test_a_bom_prefixed_config_is_still_read(self):
+        # Notepad's default on Windows is UTF-8-with-BOM. Read as plain utf-8 the BOM
+        # survives into the string, json.loads raises on it, and the bare `except`
+        # treats that as "no config" — leaving the plugin on env vars alone. The saved
+        # CI-Server URL is ignored and memory never accumulates, with nothing printed.
+        self._home_with_config(
+            _UTF8_BOM + '{"url": "http://saved:8642", "token": "from-file"}'.encode("utf-8")
+        )
+        # Blanked, not cleared: these are the base _load_config layers the file over,
+        # so a real CI_SERVER_URL in the runner's environment would mask the read.
+        with mock.patch.dict(os.environ, {"CI_SERVER_URL": "", "CI_SERVER_TOKEN": ""}):
+            cfg = ci._load_config()
+            self.assertEqual(cfg["url"], "http://saved:8642")
+            self.assertEqual(cfg["token"], "from-file")
+            self.assertTrue(
+                ci.CompanionIntelligenceProvider().is_available(),
+                "a saved config must be enough to make the provider available",
+            )
+
+
+class _OkHandler(http.server.BaseHTTPRequestHandler):
+    """Answers anything with 200 and records the request-target it was given."""
+
+    received: list
+
+    def do_GET(self):
+        type(self).received.append(self.path)
+        body = b'{"status":"ok"}'
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):
+        pass
+
+
+class ProxyBypassTests(unittest.TestCase):
+    """A proxy is bypassed for addresses it could not serve — and only those.
+
+    urllib's default opener honours the WinINET registry proxy on Windows, and its
+    "bypass local addresses" rule exempts only DOTLESS hosts — so ``127.0.0.1``, the
+    default address this plugin ships with, is handed to a corporate proxy and never
+    arrives. Capture failures are swallowed by design, so the symptom is memory that
+    silently never accumulates.
+
+    The other direction matters just as much: a CI-Server reached at its public domain
+    (the app's "Expose app" setting) may only be reachable THROUGH the corporate proxy,
+    so ignoring proxies outright would trade one broken deployment for another.
+    """
+
+    def _serve(self):
+        """Start a throwaway HTTP server; returns (port, received-paths)."""
+        handler = type("_H", (_OkHandler,), {"received": []})
+        srv = http.server.HTTPServer(("127.0.0.1", 0), handler)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
+        return srv.server_address[1], handler.received
+
+    def _only_proxy(self, proxy_url: str):
+        """Patch the environment down to *proxy_url* as its single proxy setting.
+
+        ``clear=True`` matters: ``patch.dict`` otherwise MERGES, leaving the runner's
+        own proxy environment to decide the outcome. An ambient ``NO_PROXY=*`` — the
+        norm on exactly the corporate-proxy machines this fix targets, and the default
+        in several CI images — sends urllib through ``proxy_bypass_environment``, which
+        bypasses the proxy injected here and fails the public-host test on a correct
+        tree. Nothing under test reads any other variable.
+        """
+        return mock.patch.dict(os.environ, {"http_proxy": proxy_url}, clear=True)
+
+    def test_a_loopback_server_is_reached_despite_a_configured_proxy(self):
+        port, received = self._serve()
+        # Port 1 answers nothing. If the plugin honoured this proxy for loopback the
+        # request would fail instead of reaching the server started above.
+        with self._only_proxy("http://127.0.0.1:1"):
+            self.assertTrue(ci._CIClient(f"http://127.0.0.1:{port}", "tok").health())
+        # A proxied request arrives as an absolute URI; a direct one as a bare path.
+        self.assertEqual(received, ["/api/health"])
+
+    def test_a_public_server_still_goes_through_the_proxy(self):
+        # The regression guard for over-correcting: on a corporate laptop the proxy is
+        # the only route to an exposed CI-Server, and the hostname below resolves
+        # nowhere, so this can only pass if the proxy was actually used.
+        port, received = self._serve()
+        with self._only_proxy(f"http://127.0.0.1:{port}"):
+            self.assertTrue(ci._CIClient("http://memory.example.com", "tok").health())
+        self.assertEqual(received, ["http://memory.example.com/api/health"])
+
+    def test_direct_host_classification(self):
+        for host in (
+            "127.0.0.1", "::1", "[::1]", "10.1.2.3", "192.168.1.9", "172.16.0.4",
+            "169.254.1.1", "100.101.102.103",           # link-local, and the tailnet range
+            "ci-memory", "hub",                           # dotless: what <local> means
+            "ci-memory.ci.lan", "hub.local", "box.internal", "hub.tailnet.ts.net",
+            "ci-memory.ci.lan.",                          # trailing dot on an FQDN
+            "CI-Memory.CI.LAN",                           # case is not significant
+        ):
+            self.assertTrue(ci._is_direct_host(host), f"{host} should bypass the proxy")
+
+        # Not 203.0.113.x here: ipaddress counts the documentation ranges as private,
+        # so those would pass for a reason that has nothing to do with this rule.
+        for host in ("memory.example.com", "8.8.8.8", "93.184.216.34", "ci.computer", "2606:4700::1111", ""):
+            self.assertFalse(ci._is_direct_host(host), f"{host} should keep the proxy")
 
 
 class ContextAndIntentGatingTests(unittest.TestCase):

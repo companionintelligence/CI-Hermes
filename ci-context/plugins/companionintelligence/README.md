@@ -18,10 +18,17 @@ Hermes install is enough.
 
 ## Install
 
-Hermes discovers memory providers by scanning `$HERMES_HOME/plugins/` (by default
-`~/.hermes/plugins/`) for a directory containing a `plugin.yaml`. It has no plugin
-registry, and it never looks in `site-packages` — so installing means putting this
-directory there:
+Hermes discovers memory providers by scanning `$HERMES_HOME/plugins/` for a directory
+containing a `plugin.yaml`. It has no plugin registry, and it never looks in
+`site-packages` — so installing means putting this directory there.
+
+`$HERMES_HOME` defaults to `~/.hermes` on macOS, Linux and WSL2, and to
+`%LOCALAPPDATA%\hermes` on **native Windows**. That difference matters more than it
+looks: extract into the wrong one and everything appears to work — the files land, no
+error — and then `hermes memory setup` does not list `companionintelligence`, because
+Hermes never scans there.
+
+macOS, Linux, WSL2:
 
 ```sh
 rm -rf ~/.hermes/plugins/companionintelligence
@@ -29,6 +36,23 @@ mkdir -p ~/.hermes/plugins/companionintelligence
 curl -fL https://registry.npmjs.org/@companionintelligence/hermes-memory/-/hermes-memory-<version>.tgz \
   | tar -xz -C ~/.hermes/plugins/companionintelligence --strip-components=1
 ```
+
+Native Windows, in PowerShell:
+
+```powershell
+$dst = "$env:LOCALAPPDATA\hermes\plugins\companionintelligence"
+if (Test-Path $dst) { Remove-Item -Recurse -Force $dst }
+New-Item -ItemType Directory -Force $dst | Out-Null
+curl.exe -fL https://registry.npmjs.org/@companionintelligence/hermes-memory/-/hermes-memory-<version>.tgz -o "$env:TEMP\hermes-memory.tgz"
+tar.exe -xzf "$env:TEMP\hermes-memory.tgz" -C $dst --strip-components=1
+Remove-Item "$env:TEMP\hermes-memory.tgz"
+```
+
+`curl.exe` and `tar.exe` with the extension: in Windows PowerShell 5.1 a bare `curl` is
+an alias for `Invoke-WebRequest`, which rejects `-fL` and fails before downloading
+anything. Both real binaries ship in `System32` on Windows 10 1803 and later.
+Downloading to a file rather than piping is what keeps this working on 5.1, which
+cannot stream binary data through a pipe intact.
 
 Replace `<version>` with a published version — `2026.8.1`, for example. The list of
 published versions is on
@@ -182,11 +206,16 @@ rm -rf ~/.hermes/plugins/companionintelligence   # the plugin itself
 rm -rf ~/.hermes/companionintelligence           # the saved server URL
 ```
 
-Then edit `~/.hermes/config.yaml` to clear `memory.provider` and drop
+```powershell
+Remove-Item -Recurse -Force "$env:LOCALAPPDATA\hermes\plugins\companionintelligence"
+Remove-Item -Recurse -Force "$env:LOCALAPPDATA\hermes\companionintelligence"
+```
+
+Then edit `$HERMES_HOME/config.yaml` to clear `memory.provider` and drop
 `companionintelligence` from `plugins.enabled`, and **remove `CI_SERVER_TOKEN` from
-`~/.hermes/.env`** — otherwise a live Companion Memory API key stays on disk after you
-believe you have uninstalled. Revoke it in the server's web UI if you no longer need
-it.
+`$HERMES_HOME/.env`** — otherwise a live Companion Memory API key stays on disk after
+you believe you have uninstalled. Revoke it in the server's web UI if you no longer
+need it.
 
 Your data on the Companion Memory server is untouched by any of this.
 
