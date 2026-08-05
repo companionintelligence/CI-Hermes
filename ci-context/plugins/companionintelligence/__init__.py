@@ -97,7 +97,10 @@ def _load_config() -> dict:
         from hermes_constants import get_hermes_home
         config_path = get_hermes_home() / "companionintelligence" / "config.json"
         if config_path.exists():
-            file_cfg = json.loads(config_path.read_text(encoding="utf-8"))
+            # utf-8-sig so a BOM-prefixed file (Notepad's default on Windows) parses
+            # rather than failing into the except below and leaving the plugin on
+            # env vars alone. Matches save_config, and Hermes' own plugin.yaml read.
+            file_cfg = json.loads(config_path.read_text(encoding="utf-8-sig"))
             config.update({k: v for k, v in file_cfg.items() if v})
     except Exception:
         pass
@@ -170,6 +173,54 @@ _DIRECT_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
 def _urlopen(req: urllib.request.Request, timeout: float):
     """Open *req* directly, bypassing any system/environment proxy."""
     return _DIRECT_OPENER.open(req, timeout=timeout)
+
+
+# ---------------------------------------------------------------------------
+# Console output — the setup wizard must survive a non-UTF-8 stdout
+# ---------------------------------------------------------------------------
+# `hermes memory setup` is run from a terminal, and on Windows that terminal is
+# frequently Git Bash / mintty — where Python sees a PIPE rather than a console and
+# falls back to the ANSI code page (cp1252 on a typical machine) instead of UTF-8.
+# None of ``─ ✓ ✗`` exist in cp1252, so the wizard used to die with
+# UnicodeEncodeError on its second print: a traceback before the first prompt,
+# with nothing configured and no hint why.
+
+def _console_glyphs() -> tuple:
+    """Return ``(ok, no, rule)`` glyphs stdout can actually encode."""
+    encoding = getattr(sys.stdout, "encoding", None) or "ascii"
+    try:
+        "─✓✗—".encode(encoding)
+    except (UnicodeEncodeError, LookupError):
+        return "[ok]", "[!]", "-"
+    return "✓", "✗", "─"
+
+
+def _redact(text: str, secret: str) -> str:
+    """Replace *secret* (and its repr-escaped form) in *text* with a masked stub."""
+    if not secret:
+        return text
+    masked = f"<api key ...{secret[-4:]}>" if len(secret) > 4 else "<api key>"
+    out = text.replace(secret, masked)
+    # http.client formats the offending header through repr(), so the key can also
+    # appear escaped — b'sk-live-...\r' — which a plain replace would miss.
+    escaped = repr(secret)[1:-1]
+    if escaped != secret:
+        out = out.replace(escaped, masked)
+    return out
+
+
+def _say(text: str = "") -> None:
+    """``print`` that cannot kill the wizard on a narrow console.
+
+    The glyph constants above cover what this module writes deliberately; this is
+    the backstop for everything else that reaches stdout — em dashes in prose, and
+    server-supplied strings such as an error body echoed back to the user.
+    """
+    try:
+        print(text)
+    except UnicodeEncodeError:
+        encoding = getattr(sys.stdout, "encoding", None) or "ascii"
+        print(text.encode(encoding, errors="replace").decode(encoding, errors="replace"))
 
 
 def _build_request(
@@ -353,11 +404,18 @@ class CompanionIntelligenceProvider(MemoryProvider):
         existing = {}
         if config_path.exists():
             try:
-                existing = json.loads(config_path.read_text())
+                # utf-8-sig, matching _load_config's utf-8 read (and tolerating a
+                # BOM). Reading with the locale codec instead — cp1252 on Windows —
+                # made a hand-edited config with any non-ASCII value raise, and the
+                # `except` below then treated it as "no existing config" and wrote
+                # back ONLY the keys being saved, silently dropping every other
+                # setting the user had. On Linux the locale is UTF-8, so the
+                # divergence never showed up there.
+                existing = json.loads(config_path.read_text(encoding="utf-8-sig"))
             except Exception:
                 pass
         existing.update(values)
-        config_path.write_text(json.dumps(existing, indent=2))
+        config_path.write_text(json.dumps(existing, indent=2), encoding="utf-8")
 
     def get_config_schema(self) -> List[Dict[str, Any]]:
         return [
@@ -387,18 +445,20 @@ class CompanionIntelligenceProvider(MemoryProvider):
         """
         import stat
 
+        ok, no, rule = _console_glyphs()
+
         try:
             from hermes_cli.config import save_config as hermes_save_config
         except ImportError:
-            print("  ✗ Could not import hermes config module — run from inside a Hermes install.\n")
+            _say(f"  {no} Could not import hermes config module — run from inside a Hermes install.\n")
             return
 
         hermes_home_path = Path(hermes_home)
         existing = _load_config()
 
-        print("\n  Companion Intelligence setup")
-        print("  ─────────────────────────────────────────")
-        print("  Generate an API key in the CI-Server admin panel first.\n")
+        _say("\n  Companion Intelligence setup")
+        _say(f"  {rule * 41}")
+        _say("  Generate an API key in the CI-Server admin panel first.\n")
 
         # ── URL ──────────────────────────────────────────────────────────────
         default_url = existing.get("url") or "http://127.0.0.1:8642"
@@ -409,7 +469,11 @@ class CompanionIntelligenceProvider(MemoryProvider):
             url = f"http://{url}"
 
         # ── API key ───────────────────────────────────────────────────────────
-        existing_token = os.environ.get("CI_SERVER_TOKEN", "")
+        # Stripped: on Windows an env file written with CRLF (or hand-edited) hands
+        # back a token with a trailing \r, and a \r in a header value makes
+        # http.client raise ValueError — which the generic handler below would then
+        # print, echoing the whole key to the terminal.
+        existing_token = os.environ.get("CI_SERVER_TOKEN", "").strip()
         if existing_token:
             masked = f"...{existing_token[-4:]}" if len(existing_token) > 4 else "set"
             sys.stdout.write(f"  API key (current: {masked}, blank to keep): ")
@@ -423,12 +487,12 @@ class CompanionIntelligenceProvider(MemoryProvider):
             token = existing_token  # keep existing if blank
 
         if not url or not token:
-            print("\n  ✗ Both URL and API key are required. Setup cancelled.\n")
+            _say(f"\n  {no} Both URL and API key are required. Setup cancelled.\n")
             return
 
         # ── Connection test ───────────────────────────────────────────────────
         health_url = f"{url.rstrip('/')}/api/health"
-        print(f"\n  Testing connection: GET {health_url} ...")
+        _say(f"\n  Testing connection: GET {health_url} ...")
 
         try:
             req = _build_request(health_url, token, method="GET")
@@ -436,36 +500,40 @@ class CompanionIntelligenceProvider(MemoryProvider):
                 status = resp.status
                 body = resp.read().decode("utf-8", errors="replace")[:200]
             if status == 200:
-                print(f"  ✓ Connected  (HTTP {status}: {body})")
+                _say(f"  {ok} Connected  (HTTP {status}: {body})")
             else:
-                print(f"  ✗ Unexpected response  HTTP {status}: {body}")
-                print("  Nothing was saved — run 'hermes memory setup' again when ready.\n")
+                _say(f"  {no} Unexpected response  HTTP {status}: {body}")
+                _say("  Nothing was saved — run 'hermes memory setup' again when ready.\n")
                 return
         except urllib.error.HTTPError as exc:
             body = exc.read().decode("utf-8", errors="replace")[:200] if exc.fp else ""
-            print(f"  ✗ HTTP {exc.code} {exc.reason}")
+            _say(f"  {no} HTTP {exc.code} {exc.reason}")
             if body:
-                print(f"    {body}")
+                _say(f"    {body}")
             # CI-Server answers in JSON. An HTML error body means something in front of
             # it refused the request and the server never saw it — the distinction that
             # decides whether to go re-mint the key or change the address.
             if "<html" in body.lower():
-                print("    That is an HTML error page, so it came from a CDN or proxy in front of")
-                print("    CI-Server rather than from CI-Server itself. Your key is not the problem;")
-                print("    try the server's LAN or VPN address instead of its public URL.")
-            print("  Nothing was saved — run 'hermes memory setup' again when ready.\n")
+                _say("    That is an HTML error page, so it came from a CDN or proxy in front of")
+                _say("    CI-Server rather than from CI-Server itself. Your key is not the problem;")
+                _say("    try the server's LAN or VPN address instead of its public URL.")
+            _say("  Nothing was saved — run 'hermes memory setup' again when ready.\n")
             return
         except urllib.error.URLError as exc:
-            print(f"  ✗ Could not reach {url}")
-            print(f"    {exc.reason}")
-            print("  Nothing was saved — run 'hermes memory setup' again when ready.\n")
+            _say(f"  {no} Could not reach {url}")
+            _say(f"    {exc.reason}")
+            _say("  Nothing was saved — run 'hermes memory setup' again when ready.\n")
             return
         except Exception as exc:
-            print(f"  ✗ Unexpected error: {exc}")
-            print("  Nothing was saved — run 'hermes memory setup' again when ready.\n")
+            # Redacted: this catches ValueError from http.client, whose message quotes
+            # the offending header value verbatim — i.e. the API key. Printing the
+            # exception unfiltered wrote the user's live credential to the terminal
+            # (and into any transcript or screenshot of it).
+            _say(f"  {no} Unexpected error: {_redact(str(exc), token)}")
+            _say("  Nothing was saved — run 'hermes memory setup' again when ready.\n")
             return
 
-        print("  ✓ Connected successfully\n")
+        _say(f"  {ok} Connected successfully\n")
 
         # ── Persist URL to config.json ────────────────────────────────────────
         self.save_config({"url": url}, hermes_home)
@@ -473,8 +541,13 @@ class CompanionIntelligenceProvider(MemoryProvider):
         # ── Persist token to .env (0600) ──────────────────────────────────────
         env_path = hermes_home_path / ".env"
         env_path.parent.mkdir(parents=True, exist_ok=True)
+        # utf-8-sig, not utf-8: a Windows editor (Notepad's long-standing default)
+        # saves this file with a BOM, which would otherwise stay glued to the first
+        # line — so a leading CI_SERVER_TOKEN would not match the key comparison
+        # below, and we would append a SECOND token line rather than replacing it.
+        # The wizard would report success while a stale key kept being used.
         existing_lines = (
-            env_path.read_text(encoding="utf-8").splitlines()
+            env_path.read_text(encoding="utf-8-sig").splitlines()
             if env_path.exists()
             else []
         )
@@ -489,8 +562,15 @@ class CompanionIntelligenceProvider(MemoryProvider):
                 new_lines.append(line)
         if not token_written:
             new_lines.append(f"CI_SERVER_TOKEN={token}")
-        env_path.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+        # newline="\n" so the file is LF on every platform. Without it, text mode
+        # translates to os.linesep and this file goes out CRLF on Windows — and a
+        # shell-side consumer that `source`s an env file then exports the token with
+        # a trailing \r, which is rejected as a header value further down the line.
+        env_path.write_text("\n".join(new_lines) + "\n", encoding="utf-8", newline="\n")
         try:
+            # POSIX only. On Windows this maps onto the read-only attribute and
+            # cannot restrict group/other at all — the file is left to inherit the
+            # profile directory's ACLs, which are user-private by default.
             env_path.chmod(stat.S_IRUSR | stat.S_IWUSR)  # 0600
         except OSError:
             pass
@@ -501,11 +581,11 @@ class CompanionIntelligenceProvider(MemoryProvider):
         config["memory"]["provider"] = self.name
         hermes_save_config(config)
 
-        print("  ✓ API key saved to .env")
-        print("  ✓ URL saved to companionintelligence/config.json")
-        print("  ✓ memory.provider: companionintelligence activated in config.yaml")
-        print()
-        print("  Start a new Hermes session to activate.\n")
+        _say(f"  {ok} API key saved to .env")
+        _say(f"  {ok} URL saved to companionintelligence/config.json")
+        _say(f"  {ok} memory.provider: companionintelligence activated in config.yaml")
+        _say()
+        _say("  Start a new Hermes session to activate.\n")
 
     # ---------------------------------------------------------------------------
     # Lifecycle

@@ -18,6 +18,7 @@ import threading
 import types
 import unittest
 import urllib.error
+from pathlib import Path
 from unittest import mock
 
 # --- Stub the Hermes base so ``import companionintelligence`` works standalone ---
@@ -475,6 +476,120 @@ class SetupProbeTests(unittest.TestCase):
         text, _ = self._run_setup(fake_urlopen)
         self.assertNotIn("CDN or proxy", text)
         self.assertIn("insufficient scope", text)
+
+
+class SetupConsoleAndFileHygieneTests(unittest.TestCase):
+    """Hazards that only appear off a UTF-8 POSIX box: console codec, EOLs, BOMs.
+
+    `hermes memory setup` is run from a terminal, and on Windows that terminal is
+    frequently Git Bash — where stdout is a cp1252-encoded PIPE, not a console.
+    """
+
+    @staticmethod
+    def _narrow_stdout():
+        """Stand in for Git Bash's stdout: cp1252, strict, and it is a pipe."""
+        return io.TextIOWrapper(io.BytesIO(), encoding="cp1252", newline="")
+
+    def _run(self, urlopen, *, home, stdout=None, url="http://ci-server:8642", token="tok"):
+        """post_setup against a real temp home; returns (stdout_text, saved)."""
+        hermes_cli = types.ModuleType("hermes_cli")
+        config_mod = types.ModuleType("hermes_cli.config")
+        saved = {}
+        config_mod.save_config = lambda cfg: saved.update(cfg)
+        hermes_cli.config = config_mod
+        out = stdout if stdout is not None else io.StringIO()
+
+        with mock.patch.dict(sys.modules, {"hermes_cli": hermes_cli, "hermes_cli.config": config_mod}), \
+             mock.patch.object(ci, "_urlopen", urlopen), \
+             mock.patch.object(sys, "stdin", io.StringIO(f"{url}\n{token}\n")), \
+             mock.patch.object(sys, "stdout", out):
+            ci.CompanionIntelligenceProvider().post_setup(home, {})
+
+        if isinstance(out, io.StringIO):
+            return out.getvalue(), saved
+        out.flush()
+        return out.buffer.getvalue().decode("cp1252"), saved
+
+    def test_wizard_survives_a_cp1252_console(self):
+        # The whole wizard used to die here, on its second print, before the first
+        # prompt: '─' has no cp1252 mapping, so print() raised UnicodeEncodeError
+        # and the user got a traceback instead of a setup flow.
+        with tempfile.TemporaryDirectory() as home:
+            text, saved = self._run(
+                lambda req, timeout=None: _FakeResp(b'{"status":"ok"}'),
+                home=home,
+                stdout=self._narrow_stdout(),
+            )
+        self.assertIn("[ok]", text, "glyphs must degrade to ASCII, not raise")
+        self.assertIn("Connected", text)
+        self.assertEqual(saved["memory"]["provider"], "companionintelligence")
+
+    def test_say_never_raises_on_an_unencodable_character(self):
+        # Backstop for prose and server-supplied strings the glyph constants do not
+        # cover — a CJK character has no cp1252 mapping at all.
+        out = self._narrow_stdout()
+        with mock.patch.object(sys, "stdout", out):
+            ci._say("server said: 日本語")
+        out.flush()
+        self.assertIn("server said:", out.buffer.getvalue().decode("cp1252"))
+
+    def test_env_file_is_written_lf_on_every_platform(self):
+        # Text mode translates \n to os.linesep, so without newline="" this file
+        # goes out CRLF on Windows and a shell consumer that sources it exports the
+        # token with a trailing \r.
+        with tempfile.TemporaryDirectory() as home:
+            self._run(lambda req, timeout=None: _FakeResp(b'{"status":"ok"}'), home=home)
+            raw = (Path(home) / ".env").read_bytes()
+        self.assertNotIn(b"\r\n", raw)
+        self.assertIn(b"CI_SERVER_TOKEN=tok\n", raw)
+
+    def test_bom_prefixed_env_file_replaces_the_token_rather_than_duplicating_it(self):
+        # Notepad's default is UTF-8-with-BOM. Read as plain utf-8 the BOM stays
+        # glued to the first line, so 'CI_SERVER_TOKEN' != '﻿CI_SERVER_TOKEN',
+        # the replace missed and a SECOND token line was appended — setup reported
+        # success while a first-wins loader kept using the stale key.
+        with tempfile.TemporaryDirectory() as home:
+            env_path = Path(home) / ".env"
+            env_path.write_bytes(b"\xef\xbb\xbfCI_SERVER_TOKEN=stale\nOTHER=keep\n")
+            self._run(
+                lambda req, timeout=None: _FakeResp(b'{"status":"ok"}'),
+                home=home,
+                token="fresh",
+            )
+            lines = env_path.read_text(encoding="utf-8-sig").splitlines()
+        self.assertEqual([ln for ln in lines if ln.startswith("CI_SERVER_TOKEN=")], ["CI_SERVER_TOKEN=fresh"])
+        self.assertIn("OTHER=keep", lines)
+
+    def test_an_error_quoting_the_key_does_not_print_the_key(self):
+        # http.client raises ValueError("Invalid header value b'<token>\\r'") for a
+        # \r-tainted key. That reached the generic handler, which printed the
+        # exception verbatim — writing the user's live credential to the terminal.
+        secret = "sk-live-abcdef123456"
+
+        def fake_urlopen(req, timeout=None):
+            raise ValueError(f"Invalid header value {secret!r}")
+
+        with tempfile.TemporaryDirectory() as home:
+            text, saved = self._run(fake_urlopen, home=home, token=secret)
+        self.assertNotIn(secret, text)
+        self.assertIn("Unexpected error", text)
+        self.assertIn("3456", text, "a tail stub should survive, to identify the key")
+        self.assertEqual(saved, {})
+
+    def test_save_config_keeps_other_settings_when_the_file_has_a_bom(self):
+        # Reading with the locale codec (cp1252 on Windows) raised on non-ASCII,
+        # the bare except treated that as "no config", and the write-back silently
+        # dropped every key it was not currently saving.
+        with tempfile.TemporaryDirectory() as home:
+            cfg_dir = Path(home) / "companionintelligence"
+            cfg_dir.mkdir(parents=True)
+            (cfg_dir / "config.json").write_bytes(
+                '﻿{"url": "http://old", "note": "café"}'.encode("utf-8")
+            )
+            ci.CompanionIntelligenceProvider().save_config({"url": "http://new"}, home)
+            data = json.loads((cfg_dir / "config.json").read_text(encoding="utf-8-sig"))
+        self.assertEqual(data["url"], "http://new")
+        self.assertEqual(data["note"], "café", "unrelated settings must survive the write")
 
 
 class ProxyBypassTests(unittest.TestCase):
