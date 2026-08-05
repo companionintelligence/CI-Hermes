@@ -592,46 +592,80 @@ class SetupConsoleAndFileHygieneTests(unittest.TestCase):
         self.assertEqual(data["note"], "café", "unrelated settings must survive the write")
 
 
+class _OkHandler(http.server.BaseHTTPRequestHandler):
+    """Answers anything with 200 and records the request-target it was given."""
+
+    received: list
+
+    def do_GET(self):
+        type(self).received.append(self.path)
+        body = b'{"status":"ok"}'
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, *args):
+        pass
+
+
 class ProxyBypassTests(unittest.TestCase):
-    """CI-Server is a loopback/LAN appliance; no proxy is ever the right route to it.
+    """A proxy is bypassed for addresses it could not serve — and only those.
 
     urllib's default opener honours the WinINET registry proxy on Windows, and its
     "bypass local addresses" rule exempts only DOTLESS hosts — so ``127.0.0.1``, the
     default address this plugin ships with, is handed to a corporate proxy and never
     arrives. Capture failures are swallowed by design, so the symptom is memory that
     silently never accumulates.
+
+    The other direction matters just as much: a CI-Server reached at its public domain
+    (the app's "Expose app" setting) may only be reachable THROUGH the corporate proxy,
+    so ignoring proxies outright would trade one broken deployment for another.
     """
 
-    def test_requests_go_direct_even_with_a_proxy_configured(self):
-        received = []
-
-        class _Handler(http.server.BaseHTTPRequestHandler):
-            def do_GET(self):
-                received.append(self.path)
-                body = b'{"status":"ok"}'
-                self.send_response(200)
-                self.send_header("Content-Type", "application/json")
-                self.send_header("Content-Length", str(len(body)))
-                self.end_headers()
-                self.wfile.write(body)
-
-            def log_message(self, *args):
-                pass
-
-        srv = http.server.HTTPServer(("127.0.0.1", 0), _Handler)
+    def _serve(self):
+        """Start a throwaway HTTP server; returns (port, received-paths)."""
+        handler = type("_H", (_OkHandler,), {"received": []})
+        srv = http.server.HTTPServer(("127.0.0.1", 0), handler)
         threading.Thread(target=srv.serve_forever, daemon=True).start()
-        try:
-            port = srv.server_address[1]
-            # Port 1 answers nothing. If the plugin honoured this proxy the request
-            # would fail instead of reaching the server started above.
-            with mock.patch.dict(os.environ, {"http_proxy": "http://127.0.0.1:1"}):
-                self.assertTrue(ci._CIClient(f"http://127.0.0.1:{port}", "tok").health())
-        finally:
-            srv.shutdown()
-            srv.server_close()
+        self.addCleanup(srv.server_close)
+        self.addCleanup(srv.shutdown)
+        return srv.server_address[1], handler.received
 
+    def test_a_loopback_server_is_reached_despite_a_configured_proxy(self):
+        port, received = self._serve()
+        # Port 1 answers nothing. If the plugin honoured this proxy for loopback the
+        # request would fail instead of reaching the server started above.
+        with mock.patch.dict(os.environ, {"http_proxy": "http://127.0.0.1:1"}):
+            self.assertTrue(ci._CIClient(f"http://127.0.0.1:{port}", "tok").health())
         # A proxied request arrives as an absolute URI; a direct one as a bare path.
         self.assertEqual(received, ["/api/health"])
+
+    def test_a_public_server_still_goes_through_the_proxy(self):
+        # The regression guard for over-correcting: on a corporate laptop the proxy is
+        # the only route to an exposed CI-Server, and the hostname below resolves
+        # nowhere, so this can only pass if the proxy was actually used.
+        port, received = self._serve()
+        with mock.patch.dict(os.environ, {"http_proxy": f"http://127.0.0.1:{port}"}):
+            self.assertTrue(ci._CIClient("http://memory.example.com", "tok").health())
+        self.assertEqual(received, ["http://memory.example.com/api/health"])
+
+    def test_direct_host_classification(self):
+        for host in (
+            "127.0.0.1", "::1", "[::1]", "10.1.2.3", "192.168.1.9", "172.16.0.4",
+            "169.254.1.1", "100.101.102.103",           # link-local, and the tailnet range
+            "ci-memory", "hub",                           # dotless: what <local> means
+            "ci-memory.ci.lan", "hub.local", "box.internal", "hub.tailnet.ts.net",
+            "ci-memory.ci.lan.",                          # trailing dot on an FQDN
+            "CI-Memory.CI.LAN",                           # case is not significant
+        ):
+            self.assertTrue(ci._is_direct_host(host), f"{host} should bypass the proxy")
+
+        # Not 203.0.113.x here: ipaddress counts the documentation ranges as private,
+        # so those would pass for a reason that has nothing to do with this rule.
+        for host in ("memory.example.com", "8.8.8.8", "93.184.216.34", "ci.computer", "2606:4700::1111", ""):
+            self.assertFalse(ci._is_direct_host(host), f"{host} should keep the proxy")
 
 
 class ContextAndIntentGatingTests(unittest.TestCase):

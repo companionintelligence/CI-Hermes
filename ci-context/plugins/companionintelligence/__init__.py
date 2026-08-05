@@ -20,12 +20,14 @@ Config (set by `hermes memory setup` or environment):
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import logging
 import os
 import sys
 import threading
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any, Dict, List, Optional
@@ -151,7 +153,7 @@ def _plugin_version() -> str:
 _USER_AGENT = f"companionintelligence-hermes-memory/{_plugin_version()}"
 
 
-# Every request goes direct, never through a system proxy.
+# Requests to an address a proxy cannot serve go direct.
 #
 # ``urlopen`` uses the default opener, which installs a ProxyHandler built from
 # ``getproxies()``. On Windows that falls back to the WinINET registry proxy when no
@@ -164,15 +166,55 @@ _USER_AGENT = f"companionintelligence-hermes-memory/{_plugin_version()}"
 #
 # That failure is invisible: capture errors are swallowed rather than allowed to break
 # a session (see the User-Agent note above), so setup passes and memory just never
-# accumulates. CI-Server is a LAN or loopback appliance by design and there is no
-# deployment where routing it through an enterprise proxy is correct, so the opener
-# below has an empty ProxyHandler — proxies are ignored on every platform.
+# accumulates.
+#
+# The bypass is SCOPED rather than blanket, and the distinction matters. CI-Server can
+# legitimately be reached at a public domain — the app's "Expose app" setting is a
+# documented deployment — and on a corporate laptop the proxy is then the only route
+# out. Ignoring proxies outright would fix the loopback case by breaking that one. So:
+# addresses no proxy can resolve or route (loopback, RFC1918, link-local, the
+# appliance's own local/VPN suffixes, and dotless hosts, which is what ``<local>`` was
+# always meant to cover) go direct; everything else keeps stock urllib behaviour.
 _DIRECT_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+# ``.lan`` is the appliance's default local domain and ``.ts.net`` a tailnet: both name
+# hosts that exist only on the near side of any proxy.
+_DIRECT_HOST_SUFFIXES = (".local", ".lan", ".internal", ".home.arpa", ".ts.net")
+
+# Tailscale hands out addresses from the CGNAT range, which ``ipaddress`` does not
+# classify as private — it is carrier space, publicly allocated. A tailnet address is
+# still reachable only from inside the tailnet, so a proxy cannot serve it.
+_DIRECT_NETWORKS = (
+    ipaddress.ip_network("100.64.0.0/10"),
+    ipaddress.ip_network("fd7a:115c:a1e0::/48"),
+)
+
+
+def _is_direct_host(host: str) -> bool:
+    """True when *host* is one no proxy could usefully be asked about."""
+    host = (host or "").strip().strip("[]").rstrip(".").lower()
+    if not host:
+        return False
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        # A dotless name is single-label, so it resolves on the local network only —
+        # exactly the case ``<local>`` names, and the one Windows gets right.
+        return "." not in host or host.endswith(_DIRECT_HOST_SUFFIXES)
+    if ip.is_loopback or ip.is_private or ip.is_link_local:
+        return True
+    return any(ip in net for net in _DIRECT_NETWORKS if ip.version == net.version)
 
 
 def _urlopen(req: urllib.request.Request, timeout: float):
-    """Open *req* directly, bypassing any system/environment proxy."""
-    return _DIRECT_OPENER.open(req, timeout=timeout)
+    """Open *req*, bypassing any system/environment proxy for local addresses."""
+    if _is_direct_host(urllib.parse.urlsplit(req.full_url).hostname or ""):
+        return _DIRECT_OPENER.open(req, timeout=timeout)
+    # Built per call rather than cached: a cached opener freezes the proxy settings at
+    # import time, and this plugin is loaded once for the life of a long-running agent
+    # that can move between networks. This path is the rare one — the shipped default
+    # is loopback — so the cost is not on the hot route.
+    return urllib.request.build_opener().open(req, timeout=timeout)
 
 
 # ---------------------------------------------------------------------------
