@@ -738,6 +738,7 @@ class OllamaNativeClient:
         max_tokens: Optional[int] = None,
         stop: Any = None,
         seed: Optional[int] = None,
+        reasoning_effort: Optional[str] = None,
         extra_body: Optional[Dict[str, Any]] = None,
         timeout: Any = None,
         **_: Any,
@@ -747,6 +748,19 @@ class OllamaNativeClient:
         if isinstance(extra_body, dict):
             options = extra_body.get("options")
             think = extra_body.get("think")
+
+        # The custom profile emits a configured reasoning level as TOP-LEVEL
+        # reasoning_effort (the OpenAI-compatible field Ollama's /v1 honors),
+        # not extra_body.think — translate it so the level survives the native
+        # path instead of silently falling back to the server default. An
+        # explicit extra_body.think always wins (the profile's disabled case
+        # already pairs reasoning_effort="none" with think=False); "none" alone
+        # maps to think=False. Level strings pass through unchanged — Ollama
+        # accepts them as native think values exactly as /v1's reasoning_effort
+        # mapping does, so /v1 and native stay behavior-identical per level.
+        if think is None and isinstance(reasoning_effort, str) and reasoning_effort.strip():
+            effort = reasoning_effort.strip().lower()
+            think = False if effort == "none" else effort
 
         # Newer Ollama 400s on a truthy `think` (true or a "low"/"high" level)
         # for models without the "thinking" capability; `think: false` is
