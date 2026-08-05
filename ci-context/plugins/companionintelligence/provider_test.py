@@ -592,6 +592,48 @@ class SetupConsoleAndFileHygieneTests(unittest.TestCase):
         self.assertEqual(data["note"], "café", "unrelated settings must survive the write")
 
 
+class LoadConfigTests(unittest.TestCase):
+    """``_load_config`` is the runtime READ path — ``is_available()``, client
+    construction and every session start go through it, and every failure in it is
+    swallowed by design. A regression here is silent: no traceback, no warning, just
+    a plugin that quietly stops using the settings the user saved.
+    """
+
+    def _home_with_config(self, raw: bytes) -> str:
+        """Write *raw* as the config file of a throwaway Hermes home, and point
+        ``_load_config`` at it by stubbing the module it imports lazily."""
+        home = tempfile.TemporaryDirectory()
+        self.addCleanup(home.cleanup)
+        cfg_dir = Path(home.name) / "companionintelligence"
+        cfg_dir.mkdir(parents=True)
+        (cfg_dir / "config.json").write_bytes(raw)
+
+        stub = types.ModuleType("hermes_constants")
+        stub.get_hermes_home = lambda: Path(home.name)
+        sys.modules["hermes_constants"] = stub
+        self.addCleanup(sys.modules.pop, "hermes_constants", None)
+        return home.name
+
+    def test_a_bom_prefixed_config_is_still_read(self):
+        # Notepad's default on Windows is UTF-8-with-BOM. Read as plain utf-8 the BOM
+        # survives into the string, json.loads raises on it, and the bare `except`
+        # treats that as "no config" — leaving the plugin on env vars alone. The saved
+        # CI-Server URL is ignored and memory never accumulates, with nothing printed.
+        self._home_with_config(
+            '﻿{"url": "http://saved:8642", "token": "from-file"}'.encode("utf-8")
+        )
+        # Blanked, not cleared: these are the base _load_config layers the file over,
+        # so a real CI_SERVER_URL in the runner's environment would mask the read.
+        with mock.patch.dict(os.environ, {"CI_SERVER_URL": "", "CI_SERVER_TOKEN": ""}):
+            cfg = ci._load_config()
+            self.assertEqual(cfg["url"], "http://saved:8642")
+            self.assertEqual(cfg["token"], "from-file")
+            self.assertTrue(
+                ci.CompanionIntelligenceProvider().is_available(),
+                "a saved config must be enough to make the provider available",
+            )
+
+
 class _OkHandler(http.server.BaseHTTPRequestHandler):
     """Answers anything with 200 and records the request-target it was given."""
 
