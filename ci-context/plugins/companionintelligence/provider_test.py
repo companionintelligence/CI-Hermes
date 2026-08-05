@@ -557,7 +557,7 @@ class SetupConsoleAndFileHygieneTests(unittest.TestCase):
         # the stale key.
         with tempfile.TemporaryDirectory() as home:
             env_path = Path(home) / ".env"
-            env_path.write_bytes(b"\xef\xbb\xbfCI_SERVER_TOKEN=stale\nOTHER=keep\n")
+            env_path.write_bytes(_UTF8_BOM + b"CI_SERVER_TOKEN=stale\nOTHER=keep\n")
             self._run(
                 lambda req, timeout=None: _FakeResp(b'{"status":"ok"}'),
                 home=home,
