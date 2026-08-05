@@ -42,6 +42,12 @@ if _PARENT not in sys.path:
 
 import companionintelligence as ci  # noqa: E402
 
+# The UTF-8 BOM, spelled as the bytes it actually is. Every BOM fixture below builds
+# on this rather than embedding a U+FEFF in a string literal, where it is invisible in
+# review and one editor normalization away from vanishing — taking the whole point of
+# the test with it and leaving it green.
+_UTF8_BOM = b"\xef\xbb\xbf"
+
 _FLAGS = (
     "CI_MEMORY_CONTEXT_ENABLED",
     "CI_MEMORY_RECALL_ENABLED",
@@ -544,10 +550,11 @@ class SetupConsoleAndFileHygieneTests(unittest.TestCase):
         self.assertIn(b"CI_SERVER_TOKEN=tok\n", raw)
 
     def test_bom_prefixed_env_file_replaces_the_token_rather_than_duplicating_it(self):
-        # Notepad's default is UTF-8-with-BOM. Read as plain utf-8 the BOM stays
-        # glued to the first line, so 'CI_SERVER_TOKEN' != '﻿CI_SERVER_TOKEN',
-        # the replace missed and a SECOND token line was appended — setup reported
-        # success while a first-wins loader kept using the stale key.
+        # Notepad's default is UTF-8-with-BOM. Read as plain utf-8 the BOM stays glued
+        # to the first line, so the first key reads as U+FEFF + "CI_SERVER_TOKEN"
+        # rather than "CI_SERVER_TOKEN", the replace missed, and a SECOND token line
+        # was appended — setup reported success while a first-wins loader kept using
+        # the stale key.
         with tempfile.TemporaryDirectory() as home:
             env_path = Path(home) / ".env"
             env_path.write_bytes(b"\xef\xbb\xbfCI_SERVER_TOKEN=stale\nOTHER=keep\n")
@@ -583,8 +590,11 @@ class SetupConsoleAndFileHygieneTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as home:
             cfg_dir = Path(home) / "companionintelligence"
             cfg_dir.mkdir(parents=True)
+            # _UTF8_BOM as explicit bytes, not a U+FEFF in the literal: an invisible
+            # character is exactly what an editor or a formatter silently strips, and
+            # the test would keep passing while no longer testing a BOM at all.
             (cfg_dir / "config.json").write_bytes(
-                '﻿{"url": "http://old", "note": "café"}'.encode("utf-8")
+                _UTF8_BOM + '{"url": "http://old", "note": "café"}'.encode("utf-8")
             )
             ci.CompanionIntelligenceProvider().save_config({"url": "http://new"}, home)
             data = json.loads((cfg_dir / "config.json").read_text(encoding="utf-8-sig"))
@@ -620,7 +630,7 @@ class LoadConfigTests(unittest.TestCase):
         # treats that as "no config" — leaving the plugin on env vars alone. The saved
         # CI-Server URL is ignored and memory never accumulates, with nothing printed.
         self._home_with_config(
-            '﻿{"url": "http://saved:8642", "token": "from-file"}'.encode("utf-8")
+            _UTF8_BOM + '{"url": "http://saved:8642", "token": "from-file"}'.encode("utf-8")
         )
         # Blanked, not cleared: these are the base _load_config layers the file over,
         # so a real CI_SERVER_URL in the runner's environment would mask the read.
