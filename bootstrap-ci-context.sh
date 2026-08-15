@@ -123,8 +123,9 @@ case "${ci_native_lc}" in 1|true|yes|on) : ;; *) aux_base="" ;; esac
 [[ "${aux_key}" == "ollama" ]] || aux_base=""
 
 if [[ -f "${CONFIG_FILE}" ]]; then
-  python3 - "${CONFIG_FILE}" "${SKILLS_SOURCE}" "${PLUGIN_NAME}" "${CI_MEMORY_PROVIDER}" "${ci_num_ctx}" "${aux_base}" "${aux_model}" "${main_base}" <<'PY'
+  python3 - "${CONFIG_FILE}" "${SKILLS_SOURCE}" "${PLUGIN_NAME}" "${CI_MEMORY_PROVIDER}" "${ci_num_ctx}" "${aux_base}" "${aux_model}" "${main_base}" "${HUB_ENV_FILE}" <<'PY'
 from pathlib import Path
+import os
 import re
 import sys
 
@@ -136,6 +137,7 @@ num_ctx = sys.argv[5] if len(sys.argv) > 5 else ""
 aux_base = sys.argv[6] if len(sys.argv) > 6 else ""
 aux_model = sys.argv[7] if len(sys.argv) > 7 else ""
 main_base = sys.argv[8] if len(sys.argv) > 8 else ""
+hub_env_file = sys.argv[9] if len(sys.argv) > 9 else ""
 
 # Hermes' hard minimum context window. Mirrors the upstream agent's
 # MINIMUM_CONTEXT_LENGTH, which is the literal 64000 (NOT 65536) and is compared
@@ -485,6 +487,107 @@ if aux_base:
             lines.append("\n")
         lines.extend(block)
         print(f"CI context: added auxiliary providers (side-tasks -> {aux_base})")
+
+# ── Hub-saved cloud providers (additive) ─────────────────────────────────────
+# Hub Settings → AI injects CI_CLOUD_* into .env.hub-bootstrap. Register each
+# present provider so the GUI picker can offer OpenAI / Anthropic / Google /
+# GitHub Copilot alongside local Ollama. Do not overwrite HERMES_OPENAI_* /
+# model.provider — those stay on the local backend.
+def read_dotenv(path: str) -> dict:
+    env = {}
+    p = Path(path) if path else None
+    if not p or not p.is_file():
+        return env
+    for raw in p.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        value = value.strip().strip("\r")
+        if (value.startswith('"') and value.endswith('"')) or (
+            value.startswith("'") and value.endswith("'")
+        ):
+            value = value[1:-1]
+        env[key] = value
+    return env
+
+def env_get(key: str) -> str:
+    return (hub_env.get(key) or os.environ.get(key) or "").strip()
+
+def provider_span(provider_key: str):
+    start, end = section_bounds("providers")
+    if start is None:
+        return None
+    key_re = re.compile(rf"^  {re.escape(provider_key)}:\s*(?:.*)$")
+    for i in range(start + 1, end):
+        if key_re.match(lines[i]):
+            j = i + 1
+            while j < end and (lines[j].startswith("    ") or not lines[j].strip()):
+                j += 1
+            return i, j
+    return None
+
+def remove_provider_entry(provider_key: str) -> bool:
+    span = provider_span(provider_key)
+    if span is None:
+        return False
+    del lines[span[0]:span[1]]
+    return True
+
+def upsert_provider_entry(provider_key: str, name: str, base_url: str, api_key: str, model: str) -> bool:
+    def _q(v: str) -> str:
+        return v.replace("'", "''")
+
+    block = [
+        f"  {provider_key}:\n",
+        f"    name: '{_q(name)}'\n",
+    ]
+    if base_url:
+        block.append(f"    base_url: '{_q(base_url)}'\n")
+    block.append(f"    api_key: '{_q(api_key)}'\n")
+    if model:
+        block.append(f"    model: '{_q(model)}'\n")
+
+    span = provider_span(provider_key)
+    if span is not None and lines[span[0]:span[1]] == block:
+        return False
+    if span is not None:
+        del lines[span[0]:span[1]]
+
+    idx = next((i for i, l in enumerate(lines) if re.match(r"^providers:", l)), None)
+    if idx is None:
+        if lines and not lines[-1].endswith("\n"):
+            lines[-1] += "\n"
+        if lines and lines[-1].strip():
+            lines.append("\n")
+        lines.append("providers:\n")
+        lines.extend(block)
+        return True
+    if re.match(r"^providers:\s*(\{\s*\}|\[\s*\])\s*(?:#.*)?$", lines[idx]):
+        lines[idx] = "providers:\n"
+        lines[idx + 1:idx + 1] = block
+        return True
+    start, _end = section_bounds("providers")
+    if start is None:
+        return False
+    lines[start + 1:start + 1] = block
+    return True
+
+hub_env = read_dotenv(hub_env_file)
+CLOUD_SPECS = (
+    ("openai", "OpenAI", "CI_CLOUD_OPENAI_API_KEY", "CI_CLOUD_OPENAI_BASE_URL", "CI_CLOUD_OPENAI_MODEL"),
+    ("anthropic", "Anthropic", "CI_CLOUD_ANTHROPIC_API_KEY", "CI_CLOUD_ANTHROPIC_BASE_URL", "CI_CLOUD_ANTHROPIC_MODEL"),
+    ("google", "Google", "CI_CLOUD_GOOGLE_API_KEY", "CI_CLOUD_GOOGLE_BASE_URL", "CI_CLOUD_GOOGLE_MODEL"),
+    ("github-copilot", "GitHub Copilot", "CI_CLOUD_GITHUB_COPILOT_API_KEY", "CI_CLOUD_GITHUB_COPILOT_BASE_URL", "CI_CLOUD_GITHUB_COPILOT_MODEL"),
+)
+for _id, _name, _key, _base, _model in CLOUD_SPECS:
+    _api_key = env_get(_key)
+    if not _api_key:
+        if remove_provider_entry(_id):
+            print(f"CI context: removed providers.{_id} (Hub cloud key absent)")
+        continue
+    if upsert_provider_entry(_id, _name, env_get(_base), _api_key, env_get(_model)):
+        print(f"CI context: registered providers.{_id} from Hub cloud token")
 
 new_text = "".join(lines)
 # Only write when something actually changed, so a fully-reconciled config is a
