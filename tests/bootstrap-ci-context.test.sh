@@ -572,6 +572,50 @@ else
 fi
 rm -rf "${data_dir}"
 
+# ─── Test 30: CI_CLOUD_* providers are registered alongside local ollama ────
+echo "test: Hub cloud tokens register additive providers without replacing ollama"
+data_dir="$(mktemp -d)"
+printf "model:\n  provider: ollama\n  default: gemma4:e2b\n" > "${data_dir}/config.yaml"
+printf '%s\n' \
+  'HERMES_OPENAI_BASE_URL=http://172.17.0.1:11434/v1' \
+  'HERMES_OPENAI_API_KEY=ollama' \
+  'CI_CLOUD_OPENAI_API_KEY=sk-oai' \
+  'CI_CLOUD_OPENAI_BASE_URL=https://api.openai.com/v1' \
+  'CI_CLOUD_OPENAI_MODEL=gpt-4o' \
+  'CI_CLOUD_ANTHROPIC_API_KEY=sk-ant' \
+  'CI_CLOUD_ANTHROPIC_BASE_URL=https://api.anthropic.com/v1' \
+  'CI_CLOUD_ANTHROPIC_MODEL=claude-opus-4' \
+  > "${data_dir}/.env.hub-bootstrap"
+run_bootstrap "${data_dir}"
+out="$(cat "${data_dir}/config.yaml")"
+assert_contains "local provider stays ollama" "provider: ollama" "${out}"
+assert_contains "ollama picker entry present" "name: 'Ollama (local)'" "${out}"
+assert_contains "OpenAI cloud provider registered" "name: 'OpenAI'" "${out}"
+assert_contains "OpenAI cloud key written" "api_key: 'sk-oai'" "${out}"
+assert_contains "Anthropic cloud provider registered" "name: 'Anthropic'" "${out}"
+assert_contains "Anthropic cloud key written" "api_key: 'sk-ant'" "${out}"
+assert_eq "single providers: key" "1" "$(grep -cE '^providers:' "${data_dir}/config.yaml")"
+assert_contains "openai provider key present" "  openai:" "${out}"
+assert_contains "anthropic provider key present" "  anthropic:" "${out}"
+hash1="$(shasum "${data_dir}/config.yaml" | awk '{print $1}')"
+run_bootstrap "${data_dir}"
+hash2="$(shasum "${data_dir}/config.yaml" | awk '{print $1}')"
+assert_eq "cloud provider reconcile is idempotent" "${hash1}" "${hash2}"
+rm -rf "${data_dir}"
+
+# ─── Test 31: removing a Hub cloud key drops that provider only ─────────────
+echo "test: absent CI_CLOUD_* key removes that provider and keeps the others"
+data_dir="$(mktemp -d)"
+printf "model:\n  provider: ollama\n  default: gemma4:e2b\nproviders:\n  openai:\n    name: 'OpenAI'\n    api_key: 'stale'\n  myremote:\n    name: 'My Remote'\n    base_url: 'https://remote.example/v1'\n" > "${data_dir}/config.yaml"
+printf 'HERMES_OPENAI_BASE_URL=http://172.17.0.1:11434/v1\nHERMES_OPENAI_API_KEY=ollama\nCI_CLOUD_GOOGLE_API_KEY=g-key\nCI_CLOUD_GOOGLE_MODEL=gemini-2.5-pro\n' > "${data_dir}/.env.hub-bootstrap"
+run_bootstrap "${data_dir}"
+out="$(cat "${data_dir}/config.yaml")"
+assert_not_contains "stale OpenAI provider removed" "name: 'OpenAI'" "${out}"
+assert_contains "user provider preserved" "name: 'My Remote'" "${out}"
+assert_contains "Google cloud provider added" "name: 'Google'" "${out}"
+assert_contains "Google key written" "api_key: 'g-key'" "${out}"
+rm -rf "${data_dir}"
+
 # ─── Summary ────────────────────────────────────────────────────────────────
 echo
 echo "Results: ${PASS} passed, ${FAIL} failed"

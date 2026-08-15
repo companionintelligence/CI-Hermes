@@ -164,6 +164,10 @@ bash tests/configure-hub-mcp.test.sh
 
 If Hub MCP is disabled on the Hub, run `cihub mcp setup` and restart the Hermes app to pick up new credentials.
 
+## Hub cloud inference tokens
+
+Hub → Settings → AI can store OpenAI, Anthropic, Google, and GitHub Copilot keys. On every start, `bootstrap-ci-context.sh` registers each present `CI_CLOUD_<PROVIDER>_API_KEY` / `_BASE_URL` / `_MODEL` under `providers:` so the dashboard picker can offer them **alongside** local Ollama (`HERMES_OPENAI_*`). A saved cloud key does not replace the local backend. Removing a key from Hub Settings drops that provider on the next restart.
+
 ## Error reporting
 
 The wrapper reports its own crashes to Sentry. It is **opt-out**: on any build
