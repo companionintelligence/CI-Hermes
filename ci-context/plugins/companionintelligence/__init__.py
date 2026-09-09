@@ -43,6 +43,20 @@ from .intent_catalog import (
 
 logger = logging.getLogger(__name__)
 
+
+def _warn_catalog_unavailable(failures: list) -> None:
+    """Say out loud that the curated intent catalog could not be reached.
+
+    Without this the agent quietly loses every privacy-labelled intent and
+    falls back to raw CRUD, which is exactly how CI-Server#1684 went unnoticed:
+    both candidate paths 404'd through the gateway and nothing logged it.
+    """
+    logger.warning(
+        "CI-Server intent catalog unavailable — the agent falls back to raw CRUD "
+        "instead of the curated, privacy-labelled intents. Tried %s",
+        "; ".join(failures),
+    )
+
 _REQUEST_TIMEOUT = 10.0   # seconds for write calls (absorb)
 _PREFETCH_TIMEOUT = 5.0   # seconds to wait for a queued prefetch result
 _MAX_TURN_CONTENT_CHARS = 4000   # max chars persisted per message (matches CI-OpenClaw)
@@ -327,14 +341,10 @@ class _CIClient:
             payload["title"] = title
         if session_id:
             payload["sessionId"] = session_id
-        try:
-            return self._post("/api/memory/write", payload)
-        except urllib.error.HTTPError as exc:
-            # Older CI-Server builds expose this as /api/memory/note. Fall back on
-            # 404 so a version skew doesn't drop the write (matches CI-OpenClaw).
-            if exc.code == 404:
-                return self._post("/api/memory/note", payload)
-            raise
+        # No 404 fallback: ``/api/memory/note`` was renamed to ``/write`` in
+        # CI-Server on 2026-06-03 and no longer exists, so the fallback turned
+        # one 404 into two and raised the second. Let a 404 surface as itself.
+        return self._post("/api/memory/write", payload)
 
     # ── Intent execution ──────────────────────────────────────────────────────
 
@@ -683,7 +693,9 @@ class CompanionIntelligenceProvider(MemoryProvider):
         # privacy-labelled intents over raw CRUD. Mirrors how CI-OpenClaw consumes
         # the same shared catalog; degrades silently if CI-Server lacks the endpoint.
         if _feature_enabled("CI_INTENTS_ENABLED"):
-            catalog = describe_catalog_for_prompt(fetch_intent_manifest(self._client._get))
+            catalog = describe_catalog_for_prompt(
+                fetch_intent_manifest(self._client._get, _warn_catalog_unavailable)
+            )
             if catalog:
                 # When the catalog is also registered as callable tools (see
                 # get_tool_schemas), tell the agent it can invoke these intents
@@ -901,7 +913,7 @@ class CompanionIntelligenceProvider(MemoryProvider):
             self._tool_schemas = []
             return self._tool_schemas
 
-        manifest = fetch_intent_manifest(client._get)
+        manifest = fetch_intent_manifest(client._get, _warn_catalog_unavailable)
         if manifest is None:
             logger.debug("CI intent tools: intent catalog unreachable; exposing no tools this session")
             self._tool_schemas = []

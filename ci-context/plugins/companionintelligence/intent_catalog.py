@@ -32,20 +32,41 @@ from urllib.parse import quote
 _CATALOG_PATHS = ("/api/agent/intents", "/api/intents")
 
 
-def fetch_intent_manifest(get_json: Callable[[str], dict]) -> Optional[dict]:
+def fetch_intent_manifest(
+    get_json: Callable[[str], dict],
+    on_unavailable: Optional[Callable[[List[str]], None]] = None,
+) -> Optional[dict]:
     """Fetch the intent manifest, or ``None`` if unavailable or malformed.
 
     Tries the canonical ``/api/agent/intents`` first, falling back to the legacy
     ``/api/intents`` alias. Never raises — discovery must degrade gracefully when
     CI-Server is unreachable.
+
+    Degrading *quietly* is what let CI-Server#1684 survive for months: both paths
+    404'd through the appliance gateway (which strips ``/api`` while the
+    controller had baked it in), this returned ``None``, and the agent silently
+    fell back to raw CRUD with nothing logged. ``on_unavailable`` is how the
+    caller gets told — graceful degradation should still be *audible*. It fires
+    only when every candidate path failed, so a legacy-alias fallback that
+    succeeds stays silent.
     """
+    failures: List[str] = []
+
     for path in _CATALOG_PATHS:
         try:
             body = get_json(path)
-        except Exception:
+        except Exception as error:  # noqa: BLE001 - any transport failure is a failed path
+            failures.append(f"{path}: {error!s}")
             continue
         if isinstance(body, dict) and isinstance(body.get("intents"), list):
             return body
+        # A 200 that is not a manifest is its own failure mode, and the one a
+        # gateway misroute produces: nginx serves the SPA rather than 404ing,
+        # so the body parses but has no intents[].
+        failures.append(f"{path}: 200 without an intents[] list")
+
+    if on_unavailable is not None:
+        on_unavailable(failures)
     return None
 
 
