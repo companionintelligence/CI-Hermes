@@ -87,6 +87,43 @@ class FetchIntentManifestTests(unittest.TestCase):
         self.assertIsNone(fetch_intent_manifest(lambda _p: None))
 
 
+    def test_reports_every_failed_path_when_no_candidate_yields_a_manifest(self):
+        # The regression guard for CI-Server#1684: both paths 404'd through the
+        # gateway, this returned None, and nothing anywhere said so.
+        reported = []
+
+        def boom(path):
+            raise RuntimeError("HTTP 404 for %s" % path)
+
+        self.assertIsNone(fetch_intent_manifest(boom, reported.extend))
+        self.assertEqual(len(reported), 2)
+        self.assertIn("/api/agent/intents: HTTP 404", reported[0])
+        self.assertIn("/api/intents: HTTP 404", reported[1])
+
+    def test_names_a_200_that_is_not_a_manifest(self):
+        # nginx serves the SPA rather than 404ing for an unmatched /api path, so
+        # the body parses fine and simply has no intents[]. "Malformed" must be a
+        # distinguishable reason, not a silent None.
+        reported = []
+        self.assertIsNone(fetch_intent_manifest(lambda _p: {"ok": True}, reported.extend))
+        self.assertEqual(len(reported), 2)
+        self.assertTrue(all("200 without an intents[] list" in line for line in reported))
+
+    def test_stays_silent_when_a_fallback_path_succeeds(self):
+        called = []
+
+        def get_json(path):
+            if path == "/api/agent/intents":
+                raise RuntimeError("HTTP 404")
+            return MANIFEST
+
+        manifest = fetch_intent_manifest(get_json, called.append)
+        self.assertEqual(len(manifest["intents"]), 3)
+        self.assertEqual(
+            called, [], "a working legacy alias is not a failure worth warning about"
+        )
+
+
 class DescribeCatalogTests(unittest.TestCase):
     def test_groups_by_domain_and_flags_destructive_external(self):
         text = describe_catalog_for_prompt(MANIFEST)

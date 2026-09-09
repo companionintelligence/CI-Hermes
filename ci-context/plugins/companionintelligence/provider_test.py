@@ -199,20 +199,22 @@ class CIClientDriftTests(unittest.TestCase):
         self.assertEqual(captured["path"], "/api/memory/recall")
         self.assertEqual(captured["payload"]["maxResults"], 20)
 
-    def test_write_falls_back_to_note_on_404(self):
+    def test_write_does_not_retry_a_dead_alias_on_404(self):
+        # This asserted the opposite until 2026-09: a 404 fell back to
+        # /api/memory/note, a route CI-Server renamed to /write on 2026-06-03.
+        # The fallback therefore turned one 404 into two and raised the second,
+        # which is strictly worse than reporting the first.
         client = self._client()
         calls = []
 
         def fake_post(path, payload):
             calls.append(path)
-            if path == "/api/memory/write":
-                raise urllib.error.HTTPError("http://u", 404, "Not Found", None, None)
-            return {"ok": True}
+            raise urllib.error.HTTPError("http://u", 404, "Not Found", None, None)
 
         client._post = fake_post
-        out = client.write("hello")
-        self.assertEqual(calls, ["/api/memory/write", "/api/memory/note"])
-        self.assertEqual(out, {"ok": True})
+        with self.assertRaises(urllib.error.HTTPError):
+            client.write("hello")
+        self.assertEqual(calls, ["/api/memory/write"])
 
     def test_write_reraises_non_404(self):
         client = self._client()
