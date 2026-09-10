@@ -304,6 +304,28 @@ def _build_request(
     return req
 
 
+
+#: CI-Server's marker for "the owner must approve this before it runs".
+#:
+#: It arrives inside a normal HTTP 200 body rather than as a 4xx, which is why it
+#: has to be recognised explicitly instead of falling out of the error path.
+_QUEUED_ERROR_CODE = "TOOL_QUEUED"
+
+
+def _queued_action(result: Any) -> Optional[str]:
+    """The pending-action id if this result is an approval request, else ``None``.
+
+    Returns the id (possibly an empty string) only when the marker is present, so
+    a server that omits the id still produces the right ANSWER — the agent must
+    stop and report either way.
+    """
+    if not isinstance(result, dict):
+        return None
+    error = result.get("error")
+    if not isinstance(error, dict) or error.get("code") != _QUEUED_ERROR_CODE:
+        return None
+    return str(error.get("pendingActionId") or "")
+
 class _CIClient:
     def __init__(self, base_url: str, token: str, timeout: float = _REQUEST_TIMEOUT):
         self._base = _normalize_base_url(base_url)
@@ -702,8 +724,9 @@ class CompanionIntelligenceProvider(MemoryProvider):
                 # mid-session instead of treating the catalog as descriptive only.
                 if self.get_tool_schemas():
                     catalog += (
-                        "\n\nRead-only intents from this catalog are registered as callable "
-                        "tools in this session — invoke them directly by tool name."
+                        "\n\nIntents from this catalog are registered as callable tools in this "
+                        "session — invoke them directly by tool name. Any marked destructive or "
+                        "external needs the owner's approval: calling one asks, it does not act."
                     )
                 blocks.append(catalog)
 
@@ -936,6 +959,30 @@ class CompanionIntelligenceProvider(MemoryProvider):
             return json.dumps({"success": False, "error": "CI-Server client is not configured"})
         try:
             result = client.invoke_intent(tool_name, args or {})
+
+            # A queue is not a failure and must not read like one. CI-Server
+            # answers a gated intent with a normal HTTP 200 carrying
+            # ``error.code == TOOL_QUEUED`` — so it never reaches the except
+            # branch below, and handed to the model raw it looks like something
+            # to retry. Said plainly instead, with ``retry: false`` carried
+            # explicitly so the instruction survives summarisation into a later
+            # turn.
+            queued = _queued_action(result)
+            if queued is not None:
+                return json.dumps(
+                    {
+                        "status": "awaiting_owner_approval",
+                        "intent": tool_name,
+                        "pendingActionId": queued,
+                        "retry": False,
+                        "message": (
+                            "Companion Memory has asked the owner to approve this. It has NOT "
+                            "run. Tell the user you have requested approval; do not call this "
+                            "tool again for the same request."
+                        ),
+                    }
+                )
+
             return json.dumps(result)
         except urllib.error.HTTPError as exc:
             if exc.code == 404:
@@ -944,9 +991,12 @@ class CompanionIntelligenceProvider(MemoryProvider):
                     "(HTTP 404) — unknown intent, or the server predates the REST intent executor"
                 )
             elif exc.code == 403:
+                # No longer the destructive/external case: those are queued as an
+                # approval card now, not refused. A 403 here means this key's
+                # capability is genuinely too low for the intent.
                 message = (
-                    f"CI-Server refused intent '{tool_name}' (HTTP 403) — destructive/external "
-                    "intents cannot run via the generic REST executor"
+                    f"CI-Server refused intent '{tool_name}' (HTTP 403) — this connection's "
+                    "capability is insufficient for it"
                 )
             else:
                 message = f"CI-Server intent '{tool_name}' failed (HTTP {exc.code})"
