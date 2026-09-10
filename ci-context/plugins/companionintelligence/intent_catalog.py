@@ -111,15 +111,37 @@ def describe_catalog_for_prompt(manifest: Optional[dict]) -> str:
     return "\n".join(lines).strip()
 
 
+#: Appended to a gated intent's description.
+#:
+#: Without it the agent meets the gate only by calling, and reads the queued
+#: result as a failure — and the obvious next move after a failure is to retry,
+#: which turns one intent into a pile of duplicate cards for the owner.
+_APPROVAL_NOTE = (
+    "\n\nRequires the owner's approval: calling this does NOT perform it. "
+    "Companion Memory queues an approval card and the owner answers on their own "
+    "device. Report that you have asked and move on — do NOT call it again to "
+    "check, and do not retry."
+)
+
+
 def manifest_to_tool_schemas(
     manifest: Optional[dict],
     include: Optional[Collection[str]] = None,
 ) -> List[Dict]:
     """Map manifest intents to OpenAI function-calling tool schemas.
 
-    Only non-destructive AND non-external intents are mapped — the same policy
-    CI-Server's generic REST executor enforces server-side with a 403, so the
-    agent is never offered a tool the executor would refuse.
+    EVERY intent is mapped, including destructive and external ones.
+
+    They used to be skipped, on the sound reasoning that CI-Server would answer
+    them with a 403 anyway — true while a connect key held ``write`` capability,
+    because ``capabilityAllows`` refused them before the gate was reached.
+
+    CI-Server now mints these keys at ``full`` and QUEUES anything irreversible
+    as an approval card for the owner instead of refusing it. Under that design
+    the filter is backwards: a tool the agent cannot call is a card it can never
+    ask for. Gated intents are mapped with an explicit note in the description
+    (see ``_APPROVAL_NOTE``) so the model knows the owner decides, rather than
+    discovering it from a result it will read as a plain failure.
 
     ``include`` optionally restricts the result to intents whose ``tool`` (or
     dotted ``name``) is in the collection. Returns ``[]`` for a missing or
@@ -144,11 +166,11 @@ def manifest_to_tool_schemas(
         if include is not None and tool not in include and intent.get("name") not in include:
             continue
         privacy = intent.get("privacy") or {}
-        if privacy.get("destructive") or privacy.get("external"):
-            continue
         title = intent.get("title") or ""
         desc = intent.get("description") or ""
         description = f"{title} — {desc}" if title and desc else (title or desc or tool)
+        if privacy.get("destructive") or privacy.get("external"):
+            description = f"{description}{_APPROVAL_NOTE}"
         parameters = intent.get("parameters")
         if not isinstance(parameters, dict) or not parameters:
             parameters = {"type": "object", "properties": {}}

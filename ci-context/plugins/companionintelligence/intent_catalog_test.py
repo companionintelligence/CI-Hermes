@@ -141,19 +141,40 @@ class DescribeCatalogTests(unittest.TestCase):
 class ManifestToToolSchemasTests(unittest.TestCase):
     def test_maps_read_intents_to_openai_function_schemas(self):
         schemas = manifest_to_tool_schemas(MANIFEST)
-        # memory.forget (destructive) and media.streamingAvailability (external)
-        # are filtered — only the read-only, appliance-local intent survives.
-        self.assertEqual([s["name"] for s in schemas], ["memory_recall"])
+        # All three map now: the gated two are approval-carded by CI-Server rather
+        # than refused, so hiding them would make the card unreachable. Order
+        # follows the manifest.
+        self.assertEqual(
+            [s["name"] for s in schemas],
+            ["memory_recall", "memory_forget", "media_streamingAvailability"],
+        )
         schema = schemas[0]
         self.assertEqual(set(schema.keys()), {"name", "description", "parameters"})
         self.assertIn("Recall knowledge", schema["description"])
         self.assertIn("Recall stored facts.", schema["description"])
         self.assertEqual(schema["parameters"], {"type": "object"})
 
-    def test_filters_destructive_and_external(self):
-        names = {s["name"] for s in manifest_to_tool_schemas(MANIFEST)}
-        self.assertNotIn("memory_forget", names)
-        self.assertNotIn("media_streamingAvailability", names)
+    def test_maps_gated_intents_too_and_says_the_owner_decides(self):
+        # This asserted the opposite until 2026-09. Skipping destructive and
+        # external intents was correct while a connect key held `write` —
+        # CI-Server refused them before its gate, so offering the tool bought
+        # only a confusing 403. CI-Server now mints these keys at `full` and
+        # queues anything irreversible as an approval card, which makes a hidden
+        # tool a card the agent can never ask for.
+        schemas = {s["name"]: s for s in manifest_to_tool_schemas(MANIFEST)}
+        self.assertIn("memory_forget", schemas)
+        self.assertIn("media_streamingAvailability", schemas)
+
+        # A gated tool warns in its description, because a model that discovers
+        # the gate by calling will read the queued result as a failure and retry.
+        self.assertIn("Requires the owner's approval", schemas["memory_forget"]["description"])
+        self.assertIn("do NOT call it again", schemas["memory_forget"]["description"])
+
+        # An ungated one is left alone — a warning on every read would be noise.
+        self.assertNotIn(
+            "Requires the owner's approval",
+            schemas["memory_recall"]["description"],
+        )
 
     def test_include_filters_by_tool_or_dotted_name(self):
         manifest = {

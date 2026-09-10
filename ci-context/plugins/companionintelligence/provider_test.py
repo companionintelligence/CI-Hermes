@@ -1064,6 +1064,45 @@ class HandleToolCallTests(unittest.TestCase):
         self.assertEqual(json.loads(out), {"success": True, "data": {"hello": "world"}})
         self.assertEqual(client.invoke_calls, [("memory_recall", {"query": "ada"})])
 
+    def test_a_queued_intent_reads_as_asked_the_owner_not_as_a_failure(self):
+        # CI-Server answers a gated intent with a normal HTTP 200 carrying
+        # error.code TOOL_QUEUED — so it never reaches the HTTPError branch, and
+        # handed to the model raw it looks like a failure. The likely next move
+        # after a failure is a retry, which is a pile of duplicate cards for one
+        # intent.
+        client = _MockClient(manifest=_MANIFEST)
+        client.invoke_result = {
+            "success": False,
+            "error": {"code": "TOOL_QUEUED", "message": "queued", "pendingActionId": "pa-1"},
+        }
+        out = json.loads(_provider_with_client(client).handle_tool_call("memory_forget", {}))
+
+        self.assertEqual(out["status"], "awaiting_owner_approval")
+        self.assertIs(out["retry"], False)
+        self.assertEqual(out["pendingActionId"], "pa-1")
+        # Must not carry the failure shape the raw body had.
+        self.assertNotIn("success", out)
+
+    def test_a_queued_intent_without_an_id_still_stops_the_agent(self):
+        # The ANSWER does not depend on the id: whether or not the server sends
+        # one, the agent must stop and report rather than retry.
+        client = _MockClient(manifest=_MANIFEST)
+        client.invoke_result = {"error": {"code": "TOOL_QUEUED"}}
+        out = json.loads(_provider_with_client(client).handle_tool_call("memory_forget", {}))
+
+        self.assertEqual(out["status"], "awaiting_owner_approval")
+        self.assertIs(out["retry"], False)
+
+    def test_an_ordinary_failure_is_still_a_failure(self):
+        # Only the TOOL_QUEUED marker gets the approval treatment — a real error
+        # must not be dressed up as "asked the owner".
+        client = _MockClient(manifest=_MANIFEST)
+        client.invoke_result = {"success": False, "error": {"code": "TOOL_FORBIDDEN"}}
+        out = json.loads(_provider_with_client(client).handle_tool_call("memory_forget", {}))
+
+        self.assertNotIn("status", out)
+        self.assertIs(out["success"], False)
+
     def test_none_args_default_to_empty_input(self):
         client = _MockClient(manifest=_MANIFEST)
         _provider_with_client(client).handle_tool_call("memory_recall", None)
@@ -1190,8 +1229,11 @@ class SystemPromptCallableLineTests(unittest.TestCase):
         self.assertIn("memory_recall", out)  # catalog still injected
         self.assertNotIn("registered as callable tools", out)
 
-    def test_callable_line_absent_when_no_tools_registered(self):
-        # Catalog reachable but every intent filtered (destructive) → no line.
+    def test_callable_line_present_for_a_gated_only_catalog(self):
+        # Was: "every intent filtered (destructive) -> no line". Gated intents are
+        # registered now — CI-Server approval-cards them rather than refusing, so
+        # the agent CAN call this one; what it gets back is a request for the
+        # owner. The line must therefore appear, and must say so.
         destructive_only = {
             "intents": [
                 {
@@ -1208,7 +1250,11 @@ class SystemPromptCallableLineTests(unittest.TestCase):
         client = _MockClient(block="PROFILE", manifest=destructive_only)
         out = _provider_with_client(client).system_prompt_block()
         self.assertIn("memory_forget", out)  # still described in the catalog
-        self.assertNotIn("registered as callable tools", out)
+        self.assertIn("registered as callable tools", out)
+        # And the prompt states the gate, so the agent does not learn it from a
+        # result it would otherwise read as a failure worth retrying.
+        self.assertIn("needs the owner's approval", out)
+        self.assertIn("calling one asks, it does not act", out)
 
 
 if __name__ == "__main__":
