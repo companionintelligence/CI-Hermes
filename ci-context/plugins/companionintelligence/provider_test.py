@@ -1071,17 +1071,49 @@ class HandleToolCallTests(unittest.TestCase):
         # after a failure is a retry, which is a pile of duplicate cards for one
         # intent.
         client = _MockClient(manifest=_MANIFEST)
+        # THE SHAPE THE SERVER ACTUALLY SENDS. ``ToolError`` is
+        # ``{code, message, retryable, details}`` — the queue metadata lives in
+        # ``details`` and the type has no top-level slot for it. This fixture
+        # used to be flat, matching a reader that looked at
+        # ``error["pendingActionId"]``, so the test passed while every real
+        # queued call reported an empty id. A fixture written against the
+        # implementation instead of the contract cannot catch the
+        # implementation being wrong about the contract.
         client.invoke_result = {
             "success": False,
-            "error": {"code": "TOOL_QUEUED", "message": "queued", "pendingActionId": "pa-1"},
+            "error": {
+                "code": "TOOL_QUEUED",
+                "message": "queued",
+                "retryable": False,
+                "details": {
+                    "pendingActionId": "pa-1",
+                    "reason": "confirmation-required",
+                    "expiresAt": "2026-09-11T08:00:00.000Z",
+                },
+            },
         }
         out = json.loads(_provider_with_client(client).handle_tool_call("memory_forget", {}))
 
         self.assertEqual(out["status"], "awaiting_owner_approval")
         self.assertIs(out["retry"], False)
         self.assertEqual(out["pendingActionId"], "pa-1")
+        self.assertEqual(out["expiresAt"], "2026-09-11T08:00:00.000Z")
         # Must not carry the failure shape the raw body had.
         self.assertNotIn("success", out)
+
+    def test_a_queued_intent_from_an_older_appliance_is_still_named(self):
+        # The two ends release independently — a 90-day connect key outlives a
+        # server upgrade — so the harness can be newer than the appliance it
+        # talks to. The flat-form fallback exists for that, and is tested so it
+        # is not deleted as dead code by someone who only sees the current shape.
+        client = _MockClient(manifest=_MANIFEST)
+        client.invoke_result = {
+            "error": {"code": "TOOL_QUEUED", "pendingActionId": "pa-legacy"},
+        }
+        out = json.loads(_provider_with_client(client).handle_tool_call("memory_forget", {}))
+
+        self.assertEqual(out["pendingActionId"], "pa-legacy")
+        self.assertIsNone(out["expiresAt"])
 
     def test_a_queued_intent_without_an_id_still_stops_the_agent(self):
         # The ANSWER does not depend on the id: whether or not the server sends

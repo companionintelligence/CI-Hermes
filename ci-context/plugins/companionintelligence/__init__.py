@@ -318,13 +318,47 @@ def _queued_action(result: Any) -> Optional[str]:
     Returns the id (possibly an empty string) only when the marker is present, so
     a server that omits the id still produces the right ANSWER — the agent must
     stop and report either way.
+
+    The id lives under ``error.details``. CI-Server's ``ToolError`` is
+    ``{code, message, retryable, details}`` and the queue metadata goes in
+    ``details``; the type has no top-level slot for it. This read was
+    ``error["pendingActionId"]``, which is always absent, so every queued call
+    reported an empty id and the agent could never name the card it had just
+    raised. Keying on the MARKER rather than the id is what kept the *answer*
+    correct while the id was silently lost.
+
+    The flat form is still accepted, because the two ends release
+    independently: a 90-day connect key outlives a server upgrade, so a harness
+    can be older or newer than the appliance it is talking to.
     """
     if not isinstance(result, dict):
         return None
     error = result.get("error")
     if not isinstance(error, dict) or error.get("code") != _QUEUED_ERROR_CODE:
         return None
+    details = error.get("details")
+    if isinstance(details, dict) and details.get("pendingActionId"):
+        return str(details["pendingActionId"])
     return str(error.get("pendingActionId") or "")
+
+
+def _queued_expiry(result: Any) -> Optional[str]:
+    """When the owner's window to answer closes, if the server said.
+
+    Separate from :func:`_queued_action` so that function keeps its narrow
+    contract — "present, and here is the id" — which the empty-string case
+    depends on.
+    """
+    if not isinstance(result, dict):
+        return None
+    error = result.get("error")
+    if not isinstance(error, dict):
+        return None
+    details = error.get("details")
+    if not isinstance(details, dict):
+        return None
+    expires = details.get("expiresAt")
+    return str(expires) if expires else None
 
 class _CIClient:
     def __init__(self, base_url: str, token: str, timeout: float = _REQUEST_TIMEOUT):
@@ -974,6 +1008,9 @@ class CompanionIntelligenceProvider(MemoryProvider):
                         "status": "awaiting_owner_approval",
                         "intent": tool_name,
                         "pendingActionId": queued,
+                        # The owner has a deadline (24h by default). Worth
+                        # telling the user, and it rides in the same object.
+                        "expiresAt": _queued_expiry(result),
                         "retry": False,
                         "message": (
                             "Companion Memory has asked the owner to approve this. It has NOT "
