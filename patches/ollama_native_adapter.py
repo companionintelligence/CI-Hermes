@@ -118,6 +118,13 @@ def _probe_is_ollama(
         elif resp.status_code == 404:
             # No /api/version route at all — definitive "not Ollama".
             definitive_negative = True
+            logger.info(
+                "Ollama /api/version probe got 404 from %s — treating as "
+                "definitively not Ollama; native routing disabled for this "
+                "endpoint (cached %.0fs).",
+                root,
+                _VERSION_PROBE_TTL,
+            )
         elif resp.status_code in (401, 403):
             # Indeterminate: the endpoint may be Ollama behind a misconfigured
             # credential — keep the short retry TTL so a fixed key recovers fast.
