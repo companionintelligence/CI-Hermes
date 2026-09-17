@@ -138,22 +138,23 @@ run_with_fixture_in_dir() {
   rm -f "${fixture_file}"
 }
 
-# ─── Test 1: LOCAL Ollama (api_key sentinel "ollama") → CUSTOM_* aliases only ──
-# The OpenAI-SDK aliases (OPENAI_BASE_URL/OPENAI_API_BASE/OPENAI_API_KEY) are
-# deliberately suppressed for a local endpoint: they make the upstream model picker
-# mislabel the local box as the cloud "openai-api" provider (dropping num_ctx and
-# targeting api.openai.com on a GUI switch). The runtime uses CUSTOM_BASE_URL +
-# config model.base_url instead. Model aliases are unaffected.
-echo "test: local endpoint aliases to CUSTOM_* only (no OPENAI_* foot-guns)"
+# ─── Test 1: LOCAL endpoint (api_key sentinel "ollama") → no endpoint/model aliases ──
+# config.yaml carries the Hub's own endpoint and the model. Upstream, env
+# CUSTOM_BASE_URL outranks config model.base_url and HERMES_INFERENCE_MODEL outranks
+# model.default, for the life of the process — so exporting them froze every running
+# process on the handout it started with (core-4, 2026-09-17). The OpenAI-SDK aliases
+# stay suppressed too: they make the model picker mislabel the local box as the
+# cloud "openai-api" provider.
+echo "test: local endpoint exports no endpoint or model aliases (config.yaml owns them)"
 fixture=$'HERMES_OPENAI_BASE_URL=http://ci-hub-ollama:11434/v1\nHERMES_OPENAI_API_KEY=ollama\nHERMES_DEFAULT_MODEL=hermes4-70b\nHERMES_DEFAULT_MODEL_BACKEND_ID=hermes4:70b\nHERMES_EMBEDDINGS_MODEL=nomic-embed-text\n'
 out="$(run_with_fixture "${fixture}")"
 assert_no_line "OPENAI_API_BASE suppressed for local" "OPENAI_API_BASE=" "${out}"
 assert_no_line "OPENAI_BASE_URL suppressed for local" "OPENAI_BASE_URL=" "${out}"
 assert_no_line "OPENAI_API_KEY suppressed for local" "OPENAI_API_KEY=" "${out}"
-assert_contains "CUSTOM_BASE_URL alias present" "CUSTOM_BASE_URL=http://ci-hub-ollama:11434/v1" "${out}"
-assert_contains "CUSTOM_API_KEY alias present" "CUSTOM_API_KEY=ollama" "${out}"
-assert_contains "OPENAI_MODEL present" "OPENAI_MODEL=hermes4-70b" "${out}"
-assert_contains "HERMES_INFERENCE_MODEL alias present" "HERMES_INFERENCE_MODEL=hermes4-70b" "${out}"
+assert_no_line "CUSTOM_BASE_URL not exported (would outrank model.base_url)" "CUSTOM_BASE_URL=" "${out}"
+assert_no_line "CUSTOM_API_KEY not exported" "CUSTOM_API_KEY=" "${out}"
+assert_no_line "OPENAI_MODEL not exported (dead upstream)" "OPENAI_MODEL=" "${out}"
+assert_no_line "HERMES_INFERENCE_MODEL not exported (would outrank model.default)" "HERMES_INFERENCE_MODEL=" "${out}"
 assert_contains "OPENAI_EMBEDDINGS_MODEL present" "OPENAI_EMBEDDINGS_MODEL=nomic-embed-text" "${out}"
 assert_contains "original HERMES_ key preserved" "HERMES_DEFAULT_MODEL=hermes4-70b" "${out}"
 assert_contains "BACKEND_ID passthrough preserved" "HERMES_DEFAULT_MODEL_BACKEND_ID=hermes4:70b" "${out}"
@@ -168,14 +169,20 @@ assert_line "cloud OPENAI_API_BASE present" "OPENAI_API_BASE=https://api.openai.
 assert_line "cloud OPENAI_BASE_URL present" "OPENAI_BASE_URL=https://api.openai.com/v1" "${out}"
 assert_line "cloud OPENAI_API_KEY present" "OPENAI_API_KEY=sk-real-cloud" "${out}"
 assert_line "cloud CUSTOM_BASE_URL present" "CUSTOM_BASE_URL=https://api.openai.com/v1" "${out}"
+assert_line "cloud CUSTOM_API_KEY present" "CUSTOM_API_KEY=sk-real-cloud" "${out}"
+assert_no_line "cloud: no HERMES_INFERENCE_MODEL either (model.default owns the model)" "HERMES_INFERENCE_MODEL=" "${out}"
+assert_no_line "cloud: no OPENAI_MODEL" "OPENAI_MODEL=" "${out}"
 
-# ─── Test 1b: backend id becomes model fallback when plain default model is absent ──
-echo "test: backend id becomes model fallback when plain default model is absent"
+# ─── Test 1b: backend id becomes the model fallback when plain default model is absent ──
+echo "test: backend id becomes model.default when plain default model is absent"
+data_dir="$(mktemp -d)"
 fixture=$'HERMES_OPENAI_BASE_URL=http://ci-hub-ollama:11434/v1\nHERMES_OPENAI_API_KEY=ollama\nHERMES_DEFAULT_MODEL_BACKEND_ID=qwen3.5:9b\n'
-out="$(run_with_fixture "${fixture}")"
-assert_contains "OPENAI_MODEL fallback present" "OPENAI_MODEL=qwen3.5:9b" "${out}"
-assert_contains "HERMES_INFERENCE_MODEL fallback present" "HERMES_INFERENCE_MODEL=qwen3.5:9b" "${out}"
+run_with_fixture_in_dir "${fixture}" "${data_dir}"
+out="$(cat "${data_dir}/.env.hub-bootstrap")"
 assert_contains "backend id preserved" "HERMES_DEFAULT_MODEL_BACKEND_ID=qwen3.5:9b" "${out}"
+assert_no_line "no model alias exported" "HERMES_INFERENCE_MODEL=" "${out}"
+assert_contains "config model.default from backend id" "default: 'qwen3.5:9b'" "$(cat "${data_dir}/config.yaml")"
+rm -rf "${data_dir}"
 
 # ─── Test 2: Unrelated env lines pass through untouched ─────────────────────
 echo "test: unrelated env lines pass through"
@@ -276,8 +283,10 @@ assert_not_contains "cloud key never written to model block" "sk-secret-cloud" "
 assert_not_contains "no providers.ollama picker entry for cloud" "Ollama (local)" "${config_out}"
 rm -rf "${data_dir}"
 
-# ─── Test 7: existing config.yaml is never overwritten ───────────────────────
-echo "test: existing config.yaml is preserved"
+# ─── Test 7: a user-authored config.yaml is not overwritten ──────────────────
+# Nothing here was written by this bootstrap (no ownership record, no Hub-written
+# picker entry), so the model is the user's and the handout does not replace it.
+echo "test: a user-authored config.yaml is preserved"
 data_dir="$(mktemp -d)"
 cat > "${data_dir}/config.yaml" <<'EOF'
 model:
@@ -425,6 +434,265 @@ run_with_fixture_in_dir "${fixture}" "${data_dir}" "172.17.0.1"
 config_out="$(cat "${data_dir}/config.yaml")"
 assert_not_contains "no auxiliary section with flag off" "auxiliary:" "${config_out}"
 rm -rf "${data_dir}"
+
+# ═══ Handout changes after first boot ═══════════════════════════════════════
+# config.yaml used to be generated once and never again, so a changed handout
+# never reached model.default / model.base_url / providers.ollama / auxiliary.*.
+# Found live on core-4 (2026-09-17): a first-boot gemma3:1b pointed straight at host
+# Ollama (32,768 tokens, below the 64K minimum) long after the Hub had moved the app
+# to the pool with qwen3-coder:30b / 65536.
+
+# cfg <data_dir> <dotted.path> → the parsed value ("<absent>" when missing).
+cfg() {
+  python3 - "$1/config.yaml" "$2" <<'PY' || echo "<unreadable>"
+import sys, yaml
+node = yaml.safe_load(open(sys.argv[1])) or {}
+for part in sys.argv[2].split("."):
+    if not isinstance(node, dict) or part not in node:
+        print("<absent>"); sys.exit(0)
+    node = node[part]
+print(node)
+PY
+}
+
+POOL=http://ci-os-hub:5002/api/inference/pool/v1
+HOST_OLLAMA=http://172.17.0.1:11434/v1
+POOL_HANDOUT="$(printf 'HERMES_OPENAI_BASE_URL=%s\nHERMES_OPENAI_API_KEY=ollama\nCI_INFERENCE_BACKEND=ollama\nHERMES_DEFAULT_MODEL=qwen3-coder:30b\nHERMES_EMBEDDINGS_MODEL=nomic-embed-text\nOLLAMA_HOST=http://ci-os-hub:5002/api/inference/pool\nHERMES_NUM_CTX=65536\n' "${POOL}")"
+
+# The config and env file v2026.8.9 left on core-4, written for the first-boot handout.
+seed_core4_before() {
+  local d="$1"
+  cat > "${d}/config.yaml" <<YAML
+model:
+  provider: ollama
+  default: 'gemma3:1b'
+  base_url: '${HOST_OLLAMA}'
+  api_key: 'ollama'
+  ollama_num_ctx: 32768
+providers:
+  ollama:
+    name: 'Ollama (local)'
+    base_url: '${HOST_OLLAMA}'
+    api_key: 'ollama'
+auxiliary:
+$(for t in compression title_generation vision web_extract session_search skills_hub mcp; do printf "  %s:\n    base_url: '%s'\n    api_key: 'ollama'\n    model: 'gemma3:1b'\n" "$t" "${HOST_OLLAMA}"; done)
+mcp_servers:
+  hub:
+    url: "http://ci-os-hub:5002/api/mcp"
+    headers:
+      Authorization: "Bearer test-token"
+    timeout: 180
+
+skills:
+  external_dirs:
+    - /app/ci-context/skills
+
+plugins:
+  enabled:
+    - ci-runtime
+YAML
+  printf 'CUSTOM_BASE_URL=%s\nHERMES_OPENAI_BASE_URL=%s\nCUSTOM_API_KEY=ollama\nHERMES_OPENAI_API_KEY=ollama\nOPENAI_MODEL=gemma3:1b\nHERMES_INFERENCE_MODEL=gemma3:1b\nHERMES_DEFAULT_MODEL=gemma3:1b\nHERMES_NUM_CTX=32768\n' "${HOST_OLLAMA}" "${HOST_OLLAMA}" > "${d}/.env.hub-bootstrap"
+}
+
+export CI_HERMES_OLLAMA_NATIVE=1
+
+# ─── Test 17: core-4 regression — an old install follows the new handout ─────
+echo "test: core-4 regression: a pre-upgrade config follows the pool handout"
+data_dir="$(mktemp -d)"
+seed_core4_before "${data_dir}"
+run_with_fixture_in_dir "${POOL_HANDOUT}" "${data_dir}"
+assert_eq "model.default follows the handout" "qwen3-coder:30b" "$(cfg "${data_dir}" model.default)"
+assert_eq "model.base_url follows the handout" "${POOL}" "$(cfg "${data_dir}" model.base_url)"
+assert_eq "model.ollama_num_ctx follows" "65536" "$(cfg "${data_dir}" model.ollama_num_ctx)"
+assert_eq "model.context_length pinned (>=64K)" "65536" "$(cfg "${data_dir}" model.context_length)"
+assert_eq "providers.ollama.base_url follows" "${POOL}" "$(cfg "${data_dir}" providers.ollama.base_url)"
+for t in compression title_generation vision web_extract session_search skills_hub mcp; do
+  assert_eq "auxiliary.${t}.base_url follows" "${POOL}" "$(cfg "${data_dir}" auxiliary.${t}.base_url)"
+  assert_eq "auxiliary.${t}.model follows" "qwen3-coder:30b" "$(cfg "${data_dir}" auxiliary.${t}.model)"
+done
+assert_eq "unmanaged mcp_servers untouched" "Bearer test-token" "$(cfg "${data_dir}" mcp_servers.hub.headers.Authorization)"
+env_out="$(cat "${data_dir}/.env.hub-bootstrap")"
+assert_no_line "env: no CUSTOM_BASE_URL outranking model.base_url" "CUSTOM_BASE_URL=" "${env_out}"
+assert_no_line "env: no HERMES_INFERENCE_MODEL outranking model.default" "HERMES_INFERENCE_MODEL=" "${env_out}"
+assert_no_line "env: no OPENAI_MODEL" "OPENAI_MODEL=" "${env_out}"
+state_out="$(cat "${data_dir}/.hub-managed-config.json" 2>/dev/null || true)"
+assert_contains "ownership recorded for model.default" '"model.default": "qwen3-coder:30b"' "${state_out}"
+assert_eq "no warning for a >=64K handout" "no" "$([[ -e "${data_dir}/.hub-inference-warning" ]] && echo yes || echo no)"
+rm -rf "${data_dir}"
+
+# ─── Test 18: every later handout change is followed ───────────────────────────
+echo "test: a generated config follows two successive handout changes"
+data_dir="$(mktemp -d)"
+run_with_fixture_in_dir "$(printf 'HERMES_OPENAI_BASE_URL=%s\nHERMES_OPENAI_API_KEY=ollama\nHERMES_DEFAULT_MODEL=qwen3.5:9b\nHERMES_NUM_CTX=65536\n' "${HOST_OLLAMA}")" "${data_dir}"
+run_with_fixture_in_dir "${POOL_HANDOUT}" "${data_dir}"
+assert_eq "first change: model" "qwen3-coder:30b" "$(cfg "${data_dir}" model.default)"
+assert_eq "first change: endpoint" "${POOL}" "$(cfg "${data_dir}" model.base_url)"
+run_with_fixture_in_dir "$(printf 'HERMES_OPENAI_BASE_URL=%s\nHERMES_OPENAI_API_KEY=ollama\nHERMES_DEFAULT_MODEL=qwen3.6:27b\nHERMES_NUM_CTX=131072\n' "${POOL}")" "${data_dir}"
+assert_eq "second change: model" "qwen3.6:27b" "$(cfg "${data_dir}" model.default)"
+assert_eq "second change: aux model" "qwen3.6:27b" "$(cfg "${data_dir}" auxiliary.vision.model)"
+assert_eq "second change: window" "131072" "$(cfg "${data_dir}" model.context_length)"
+rm -rf "${data_dir}"
+
+# ─── Test 19: a GUI model switch survives a handout change ─────────────────────
+# Hermes re-dumps config.yaml with yaml.dump on a GUI change (unquoted scalars).
+echo "test: a user's model switch is kept while the Hub endpoint still follows"
+data_dir="$(mktemp -d)"
+run_with_fixture_in_dir "$(printf 'HERMES_OPENAI_BASE_URL=%s\nHERMES_OPENAI_API_KEY=ollama\nHERMES_DEFAULT_MODEL=qwen3.5:9b\nHERMES_NUM_CTX=65536\n' "${HOST_OLLAMA}")" "${data_dir}"
+python3 - "${data_dir}/config.yaml" <<'PY'
+import sys, yaml
+p = sys.argv[1]; d = yaml.safe_load(open(p)); d["model"]["default"] = "llama3.3:70b"
+yaml.dump(d, open(p, "w"), default_flow_style=False, sort_keys=False)
+PY
+log_out="$(HERMES_HOME="${data_dir}" BOOTSTRAP_FIXTURE_FILE=<(printf '%s\n' "${POOL_HANDOUT}") "${SCRIPT}" 2>&1)"
+assert_eq "user model kept" "llama3.3:70b" "$(cfg "${data_dir}" model.default)"
+assert_eq "Hub endpoint still follows" "${POOL}" "$(cfg "${data_dir}" model.base_url)"
+assert_contains "the kept value is logged" "kept user-set model.default='llama3.3:70b' (Hub handout: 'qwen3-coder:30b')" "${log_out}"
+# Picking the Hub's model again hands the key back to the Hub.
+python3 - "${data_dir}/config.yaml" <<'PY'
+import sys, yaml
+p = sys.argv[1]; d = yaml.safe_load(open(p)); d["model"]["default"] = "qwen3.5:9b"
+yaml.dump(d, open(p, "w"), default_flow_style=False, sort_keys=False)
+PY
+run_with_fixture_in_dir "${POOL_HANDOUT}" "${data_dir}"
+assert_eq "reverting to the recorded Hub model resumes management" "qwen3-coder:30b" "$(cfg "${data_dir}" model.default)"
+rm -rf "${data_dir}"
+
+# ─── Test 19b: adoption tells a pre-upgrade GUI switch from a stale Hub model ──
+echo "test: adoption keeps a model the user picked before the upgrade"
+data_dir="$(mktemp -d)"
+seed_core4_before "${data_dir}"
+sed -i.bak "s/^  default: 'gemma3:1b'$/  default: 'mistral-small:24b'/" "${data_dir}/config.yaml" && rm -f "${data_dir}/config.yaml.bak"
+run_with_fixture_in_dir "${POOL_HANDOUT}" "${data_dir}"
+assert_eq "pre-upgrade user model kept (aux still carried the Hub's)" "mistral-small:24b" "$(cfg "${data_dir}" model.default)"
+assert_eq "endpoint still adopted and followed" "${POOL}" "$(cfg "${data_dir}" model.base_url)"
+assert_eq "aux model adopted and followed" "qwen3-coder:30b" "$(cfg "${data_dir}" auxiliary.compression.model)"
+rm -rf "${data_dir}"
+
+# ─── Test 20: a user's own endpoint survives a handout change ──────────────────
+echo "test: a hand-edited model.base_url is kept across handout changes"
+data_dir="$(mktemp -d)"
+run_with_fixture_in_dir "${POOL_HANDOUT}" "${data_dir}"
+sed -i.bak "s#^  base_url: '${POOL}'\$#  base_url: 'http://my-own-box:11434/v1'#" "${data_dir}/config.yaml" && rm -f "${data_dir}/config.yaml.bak"
+run_with_fixture_in_dir "$(printf 'HERMES_OPENAI_BASE_URL=%s\nHERMES_OPENAI_API_KEY=ollama\nHERMES_DEFAULT_MODEL=qwen3.6:27b\nHERMES_NUM_CTX=65536\n' "${HOST_OLLAMA}")" "${data_dir}"
+assert_eq "user endpoint kept" "http://my-own-box:11434/v1" "$(cfg "${data_dir}" model.base_url)"
+assert_eq "Hub-owned model still follows" "qwen3.6:27b" "$(cfg "${data_dir}" model.default)"
+assert_eq "Hub-owned picker entry follows" "${HOST_OLLAMA}" "$(cfg "${data_dir}" providers.ollama.base_url)"
+rm -rf "${data_dir}"
+
+# ─── Test 21: a handout below the 64K minimum is refused, loudly ──────────────
+echo "test: switching to a sub-64K handout model is refused and surfaced"
+data_dir="$(mktemp -d)"
+run_with_fixture_in_dir "${POOL_HANDOUT}" "${data_dir}"
+small="$(printf 'HERMES_OPENAI_BASE_URL=%s\nHERMES_OPENAI_API_KEY=ollama\nHERMES_DEFAULT_MODEL=gemma3:1b\nHERMES_NUM_CTX=32768\n' "${HOST_OLLAMA}")"
+log_out="$(HERMES_HOME="${data_dir}" BOOTSTRAP_FIXTURE_FILE=<(printf '%s\n' "${small}") "${SCRIPT}" 2>&1)"
+assert_eq "working Hub model kept" "qwen3-coder:30b" "$(cfg "${data_dir}" model.default)"
+assert_eq "its endpoint kept with it" "${POOL}" "$(cfg "${data_dir}" model.base_url)"
+assert_eq "its window kept with it" "65536" "$(cfg "${data_dir}" model.context_length)"
+assert_contains "ERROR in the container log" "ERROR: The Hub (Settings -> AI) hands Hermes model 'gemma3:1b' with a 32768-token context window, below Hermes' 64000-token minimum." "${log_out}"
+warning="$(cat "${data_dir}/.hub-inference-warning" 2>/dev/null || true)"
+assert_contains "warning file for the terminal names the model" "'gemma3:1b'" "${warning}"
+assert_contains "warning file says what was kept" "kept the previous Hub model 'qwen3-coder:30b'" "${warning}"
+run_with_fixture_in_dir "${POOL_HANDOUT}" "${data_dir}"
+assert_eq "warning cleared once the handout is usable" "no" "$([[ -e "${data_dir}/.hub-inference-warning" ]] && echo yes || echo no)"
+rm -rf "${data_dir}"
+
+# ─── Test 21b: with nothing to keep, a sub-64K handout is applied and surfaced ─
+echo "test: a first-boot sub-64K handout is written, with the warning"
+data_dir="$(mktemp -d)"
+run_with_fixture_in_dir "${small}" "${data_dir}"
+assert_eq "model written (nothing better to keep)" "gemma3:1b" "$(cfg "${data_dir}" model.default)"
+assert_eq "no context_length below the minimum" "<absent>" "$(cfg "${data_dir}" model.context_length)"
+assert_contains "warning says Hermes will refuse it" "Hermes will refuse to start a session with it" "$(cat "${data_dir}/.hub-inference-warning" 2>/dev/null || true)"
+rm -rf "${data_dir}"
+
+# ─── Test 22: a cloud handout does not displace the Hub endpoint ──────────────
+# The Hub hands out its first cloud provider whenever local inference is unhealthy at
+# fetch time. Following that would move every conversation to a paid provider until
+# the next restart — and writing the cloud model over a local endpoint would break
+# every request. config.yaml keeps the Hub's local settings and the log says why.
+echo "test: a cloud handout leaves a Hub-managed local config alone, loudly"
+data_dir="$(mktemp -d)"
+run_with_fixture_in_dir "${POOL_HANDOUT}" "${data_dir}"
+before="$(shasum "${data_dir}/config.yaml" | awk '{print $1}')"
+cloud=$'HERMES_OPENAI_BASE_URL=https://api.openai.com/v1\nHERMES_OPENAI_API_KEY=sk-secret-cloud\nHERMES_DEFAULT_MODEL=gpt-4o\n'
+log_out="$(HERMES_HOME="${data_dir}" BOOTSTRAP_FIXTURE_FILE=<(printf '%s' "${cloud}") "${SCRIPT}" 2>&1)"
+assert_eq "config.yaml unchanged" "${before}" "$(shasum "${data_dir}/config.yaml" | awk '{print $1}')"
+assert_eq "local model kept" "qwen3-coder:30b" "$(cfg "${data_dir}" model.default)"
+assert_contains "the kept handout is logged" "the Hub handed out a cloud provider" "${log_out}"
+assert_not_contains "cloud key never in config.yaml" "sk-secret-cloud" "$(cat "${data_dir}/config.yaml")"
+assert_not_contains "cloud key never in the ownership record" "sk-secret-cloud" "$(cat "${data_dir}/.hub-managed-config.json" 2>/dev/null || true)"
+assert_no_line "no model override exported for the cloud handout either" "HERMES_INFERENCE_MODEL=" "$(cat "${data_dir}/.env.hub-bootstrap")"
+run_with_fixture_in_dir "$(printf 'HERMES_OPENAI_BASE_URL=%s\nHERMES_OPENAI_API_KEY=ollama\nHERMES_DEFAULT_MODEL=qwen3.6:27b\nHERMES_NUM_CTX=65536\n' "${POOL}")" "${data_dir}"
+assert_eq "local handout again: followed" "qwen3.6:27b" "$(cfg "${data_dir}" model.default)"
+rm -rf "${data_dir}"
+
+# ─── Test 22b: a cloud-only install follows its cloud handout ─────────────────
+echo "test: an install with no Hub endpoint follows cloud model changes"
+data_dir="$(mktemp -d)"
+run_with_fixture_in_dir "${cloud}" "${data_dir}"
+run_with_fixture_in_dir $'HERMES_OPENAI_BASE_URL=https://api.openai.com/v1\nHERMES_OPENAI_API_KEY=sk-secret-cloud\nHERMES_DEFAULT_MODEL=gpt-5\n' "${data_dir}"
+assert_eq "cloud model follows" "gpt-5" "$(cfg "${data_dir}" model.default)"
+assert_eq "no local endpoint invented" "<absent>" "$(cfg "${data_dir}" model.base_url)"
+assert_line "cloud endpoint travels in env" "CUSTOM_BASE_URL=https://api.openai.com/v1" "$(cat "${data_dir}/.env.hub-bootstrap")"
+assert_not_contains "cloud key never in config.yaml" "sk-secret-cloud" "$(cat "${data_dir}/config.yaml")"
+rm -rf "${data_dir}"
+
+# ─── Test 23: Hub unreachable → the last handout (from an older image) still converges ─
+echo "test: with the Hub unreachable, an old env file is cleaned and config.yaml reconciled"
+data_dir="$(mktemp -d)"
+seed_core4_before "${data_dir}"
+printf 'CUSTOM_BASE_URL=%s\nHERMES_OPENAI_BASE_URL=%s\nCUSTOM_API_KEY=ollama\nHERMES_OPENAI_API_KEY=ollama\nOPENAI_MODEL=qwen3-coder:30b\nHERMES_INFERENCE_MODEL=qwen3-coder:30b\nHERMES_DEFAULT_MODEL=qwen3-coder:30b\nHERMES_NUM_CTX=65536\n' "${POOL}" "${POOL}" > "${data_dir}/.env.hub-bootstrap"
+HERMES_HOME="${data_dir}" CI_HUB_URL="http://127.0.0.1:1" "${SCRIPT}" >/dev/null 2>&1
+env_out="$(cat "${data_dir}/.env.hub-bootstrap")"
+assert_no_line "stale CUSTOM_BASE_URL removed" "CUSTOM_BASE_URL=" "${env_out}"
+assert_no_line "stale HERMES_INFERENCE_MODEL removed" "HERMES_INFERENCE_MODEL=" "${env_out}"
+assert_line "handout itself kept" "HERMES_DEFAULT_MODEL=qwen3-coder:30b" "${env_out}"
+assert_eq "config reconciled from the last handout" "qwen3-coder:30b" "$(cfg "${data_dir}" model.default)"
+assert_eq "endpoint reconciled from the last handout" "${POOL}" "$(cfg "${data_dir}" model.base_url)"
+rm -rf "${data_dir}"
+
+# ─── Test 24: a converged config is not rewritten ──────────────────────────────
+echo "test: an unchanged handout leaves config.yaml and the record byte-identical"
+data_dir="$(mktemp -d)"
+seed_core4_before "${data_dir}"
+run_with_fixture_in_dir "${POOL_HANDOUT}" "${data_dir}"
+h1="$(shasum "${data_dir}/config.yaml" "${data_dir}/.hub-managed-config.json" 2>/dev/null | awk '{print $1}' || true)"
+touch -t 202001010000 "${data_dir}/config.yaml"
+m1="$(ls -l "${data_dir}/config.yaml")"
+run_with_fixture_in_dir "${POOL_HANDOUT}" "${data_dir}"
+h2="$(shasum "${data_dir}/config.yaml" "${data_dir}/.hub-managed-config.json" 2>/dev/null | awk '{print $1}' || true)"
+assert_eq "same bytes" "${h1}" "${h2}"
+assert_eq "config.yaml not rewritten (mtime kept)" "${m1}" "$(ls -l "${data_dir}/config.yaml")"
+rm -rf "${data_dir}"
+
+# ─── Test 25: comments and unmanaged layout survive ────────────────────────────
+echo "test: a user's comments survive a reconcile"
+data_dir="$(mktemp -d)"
+seed_core4_before "${data_dir}"
+sed -i.bak 's/^model:$/# my notes about the model\nmodel:  # keep me/' "${data_dir}/config.yaml" && rm -f "${data_dir}/config.yaml.bak"
+run_with_fixture_in_dir "${POOL_HANDOUT}" "${data_dir}"
+assert_contains "top comment kept" "# my notes about the model" "$(cat "${data_dir}/config.yaml")"
+assert_contains "inline comment kept" "model:  # keep me" "$(cat "${data_dir}/config.yaml")"
+assert_eq "and the model still follows" "qwen3-coder:30b" "$(cfg "${data_dir}" model.default)"
+rm -rf "${data_dir}"
+
+# ─── Test 26: web and gateway start at once on one volume ──────────────────────
+echo "test: concurrent bootstraps on a shared data dir converge on valid YAML"
+for round in 1 2 3; do
+  data_dir="$(mktemp -d)"
+  seed_core4_before "${data_dir}"
+  fx="$(mktemp)"; printf '%s\n' "${POOL_HANDOUT}" > "${fx}"
+  HERMES_HOME="${data_dir}" BOOTSTRAP_FIXTURE_FILE="${fx}" "${SCRIPT}" >/dev/null 2>&1 &
+  HERMES_HOME="${data_dir}" BOOTSTRAP_FIXTURE_FILE="${fx}" "${SCRIPT}" >/dev/null 2>&1 &
+  wait
+  assert_eq "round ${round}: model" "qwen3-coder:30b" "$(cfg "${data_dir}" model.default)"
+  assert_eq "round ${round}: single model: key" "1" "$(grep -c '^model:' "${data_dir}/config.yaml")"
+  assert_eq "round ${round}: single base_url in model" "1" "$(grep -c "^  base_url:" "${data_dir}/config.yaml")"
+  assert_eq "round ${round}: no temp files left" "" "$(ls -A "${data_dir}" | grep -E '^\.(env\.hub-bootstrap|config\.yaml|\.hub-managed-config\.json)\.' || true)"
+  rm -rf "${data_dir}" "${fx}"
+done
+
+unset CI_HERMES_OLLAMA_NATIVE
 
 # ─── Summary ────────────────────────────────────────────────────────────────
 echo

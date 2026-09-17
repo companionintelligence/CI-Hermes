@@ -5,38 +5,8 @@
 
 set -euo pipefail
 
-is_allowed_key() {
-  case "$1" in
-    OPENAI_*|HERMES_*|CUSTOM_*|ANTHROPIC_*|GEMINI_*|GOOGLE_*|OLLAMA_*) return 0 ;;
-    *) return 1 ;;
-  esac
-}
-
-load_hub_env_file() {
-  local env_file="$1"
-  local line key value
-  [[ -f "${env_file}" ]] || return 0
-
-  while IFS= read -r line || [[ -n "${line}" ]]; do
-    line="${line%$'\r'}"
-    [[ -z "${line}" || "${line}" =~ ^[[:space:]]*# ]] && continue
-
-    if [[ "${line}" =~ ^[[:space:]]*([A-Za-z_][A-Za-z0-9_]*)=(.*)$ ]]; then
-      key="${BASH_REMATCH[1]}"
-      value="${BASH_REMATCH[2]}"
-
-      is_allowed_key "${key}" || continue
-
-      if [[ "${value}" =~ ^\"(.*)\"$ ]]; then
-        value="${BASH_REMATCH[1]}"
-      elif [[ "${value}" =~ ^\'(.*)\'$ ]]; then
-        value="${BASH_REMATCH[1]}"
-      fi
-
-      export "${key}=${value}"
-    fi
-  done < "${env_file}"
-}
+# shellcheck source=hub-env.sh
+source /app/hub-env.sh
 
 /app/bootstrap-ci-context.sh
 
@@ -47,6 +17,16 @@ DATA_DIR="${HERMES_HOME:-/opt/data}"
 HUB_ENV_FILE="${DATA_DIR}/.env.hub-bootstrap"
 load_hub_env_file "${HUB_ENV_FILE}"
 
+# The handout reached config.yaml above; if the Hub handed out a model Hermes cannot
+# start (below its 64K minimum), say so where the user is looking.
+HUB_WARNING_FILE="${DATA_DIR}/.hub-inference-warning"
+if [[ -s "${HUB_WARNING_FILE}" ]]; then
+  printf '\n\033[1;31m%s\033[0m\n%s\n\n' "Hub inference settings need attention:" "$(cat "${HUB_WARNING_FILE}")"
+fi
+
+# Probe with exactly the environment `hermes` gets below. Loading
+# .env.hub-bootstrap again here would re-add keys the loader deliberately leaves to
+# config.yaml, and judge a setup the real session never sees.
 if ! python3 - <<'PY' 2>/dev/null; then
 import os
 from dotenv import load_dotenv
@@ -54,7 +34,6 @@ from hermes_cli.runtime_provider import resolve_runtime_provider
 
 data_dir = os.environ.get("HERMES_HOME", "/opt/data")
 load_dotenv(f"{data_dir}/.env")
-load_dotenv(f"{data_dir}/.env.hub-bootstrap")
 resolve_runtime_provider()
 PY
   hermes setup

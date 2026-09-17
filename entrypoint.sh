@@ -3,23 +3,24 @@
 # dashboard locally, then serve the proxied terminal/dashboard UI.
 set -e
 
-source "/opt/hermes/.venv/bin/activate"
+# CI_HERMES_APP_DIR / CI_HERMES_VENV exist so tests can run this entrypoint against a
+# checkout and a fake hermes; the image never sets them.
+APP_DIR="${CI_HERMES_APP_DIR:-/app}"
+source "${CI_HERMES_VENV:-/opt/hermes/.venv}/bin/activate"
 
-# Pull inference config from the Hub first so config.yaml exists before MCP
-# configurators run (bootstrap-from-hub.sh generates config.yaml on first boot).
-/app/bootstrap-from-hub.sh || true
+# Pull inference config from the Hub first: it writes .env.hub-bootstrap and makes
+# config.yaml follow the handout (generating it on first boot) before the MCP
+# configurators run.
+"${APP_DIR}/bootstrap-from-hub.sh" || true
 
-/app/bootstrap-ci-context.sh
+"${APP_DIR}/bootstrap-ci-context.sh"
 
-# Source the Hub-derived env so OPENAI_API_BASE / OPENAI_MODEL reach the
-# dashboard and the Node server before they spawn agent subprocesses.
-HUB_ENV_FILE="${HERMES_HOME:-/opt/data}/.env.hub-bootstrap"
-if [[ -f "${HUB_ENV_FILE}" ]]; then
-  set -a
-  # shellcheck disable=SC1090
-  source "${HUB_ENV_FILE}"
-  set +a
-fi
+# Export the Hub-derived env before the dashboard and the Node server start. The
+# gateway container loads the same file through the same loader, so both run the
+# model and endpoint config.yaml names — nothing in env outranks it (hub-env.sh).
+# shellcheck source=hub-env.sh
+source "${APP_DIR}/hub-env.sh"
+load_hub_env_file "${HERMES_HOME:-/opt/data}/.env.hub-bootstrap"
 
 # Start dashboard in background.
 # Binds to 127.0.0.1 (not 0.0.0.0) since our Node server proxies it — no
@@ -27,4 +28,4 @@ fi
 # If it crashes, the terminal still works — user can restart the app from CI marketplace.
 hermes dashboard --host 127.0.0.1 --no-open &
 
-exec node /app/server.cjs
+exec node "${APP_DIR}/server.cjs"

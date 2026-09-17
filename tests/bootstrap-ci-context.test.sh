@@ -616,6 +616,48 @@ assert_contains "Google cloud provider added" "name: 'Google'" "${out}"
 assert_contains "Google key written" "api_key: 'g-key'" "${out}"
 rm -rf "${data_dir}"
 
+# ─── Test 32: a provider the user picked keeps its whole model block ──────────
+# The Hub's endpoint, model and window only apply to the providers that run through
+# the custom runtime (ollama, custom, …). A user who switched to a cloud provider in
+# the GUI must not get the local base_url or the "ollama" sentinel key injected: the
+# runtime would send that key to their provider.
+echo "test: a user-selected provider's model block is left alone"
+data_dir="$(mktemp -d)"
+printf "model:\n  provider: anthropic\n  default: claude-opus-4\n" > "${data_dir}/config.yaml"
+printf 'HERMES_OPENAI_BASE_URL=http://172.17.0.1:11434/v1\nHERMES_OPENAI_API_KEY=ollama\nHERMES_DEFAULT_MODEL=qwen3-coder:30b\nHERMES_NUM_CTX=65536\n' > "${data_dir}/.env.hub-bootstrap"
+run_bootstrap "${data_dir}" CI_HERMES_OLLAMA_NATIVE=1
+out="$(cat "${data_dir}/config.yaml")"
+assert_contains "user provider kept" "provider: anthropic" "${out}"
+assert_contains "user model kept" "default: claude-opus-4" "${out}"
+assert_no_line "no Hub base_url in the user's model block" "  base_url:" "${out}"
+assert_no_line "no sentinel api_key in the user's model block" "  api_key:" "${out}"
+assert_no_line "no Hub context window forced on it" "  context_length:" "${out}"
+assert_contains "the local endpoint is still offered in the picker" "name: 'Ollama (local)'" "${out}"
+rm -rf "${data_dir}"
+
+# ─── Test 33: the ci-context edits and the reconcile don't lose each other's writes ─
+echo "test: concurrent ci-context runs on one volume keep every edit"
+for round in 1 2 3; do
+  data_dir="$(mktemp -d)"
+  printf "model:\n  provider: ollama\n" > "${data_dir}/config.yaml"
+  printf 'HERMES_OPENAI_BASE_URL=http://172.17.0.1:11434/v1\nHERMES_OPENAI_API_KEY=ollama\nHERMES_DEFAULT_MODEL=qwen3-coder:30b\nHERMES_NUM_CTX=65536\nCI_CLOUD_OPENAI_API_KEY=sk-oai\n' > "${data_dir}/.env.hub-bootstrap"
+  run_bootstrap "${data_dir}" "${CREDS[@]}" CI_HERMES_OLLAMA_NATIVE=1 &
+  run_bootstrap "${data_dir}" "${CREDS[@]}" CI_HERMES_OLLAMA_NATIVE=1 &
+  wait
+  out="$(cat "${data_dir}/config.yaml")"
+  assert_contains "round ${round}: reconciled model" "default: 'qwen3-coder:30b'" "${out}"
+  assert_contains "round ${round}: plugin enabled" "- ci-runtime" "${out}"
+  assert_contains "round ${round}: memory provider" "provider: companionintelligence" "${out}"
+  assert_contains "round ${round}: cloud provider" "name: 'OpenAI'" "${out}"
+  assert_eq "round ${round}: single providers key" "1" "$(grep -cE '^providers:' "${data_dir}/config.yaml")"
+  if python3 -c "import yaml,sys; yaml.safe_load(open('${data_dir}/config.yaml'))"; then
+    echo "  ✓ round ${round}: valid YAML"; PASS=$((PASS + 1))
+  else
+    echo "  ✗ round ${round}: invalid YAML"; FAIL=$((FAIL + 1))
+  fi
+  rm -rf "${data_dir}"
+done
+
 # ─── Summary ────────────────────────────────────────────────────────────────
 echo
 echo "Results: ${PASS} passed, ${FAIL} failed"
