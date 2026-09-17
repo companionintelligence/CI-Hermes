@@ -150,7 +150,7 @@ Requires a CI-Server build with the REST intent executor; on older servers the c
 
 On CI marketplace installs with MCP enabled, the Hub injects `HUB_MCP_URL` and `HUB_MCP_API_KEY`. Bootstrap order is:
 
-1. `/app/bootstrap-from-hub.sh` — creates `config.yaml` when missing (skips if one already exists)
+1. `/app/bootstrap-from-hub.sh` — fetches the Hub's inference handout and makes `config.yaml` follow it (creating the file on first boot; see *Hub inference handout*)
 2. `/app/bootstrap-ci-context.sh` — runs `configure-ci-server.py` (optional CI-Server memory MCP) and `configure-hub-mcp.py` (Hub platform MCP)
 
 The Hub block is written under `mcp_servers.hub` pointing at the Hub's Streamable HTTP MCP endpoint (`…/api/mcp`) with `Authorization: Bearer` headers and **no** `transport:` line (the agent's default MCP client speaks Streamable HTTP). It mirrors the optional `ci_server` memory MCP block, with which it coexists.
@@ -163,6 +163,36 @@ bash tests/configure-hub-mcp.test.sh
 ```
 
 If Hub MCP is disabled on the Hub, run `cihub mcp setup` and restart the Hermes app to pick up new credentials.
+
+## Hub inference handout
+
+On every start, both containers fetch the Hub's handout for the app
+(`GET $CI_HUB_URL/api/inference/apps/hermes-agent/credentials.env`, alias
+`bootstrap.env`) into `/opt/data/.env.hub-bootstrap`, and
+`reconcile-hub-config.py` makes the Hub-managed part of `config.yaml` follow it:
+`model.default`, `model.base_url` / `api_key`, `model.ollama_num_ctx` /
+`context_length`, the `providers.ollama` picker entry (the endpoint upstream actually
+resolves for `provider: ollama`) and `auxiliary.*` side-task routing.
+
+- **`config.yaml` is the single source of truth.** The loaders (`hub-env.sh`, and
+  `hub-env.cjs` for terminal sessions) never export `HERMES_INFERENCE_MODEL`,
+  `HERMES_MODEL` or `OPENAI_MODEL`, nor — for the Hub's own endpoint —
+  `CUSTOM_BASE_URL` / `CUSTOM_API_KEY` / `OPENAI_*`. Upstream ranks those over
+  `config.yaml` for the life of a process, so the dashboard and the gateway could run
+  different models and ignore a corrected config. A config change now reaches running
+  processes through Hermes' own config reload.
+- **Your edits are kept.** What the bootstrap wrote is recorded in
+  `/opt/data/.hub-managed-config.json`; a value that no longer matches its record (a
+  GUI model switch, a hand edit, a provider you picked) is left alone and logged as
+  `kept user-set …`. Remove the model key, the `providers.ollama` entry or the
+  `auxiliary` section from `config.yaml` to hand it back to the Hub.
+- **A model below Hermes' 64K minimum is refused.** If the Hub switches to a model
+  whose window is under 64,000 tokens, the previous Hub model is kept; either way the
+  problem is logged as an `ERROR` and printed at the top of the web terminal
+  (`/opt/data/.hub-inference-warning`).
+- **A cloud handout does not displace the Hub endpoint.** The Hub hands out a cloud
+  provider when its local inference is down as the app starts; CI-Hermes logs it and
+  stays on the local endpoint rather than moving conversations to a paid provider.
 
 ## Hub cloud inference tokens
 

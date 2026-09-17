@@ -1,6 +1,6 @@
 #!/bin/sh
-# Pull inference config from the Hub and translate Hub's HERMES_* env keys
-# into the OPENAI_* env vars Hermes (and most agent frameworks it wraps) read.
+# Pull inference config from the Hub, write it to .env.hub-bootstrap, and make the
+# Hub-managed part of config.yaml follow it (reconcile-hub-config.py).
 #
 # Idempotent and failure-tolerant: if the Hub is unreachable the script logs
 # and exits 0 so container start still succeeds — Hermes will fall back to
@@ -16,7 +16,15 @@
 #   BOOTSTRAP_FIXTURE_FILE   For tests: read body from this file instead of curling
 #
 # Outputs:
-#   $HERMES_HOME/.env.hub-bootstrap   sourced by start-hermes.sh
+#   $HERMES_HOME/.env.hub-bootstrap   loaded by hub-env.sh / hub-env.cjs into every process
+#   $HERMES_HOME/config.yaml          Hub-managed inference settings, via reconcile-hub-config.py
+#
+# config.yaml, not env, carries the model and (for the Hub's own endpoint) the
+# endpoint. Upstream, env CUSTOM_BASE_URL outranks model.base_url and
+# HERMES_INFERENCE_MODEL outranks model.default, and env is frozen into a process at
+# exec — so exporting them made a corrected config.yaml invisible to the dashboard
+# and gateway until both restarted, and let the two containers disagree. The env
+# file therefore never carries those keys for a Hub endpoint config.yaml holds.
 set -eu
 
 CI_HUB_URL="${CI_HUB_URL:-${HUB_URL:-http://ci-os-hub:5002}}"
@@ -24,11 +32,8 @@ HUB_APP_SLUG="${HUB_APP_SLUG:-hermes-agent}"
 DATA_DIR="${HERMES_HOME:-/opt/data}"
 OUT_ENV="${DATA_DIR}/.env.hub-bootstrap"
 
-# Hermes' hard minimum context window. Mirrors the upstream agent's
-# MINIMUM_CONTEXT_LENGTH, which is the literal 64000 (NOT 65536) and is compared
-# with a strict `<`, so a context_length of exactly 64000 is accepted. We only pin
-# model.context_length at/above this value; below it the agent would abort at startup.
-HERMES_MIN_CONTEXT=64000
+SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
+RECONCILER="${SCRIPT_DIR}/reconcile-hub-config.py"
 
 log() {
   echo "[hub-bootstrap] $*"
@@ -44,32 +49,30 @@ fetch_bootstrap() {
 }
 
 translate_keys() {
-  # $1: is_local_ollama — "1" when the Hub endpoint is the local Ollama box
-  #     (api_key sentinel "ollama"); "0"/empty for a cloud provider.
+  # $1: is_local_ollama — "1" when the Hub endpoint is its own (api_key sentinel
+  #     "ollama": direct Ollama or the pool proxy); "0"/empty for a cloud provider.
   #
   # stdin:  HERMES_* and other env lines from Hub
   # stdout: env lines Hermes can read, plus the original keys preserved.
   #
-  # For a LOCAL Ollama endpoint we deliberately do NOT emit — and actively drop —
-  # the OpenAI-SDK aliases OPENAI_BASE_URL / OPENAI_API_BASE / OPENAI_API_KEY.
-  # The runtime resolves the local endpoint from CUSTOM_BASE_URL + config
-  # model.base_url (upstream no longer consults OPENAI_BASE_URL), so these aliases
-  # are unused there — while setting them makes the upstream model picker treat the
-  # local endpoint as the generic "openai-api" provider, which loses the Ollama
-  # num_ctx injection and points the main model at api.openai.com after a GUI model
-  # switch. For a CLOUD provider the OpenAI aliases are correct and required
-  # (host-gated key resolution), so we keep the original fan-out untouched.
+  # LOCAL endpoint: no aliases at all. reconcile-hub-config.py writes the endpoint
+  # into config.yaml (providers.ollama, which `provider: ollama` resolves through, and
+  # model.base_url, which env CUSTOM_BASE_URL would outrank on the generic path). The
+  # OpenAI-SDK aliases are worse than unused there:
+  # they make the upstream model picker treat the local endpoint as the generic
+  # "openai-api" provider, which loses the Ollama num_ctx injection and points the
+  # main model at api.openai.com after a GUI model switch.
+  #
+  # CLOUD provider: CUSTOM_* + OPENAI_* aliases, as before. The key never goes into
+  # config.yaml, so the endpoint has to travel in env (host-gated key resolution).
+  #
+  # No model aliases in either case: config.yaml model.default is authoritative,
+  # and HERMES_INFERENCE_MODEL would outrank it (OPENAI_MODEL is dead upstream).
   awk -v is_local="${1:-0}" '
-    BEGIN { FS="="; emitted_model_aliases=0 }
-    # Local: never let an OpenAI-SDK base/key alias reach the agent (foot-gun above),
-    # even if a future Hub were to send one directly.
-    is_local == "1" && /^OPENAI_BASE_URL=/ { next }
-    is_local == "1" && /^OPENAI_API_BASE=/ { next }
-    is_local == "1" && /^OPENAI_API_KEY=/  { next }
+    BEGIN { FS="=" }
     /^HERMES_OPENAI_BASE_URL=/ {
-      v=$0
-      sub(/^HERMES_OPENAI_BASE_URL=/, "CUSTOM_BASE_URL=", v); print v
       if (is_local != "1") {
+        v=$0; sub(/^HERMES_OPENAI_BASE_URL=/, "CUSTOM_BASE_URL=", v); print v
         a=$0; sub(/^HERMES_OPENAI_BASE_URL=/, "OPENAI_API_BASE=", a); print a
         b=$0; sub(/^HERMES_OPENAI_BASE_URL=/, "OPENAI_BASE_URL=", b); print b
       }
@@ -77,28 +80,9 @@ translate_keys() {
       next
     }
     /^HERMES_OPENAI_API_KEY=/  {
-      v=$0
-      sub(/^HERMES_OPENAI_API_KEY=/, "CUSTOM_API_KEY=", v); print v
       if (is_local != "1") {
+        v=$0; sub(/^HERMES_OPENAI_API_KEY=/, "CUSTOM_API_KEY=", v); print v
         a=$0; sub(/^HERMES_OPENAI_API_KEY=/, "OPENAI_API_KEY=", a); print a
-      }
-      print
-      next
-    }
-    /^HERMES_DEFAULT_MODEL=/   {
-      v=$0
-      sub(/^HERMES_DEFAULT_MODEL=/, "OPENAI_MODEL=", v); print v
-      sub(/^OPENAI_MODEL=/, "HERMES_INFERENCE_MODEL=", v); print v
-      emitted_model_aliases=1
-      print
-      next
-    }
-    /^HERMES_DEFAULT_MODEL_BACKEND_ID=/ {
-      if (!emitted_model_aliases) {
-        v=$0
-        sub(/^HERMES_DEFAULT_MODEL_BACKEND_ID=/, "OPENAI_MODEL=", v); print v
-        sub(/^OPENAI_MODEL=/, "HERMES_INFERENCE_MODEL=", v); print v
-        emitted_model_aliases=1
       }
       print
       next
@@ -106,6 +90,38 @@ translate_keys() {
     /^HERMES_EMBEDDINGS_MODEL=/ { v=$0; sub(/^HERMES_EMBEDDINGS_MODEL=/, "OPENAI_EMBEDDINGS_MODEL=", v); print v; print; next }
     { print }
   '
+}
+
+sanitize_env() {
+  # $1: is_local_ollama, as for translate_keys.
+  #
+  # Drops the keys config.yaml owns, whatever wrote them: a Hub that sends one
+  # directly, or an env file an older image wrote (the Hub-unreachable path reuses
+  # it). Mirrors HUB_ENV_CONFIG_OWNED_KEYS / HUB_ENV_LOCAL_ENDPOINT_KEYS in
+  # hub-env.sh, which applies the same rule again when the file is loaded.
+  awk -v is_local="${1:-0}" '
+    /^(HERMES_INFERENCE_MODEL|HERMES_MODEL|OPENAI_MODEL)=/ { next }
+    is_local == "1" && /^(CUSTOM_BASE_URL|CUSTOM_API_KEY|OPENAI_BASE_URL|OPENAI_API_BASE|OPENAI_API_KEY)=/ { next }
+    { print }
+  '
+}
+
+is_local_env() {
+  # stdin: env lines. Prints 1 when HERMES_OPENAI_API_KEY is the local sentinel.
+  key="$(grep -m1 '^HERMES_OPENAI_API_KEY=' | cut -d= -f2- || true)"
+  key="$(normalize_env_value "${key}")"
+  if [ "${key}" = "ollama" ]; then echo 1; else echo 0; fi
+}
+
+reconcile_config() {
+  # config.yaml follows the handout on EVERY start, not only when first generated.
+  # Failure never blocks the container: Hermes keeps its previous settings, loudly.
+  if ! command -v python3 >/dev/null 2>&1; then
+    log "ERROR: python3 not found; config.yaml cannot follow the Hub handout"
+    return 0
+  fi
+  python3 "${RECONCILER}" --data-dir "${DATA_DIR}" \
+    || log "ERROR: config.yaml reconcile failed; Hermes keeps its previous inference settings"
 }
 
 detect_docker_gateway_ip() {
@@ -172,26 +188,38 @@ main() {
   fi
 
   log "fetching ${CI_HUB_URL} -> slug=${HUB_APP_SLUG}"
-  if ! body="$(fetch_bootstrap)"; then
-    log "WARN: Hub unreachable or returned error; leaving Hermes provider config alone"
+  body=""
+  if ! body="$(fetch_bootstrap)" || [ -z "${body}" ]; then
+    log "WARN: Hub unreachable, errored or returned an empty handout; keeping the last one"
+    # Still converge on the last handout we have: an env file an older image wrote
+    # carries the env overrides this version no longer exports, and its config.yaml
+    # may never have been reconciled at all.
+    if [ -f "${OUT_ENV}" ]; then
+      tmp="$(mktemp "${OUT_ENV}.XXXXXX")"
+      if sanitize_env "$(is_local_env < "${OUT_ENV}")" < "${OUT_ENV}" > "${tmp}"; then
+        if cmp -s "${tmp}" "${OUT_ENV}"; then
+          rm -f "${tmp}"
+        else
+          chmod 600 "${tmp}" 2>/dev/null || true
+          mv "${tmp}" "${OUT_ENV}"
+          log "removed config-owned overrides from the existing ${OUT_ENV}"
+        fi
+      else
+        rm -f "${tmp}"
+      fi
+      reconcile_config
+    fi
     exit 0
   fi
 
-  if [ -z "${body}" ]; then
-    log "WARN: empty response from Hub; nothing to apply"
-    exit 0
-  fi
+  # Detect the Hub's own endpoint (api_key sentinel "ollama") vs a cloud provider:
+  # only a cloud provider's endpoint travels in env.
+  is_local_ollama="$(printf '%s\n' "${body}" | is_local_env)"
 
-  # Detect a local-Ollama endpoint (api_key sentinel "ollama") vs a cloud provider,
-  # so translate_keys suppresses the OpenAI-SDK aliases for local only — they make
-  # the model picker mislabel the local box as the cloud "openai-api" provider.
-  main_api_key="$(printf '%s\n' "${body}" | grep -m1 '^HERMES_OPENAI_API_KEY=' | cut -d= -f2- || true)"
-  main_api_key="$(normalize_env_value "${main_api_key}")"
-  is_local_ollama=0
-  [ "${main_api_key}" = "ollama" ] && is_local_ollama=1
-
-  tmp="$(mktemp)"
-  if ! printf '%s\n' "${body}" | translate_keys "${is_local_ollama}" > "${tmp}"; then
+  # Temp files live beside the output so the final mv is an atomic rename: the web
+  # and gateway containers share this directory and start together.
+  tmp="$(mktemp "${OUT_ENV}.XXXXXX")"
+  if ! printf '%s\n' "${body}" | translate_keys "${is_local_ollama}" | sanitize_env "${is_local_ollama}" > "${tmp}"; then
     rm -f "${tmp}"
     log "ERROR: translate_keys failed"
     exit 0
@@ -199,7 +227,7 @@ main() {
 
   gateway_ip="$(detect_docker_gateway_ip || true)"
   if [ -n "${gateway_ip}" ]; then
-    tmp2="$(mktemp)"
+    tmp2="$(mktemp "${OUT_ENV}.XXXXXX")"
     if rewrite_host_docker_internal "${tmp}" "${gateway_ip}" > "${tmp2}"; then
       mv "${tmp2}" "${tmp}"
       log "normalized host.docker.internal -> ${gateway_ip}"
@@ -209,134 +237,11 @@ main() {
     fi
   fi
 
+  chmod 600 "${tmp}" 2>/dev/null || true
   mv "${tmp}" "${OUT_ENV}"
-  chmod 600 "${OUT_ENV}" 2>/dev/null || true
   log "wrote ${OUT_ENV} ($(wc -l < "${OUT_ENV}" | tr -d ' ') lines)"
 
-  # Also write minimal config.yaml with model provider set, so Hermes recognizes
-  # that a provider is configured when it starts. This is required for -z oneshot
-  # and interactive chat to work with custom OpenAI-compatible endpoints.
-  OUT_CONFIG="${DATA_DIR}/config.yaml"
-  if grep -q "^HERMES_DEFAULT_MODEL=" "${OUT_ENV}" || grep -q "^HERMES_DEFAULT_MODEL_BACKEND_ID=" "${OUT_ENV}"; then
-    # Extract model name from env file (prefer HERMES_DEFAULT_MODEL)
-    model_name_raw=$(grep "^HERMES_DEFAULT_MODEL=" "${OUT_ENV}" | cut -d= -f2- | head -n 1)
-    [ -z "${model_name_raw}" ] && model_name_raw=$(grep "^HERMES_DEFAULT_MODEL_BACKEND_ID=" "${OUT_ENV}" | cut -d= -f2- | head -n 1)
-    model_name=$(normalize_env_value "${model_name_raw}")
-    
-    if [ -n "${model_name}" ]; then
-      # Only write config.yaml if it doesn't exist or is empty
-      # This ensures user's manual config.yaml is not overwritten
-      if [ ! -s "${OUT_CONFIG}" ]; then
-        model_name_yaml=$(yaml_single_quote "${model_name}")
-        cat > "${OUT_CONFIG}" <<EOF
-model:
-  provider: ollama
-  default: '${model_name_yaml}'
-EOF
-        # Pin the local endpoint in config.yaml so (1) the runtime resolves it from
-        # the single source of truth (upstream no longer consults OPENAI_BASE_URL) and
-        # (2) the GUI model picker surfaces it as the "custom" provider — the one that
-        # injects ollama_num_ctx — instead of the generic "openai-api" provider (which
-        # drops num_ctx and points the main model at api.openai.com on a switch).
-        # Local-only: gated on the "ollama" key sentinel, mirroring the auxiliary
-        # block, so cloud setups (provider/base_url come from the Hub) are untouched.
-        main_base=$(normalize_env_value "$(grep "^HERMES_OPENAI_BASE_URL=" "${OUT_ENV}" | cut -d= -f2- | head -n 1)")
-        main_key=$(normalize_env_value "$(grep "^HERMES_OPENAI_API_KEY=" "${OUT_ENV}" | cut -d= -f2- | head -n 1)")
-        if [ -n "${main_base}" ] && [ "${main_key}" = "ollama" ]; then
-          esc_main_base=$(yaml_single_quote "${main_base}")
-          {
-            printf "  base_url: '%s'\n" "${esc_main_base}"
-            printf "  api_key: 'ollama'\n"
-          } >> "${OUT_CONFIG}"
-          log "set model.base_url=${main_base} (config-authoritative endpoint) in ${OUT_CONFIG}"
-        fi
-        # Hardware-aware context size from the Hub (HERMES_NUM_CTX). The upstream
-        # hermes-agent reads model.ollama_num_ctx (NOT num_ctx) and injects it as
-        # extra_body.options.num_ctx on every chat request — see the bundled
-        # plugins/model-providers/custom profile. A value under the wrong key is
-        # silently ignored, so Hermes falls back to Ollama's tiny 4096 default for
-        # any model it can't auto-detect.
-        #
-        # We also pin model.context_length to the same value so the agent's working
-        # window matches the KV cache Ollama actually allocates (otherwise the agent
-        # auto-detects the model's full window — e.g. 128K — and over-fills a smaller
-        # cache, silently truncating long sessions). But ONLY when the value clears
-        # HERMES_MIN_CONTEXT: the agent fatally rejects a smaller context_length at
-        # startup. The Hub floors hermes-agent to that minimum, so this normally fires;
-        # the guard keeps us safe against an older Hub (or a model whose own window is
-        # below the minimum), where we leave context_length to the agent's
-        # auto-detection and only cap the KV cache via ollama_num_ctx.
-        #
-        # Only a POSITIVE integer is a meaningful window; treat 0 / garbage as unset,
-        # matching the reconcile path in bootstrap-ci-context.sh.
-        num_ctx_raw=$(grep "^HERMES_NUM_CTX=" "${OUT_ENV}" | cut -d= -f2- | head -n 1)
-        num_ctx=$(normalize_env_value "${num_ctx_raw}")
-        if printf '%s' "${num_ctx}" | grep -q -E '^[1-9][0-9]*$'; then
-          printf '  ollama_num_ctx: %s\n' "${num_ctx}" >> "${OUT_CONFIG}"
-          log "set model.ollama_num_ctx=${num_ctx} in ${OUT_CONFIG}"
-          if [ "${num_ctx}" -ge "${HERMES_MIN_CONTEXT}" ]; then
-            printf '  context_length: %s\n' "${num_ctx}" >> "${OUT_CONFIG}"
-            log "set model.context_length=${num_ctx} in ${OUT_CONFIG}"
-          fi
-        fi
-
-        # Register the local endpoint as a named provider so the GUI model picker
-        # LISTS it with its models — the dashboard picker reads providers:/
-        # custom_providers:, NOT model.base_url. Keyed "ollama": a built-in alias of
-        # the num_ctx-aware "custom" profile, so selecting a model here writes a
-        # provider that still injects ollama_num_ctx on switch (verified: both the
-        # "ollama" slug and a "custom" write resolve to the custom profile). Emitted
-        # AFTER all model.* keys so they stay contiguous under model:. Local-only.
-        if [ -n "${main_base}" ] && [ "${main_key}" = "ollama" ]; then
-          esc_main_base=$(yaml_single_quote "${main_base}")
-          {
-            printf 'providers:\n'
-            printf '  ollama:\n'
-            printf "    name: 'Ollama (local)'\n"
-            printf "    base_url: '%s'\n" "${esc_main_base}"
-            printf "    api_key: 'ollama'\n"
-          } >> "${OUT_CONFIG}"
-          log "registered providers.ollama for the GUI model picker -> ${main_base}"
-        fi
-
-        # Point auxiliary side-tasks (compression, title, vision, …) at the SAME
-        # local endpoint as the main model. Without this, Hermes' aux auto-detection
-        # chain only tries cloud providers (OpenRouter/Nous/api-key) and resolves to
-        # nothing on a local-only appliance — so compression/title silently don't run
-        # (it drops middle turns without a summary). An explicit base_url+api_key per
-        # task forces the "custom" path to the local endpoint, which also lets the
-        # native /api/chat adapter take over.
-        #
-        # Gated on (1) CI_HERMES_OLLAMA_NATIVE being enabled — so flag-off stays a true
-        # no-op — and (2) the api_key being the local "ollama" sentinel, so we NEVER
-        # embed a cloud API key in config.yaml or change cloud aux behavior when the
-        # Hub points Hermes at a cloud provider. Lockstep with bootstrap-ci-context.sh.
-        aux_base=$(normalize_env_value "$(grep "^HERMES_OPENAI_BASE_URL=" "${OUT_ENV}" | cut -d= -f2- | head -n 1)")
-        aux_key=$(normalize_env_value "$(grep "^HERMES_OPENAI_API_KEY=" "${OUT_ENV}" | cut -d= -f2- | head -n 1)")
-        ci_native=$(printf '%s' "${CI_HERMES_OLLAMA_NATIVE:-}" | tr '[:upper:]' '[:lower:]')
-        case "${ci_native}" in 1|true|yes|on) native_aux=1 ;; *) native_aux="" ;; esac
-        if [ -n "${native_aux}" ] && [ -n "${aux_base}" ] && [ "${aux_key}" = "ollama" ]; then
-          esc_base=$(yaml_single_quote "${aux_base}")
-          esc_model=$(yaml_single_quote "${model_name}")
-          {
-            printf 'auxiliary:\n'
-            for aux_task in compression title_generation vision web_extract session_search skills_hub mcp; do
-              printf '  %s:\n' "${aux_task}"
-              printf "    base_url: '%s'\n" "${esc_base}"
-              printf "    api_key: 'ollama'\n"
-              printf "    model: '%s'\n" "${esc_model}"
-            done
-          } >> "${OUT_CONFIG}"
-          log "wrote auxiliary providers (side-tasks -> ${aux_base}) in ${OUT_CONFIG}"
-        fi
-
-        chmod 600 "${OUT_CONFIG}" 2>/dev/null || true
-        log "wrote ${OUT_CONFIG} with provider=ollama"
-      else
-        log "config.yaml already exists; skipping generation"
-      fi
-    fi
-  fi
+  reconcile_config
 }
 
 main "$@"

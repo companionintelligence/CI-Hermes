@@ -11,6 +11,7 @@ const fs = require("fs");
 const path = require("path");
 const crypto = require("crypto");
 const memoryGate = require("./memory-gate.cjs");
+const hubEnv = require("./hub-env.cjs");
 const pty = require("/app/node_modules/node-pty");
 const WebSocket = require("/app/node_modules/ws");
 
@@ -53,54 +54,6 @@ const ALLOW_SAME_ORIGIN_WS_FALLBACK = ["1", "true", "yes", "on"].includes(
   String(process.env.ALLOW_SAME_ORIGIN_WS_FALLBACK || "").toLowerCase(),
 );
 const HUB_ENV_FILE = path.join(DATA_DIR, ".env.hub-bootstrap");
-const HUB_ENV_PREFIXES = [
-  "OPENAI_",
-  "HERMES_",
-  "CUSTOM_",
-  "ANTHROPIC_",
-  "GEMINI_",
-  "GOOGLE_",
-  "OLLAMA_",
-];
-
-function isAllowedHubEnvKey(key) {
-  return HUB_ENV_PREFIXES.some((prefix) => key.startsWith(prefix));
-}
-
-function loadHubBootstrapEnv() {
-  const out = {};
-  try {
-    if (!fs.existsSync(HUB_ENV_FILE)) {
-      return out;
-    }
-    const text = fs.readFileSync(HUB_ENV_FILE, "utf8");
-    for (const rawLine of text.split(/\r?\n/)) {
-      const line = rawLine.trim();
-      if (!line || line.startsWith("#")) {
-        continue;
-      }
-      const eqIdx = line.indexOf("=");
-      if (eqIdx <= 0) {
-        continue;
-      }
-      const key = line.slice(0, eqIdx).trim();
-      if (!isAllowedHubEnvKey(key)) {
-        continue;
-      }
-      let value = line.slice(eqIdx + 1);
-      if (
-        (value.startsWith('"') && value.endsWith('"')) ||
-        (value.startsWith("'") && value.endsWith("'"))
-      ) {
-        value = value.slice(1, -1);
-      }
-      out[key] = value;
-    }
-  } catch (e) {
-    console.warn(`Failed to read ${HUB_ENV_FILE}: ${e.message}`);
-  }
-  return out;
-}
 
 function parseNonNegativeInt(rawValue, fallbackValue) {
   const parsed = Number.parseInt(String(rawValue || ""), 10);
@@ -269,9 +222,11 @@ function startPtyIfNeeded() {
     cols: 80,
     rows: 24,
     cwd: DATA_DIR,
+    // Re-read per session, so a handout refreshed since this server started is what
+    // the session gets — including removing a key config.yaml now owns that this
+    // process inherited. Same rule as the entrypoints' loader: see hub-env.sh.
     env: {
-      ...process.env,
-      ...loadHubBootstrapEnv(),
+      ...hubEnv.applyHubBootstrapEnv(process.env, HUB_ENV_FILE),
       TERM: "xterm-256color",
       HOME: DATA_DIR,
     },

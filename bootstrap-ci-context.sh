@@ -53,6 +53,16 @@ if [[ -d "${CI_PLUGIN_SRC}" ]]; then
   echo "CI context: companionintelligence plugin installed → ${CI_PLUGIN_DEST}"
 fi
 
+# Hub-managed inference settings (model, endpoint, context window, model picker
+# entry, side-task routing) follow the Hub handout in .env.hub-bootstrap on every
+# start. One implementation, shared with bootstrap-from-hub.sh; see its docstring
+# for ownership (a user's own edits are kept) and the 64K-minimum refusal. Runs
+# before the MCP configurators, which wait for config.yaml to exist.
+HUB_ENV_FILE="${DATA_DIR}/.env.hub-bootstrap"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+python3 "${SCRIPT_DIR}/reconcile-hub-config.py" --data-dir "${DATA_DIR}" \
+  || echo "CI context: ERROR: config.yaml reconcile failed; Hermes keeps its previous inference settings" >&2
+
 # Run the CI-Server configurator (MCP registration when credentials are present).
 # Uses CI_SERVER_URL / CI_SERVER_TOKEN / CI_SERVER_ENABLED from the environment.
 python3 /app/configure-ci-server.py 2>&1 || true
@@ -60,89 +70,25 @@ python3 /app/configure-ci-server.py 2>&1 || true
 # Register Hub platform MCP (SSE + Bearer) when Hub injects credentials.
 python3 /app/configure-hub-mcp.py 2>&1 || true
 
-# Hardware-aware context window the Hub computed for this machine and wrote into
-# .env.hub-bootstrap as HERMES_NUM_CTX. The upstream hermes-agent reads
-# model.ollama_num_ctx (NOT num_ctx) and injects it as extra_body.options.num_ctx
-# on every chat request; a value under the wrong key is silently ignored and Ollama
-# falls back to its tiny 4096 default. bootstrap-from-hub.sh only stamps this key
-# when it FIRST generates config.yaml; once the file exists it skips ("config.yaml
-# already exists; skipping generation"), so a config created before this value
-# existed — or a value that later changes — would keep Ollama's default. Reconcile
-# model.ollama_num_ctx on every boot (and migrate the legacy, never-read num_ctx key
-# off existing configs), mirroring how CI-OpenClaw re-patches its config. We also pin
-# model.context_length to the same value so the agent's working window matches the KV
-# cache Ollama allocates — but ONLY when it clears Hermes' 64K minimum, since the
-# agent fatally rejects a smaller context_length at startup (the Hub floors
-# hermes-agent to 64K; the guard protects against older Hubs / sub-64K models, where
-# auto-detection keeps Hermes bootable).
-HUB_ENV_FILE="${DATA_DIR}/.env.hub-bootstrap"
-ci_num_ctx=""
-if [[ -f "${HUB_ENV_FILE}" ]]; then
-  # `|| true`: under `set -euo pipefail` a no-match grep (exit 1) would otherwise
-  # fail the pipeline and abort the whole bootstrap when the key is simply absent.
-  ci_num_ctx="$(grep -m1 '^HERMES_NUM_CTX=' "${HUB_ENV_FILE}" 2>/dev/null | cut -d= -f2- || true)"
-fi
-# Fall back to the process env in case the value is exported rather than file-only.
-[[ -z "${ci_num_ctx}" ]] && ci_num_ctx="${HERMES_NUM_CTX:-}"
-# Normalize: strip whitespace, a stray CR (CRLF env files), and surrounding quotes
-# (a PyYAML/dotenv re-dump may emit HERMES_NUM_CTX="65536"). The value is numeric,
-# so deleting all of these characters is equivalent to a strip.
-ci_num_ctx="$(printf '%s' "${ci_num_ctx}" | tr -d "[:space:]\"'")"
-# Only a POSITIVE integer is a meaningful context window; treat 0 / garbage as unset.
-if ! printf '%s' "${ci_num_ctx}" | grep -qE '^[1-9][0-9]*$'; then
-  ci_num_ctx=""
-fi
-
-# The main inference endpoint the Hub configured, so we can point auxiliary
-# side-tasks (compression/title/vision/…) at the SAME endpoint. Without this,
-# Hermes' aux auto-detect only tries cloud providers and resolves to nothing on a
-# local-only appliance, so those tasks silently don't run. See the Python block.
-strip_qcr() { printf '%s' "$1" | tr -d "\r" | sed -e "s/^[\"']//" -e "s/[\"']\$//"; }
-aux_base=""; aux_key=""; aux_model=""
-if [[ -f "${HUB_ENV_FILE}" ]]; then
-  aux_base="$(grep -m1 '^HERMES_OPENAI_BASE_URL=' "${HUB_ENV_FILE}" 2>/dev/null | cut -d= -f2- || true)"
-  aux_key="$(grep -m1 '^HERMES_OPENAI_API_KEY=' "${HUB_ENV_FILE}" 2>/dev/null | cut -d= -f2- || true)"
-  aux_model="$(grep -m1 '^HERMES_DEFAULT_MODEL=' "${HUB_ENV_FILE}" 2>/dev/null | cut -d= -f2- || true)"
-fi
-aux_base="$(strip_qcr "${aux_base}")"
-aux_key="$(strip_qcr "${aux_key}")"
-aux_model="$(strip_qcr "${aux_model}")"
-# Local-endpoint signal for the main-model picker fix (Python block below). Gated on
-# the "ollama" key sentinel ONLY — NOT the native flag — because mislabeling the local
-# endpoint as the cloud "openai-api" provider breaks the GUI model switch regardless of
-# whether the native /api/chat adapter is on. Empty for cloud providers (real key) so
-# the Python block leaves them untouched.
-main_base="${aux_base}"
-[[ "${aux_key}" == "ollama" ]] || main_base=""
-# Gate (mirrors bootstrap-from-hub.sh): only wire aux to the local endpoint when
-# native mode is enabled AND this is the local Ollama endpoint (api_key sentinel
-# "ollama"). Clearing aux_base makes the Python block a no-op. This keeps flag-off a
-# true no-op and never writes a cloud API key into config.yaml.
-ci_native_lc="$(printf '%s' "${CI_HERMES_OLLAMA_NATIVE:-}" | tr '[:upper:]' '[:lower:]')"
-case "${ci_native_lc}" in 1|true|yes|on) : ;; *) aux_base="" ;; esac
-[[ "${aux_key}" == "ollama" ]] || aux_base=""
-
 if [[ -f "${CONFIG_FILE}" ]]; then
-  python3 - "${CONFIG_FILE}" "${SKILLS_SOURCE}" "${PLUGIN_NAME}" "${CI_MEMORY_PROVIDER}" "${ci_num_ctx}" "${aux_base}" "${aux_model}" "${main_base}" "${HUB_ENV_FILE}" <<'PY'
+  python3 - "${CONFIG_FILE}" "${SKILLS_SOURCE}" "${PLUGIN_NAME}" "${CI_MEMORY_PROVIDER}" "${HUB_ENV_FILE}" <<'PY'
 from pathlib import Path
+import fcntl
 import os
 import re
 import sys
+import tempfile
 
 config_path = Path(sys.argv[1])
+# The web and gateway containers run this at the same time on one volume, and
+# reconcile-hub-config.py edits the same file: hold its lock for the whole
+# read-modify-write so neither loses the other's changes.
+_lock = open(config_path.parent / ".hub-config.lock", "a+")
+fcntl.flock(_lock, fcntl.LOCK_EX)
 skills_dir = sys.argv[2]
 plugin_name = sys.argv[3]
 memory_provider = sys.argv[4] if len(sys.argv) > 4 else ""
-num_ctx = sys.argv[5] if len(sys.argv) > 5 else ""
-aux_base = sys.argv[6] if len(sys.argv) > 6 else ""
-aux_model = sys.argv[7] if len(sys.argv) > 7 else ""
-main_base = sys.argv[8] if len(sys.argv) > 8 else ""
-hub_env_file = sys.argv[9] if len(sys.argv) > 9 else ""
-
-# Hermes' hard minimum context window. Mirrors the upstream agent's
-# MINIMUM_CONTEXT_LENGTH, which is the literal 64000 (NOT 65536) and is compared
-# with a strict `<`, so a context_length of exactly 64000 is accepted.
-HERMES_MIN_CONTEXT = 64000
+hub_env_file = sys.argv[5] if len(sys.argv) > 5 else ""
 
 text = config_path.read_text(encoding="utf-8")
 lines = text.splitlines(keepends=True)
@@ -299,69 +245,6 @@ def set_child_scalar(section: str, child: str, value: str):
             return
     lines.insert(section_index + 1, new_line)
 
-def delete_child_scalar(section: str, child: str) -> bool:
-    """Remove ALL `  child: value` scalar lines from a section. Returns True if any
-    were removed. Removing every occurrence (not just the first) means a config that
-    already carried duplicates — from manual edits or an earlier reconcile bug —
-    doesn't keep a stale copy that a later read could pick up."""
-    global lines
-    section_index, section_end = section_bounds(section)
-    if section_index is None:
-        return False
-    child_re = re.compile(rf"^  {re.escape(child)}:\s*(?:.*)$")
-    removed = False
-    i = section_index + 1
-    while i < section_end:
-        if child_re.match(lines[i]):
-            del lines[i]
-            section_end -= 1
-            removed = True
-            continue
-        i += 1
-    return removed
-
-def ensure_provider_entry(provider_key: str, name: str, base_url: str, api_key: str) -> bool:
-    """Ensure ``providers.<provider_key>`` exists with the given local endpoint so the
-    GUI model picker LISTS it (the dashboard reads providers:/custom_providers:, not
-    model.base_url). Never clobbers an existing entry for that key — respects a user's
-    own provider config. Handles an absent section, the inline-empty form
-    (``providers: {}`` / ``[]`` from a PyYAML re-dump), and an existing block."""
-    global lines
-
-    def _q(v: str) -> str:
-        return v.replace("'", "''")  # YAML single-quote escaping
-
-    block = [
-        f"  {provider_key}:\n",
-        f"    name: '{_q(name)}'\n",
-        f"    base_url: '{_q(base_url)}'\n",
-        f"    api_key: '{_q(api_key)}'\n",
-    ]
-    idx = next((i for i, l in enumerate(lines) if re.match(r"^providers:", l)), None)
-    if idx is None:
-        if lines and not lines[-1].endswith("\n"):
-            lines[-1] += "\n"
-        if lines and lines[-1].strip():
-            lines.append("\n")
-        lines.append("providers:\n")
-        lines.extend(block)
-        return True
-    if re.match(r"^providers:\s*(\{\s*\}|\[\s*\])\s*(?:#.*)?$", lines[idx]):
-        # Inline-empty form → open into a block and add our entry.
-        lines[idx] = "providers:\n"
-        lines[idx + 1:idx + 1] = block
-        return True
-    # Existing block form: skip if our key is already present (never clobber a user's).
-    start, end = section_bounds("providers")
-    if start is None:
-        return False
-    key_re = re.compile(rf"^  {re.escape(provider_key)}:\s*(?:.*)$")
-    for i in range(start + 1, end):
-        if key_re.match(lines[i]):
-            return False
-    lines[start + 1:start + 1] = block
-    return True
-
 if Path(skills_dir).is_dir():
     ensure_child_list_item("skills", "external_dirs", skills_dir)
 else:
@@ -388,105 +271,6 @@ if memory_provider:
         if current_provider != memory_provider:
             set_child_scalar("memory", "provider", memory_provider)
             print(f"CI context: selected '{memory_provider}' as active memory provider")
-
-# ── Hub-managed context window ────────────────────────────────────────────────
-# Reconcile model.ollama_num_ctx every boot (see the shell preamble for why a write
-# that only happens at config generation is not enough, and why ollama_num_ctx — not
-# num_ctx — is the key the upstream agent reads). Only touch an existing model
-# section so we never create a provider-less stub — bootstrap-from-hub.sh owns
-# generating that section on first boot. Skip the write when the value is already
-# correct so repeated runs stay byte-identical (idempotent).
-if num_ctx:
-    model_start, _ = section_bounds("model")
-    if model_start is None:
-        print(
-            "CI context: no model section yet; ollama_num_ctx will be reconciled on next startup",
-            file=sys.stderr,
-        )
-    else:
-        # Migrate the legacy, never-read `num_ctx` key off existing configs so an
-        # appliance bootstrapped before this fix stops carrying a dead key.
-        if delete_child_scalar("model", "num_ctx"):
-            print("CI context: removed stale model.num_ctx (upstream reads ollama_num_ctx)")
-        if get_child_scalar("model", "ollama_num_ctx") != num_ctx:
-            set_child_scalar("model", "ollama_num_ctx", num_ctx)
-            print(f"CI context: set model.ollama_num_ctx={num_ctx}")
-        # Pin context_length to the same value so the agent's working window matches
-        # the KV cache — but only when it clears HERMES_MIN_CONTEXT (below that the
-        # agent aborts at startup). context_length is fully Hub-managed: when the
-        # value drops below the minimum (e.g. a downgrade to smaller hardware) we
-        # REMOVE it so the agent falls back to auto-detecting the model's true window,
-        # matching the "<min → context_length unset" contract.
-        if int(num_ctx) >= HERMES_MIN_CONTEXT:
-            if get_child_scalar("model", "context_length") != num_ctx:
-                set_child_scalar("model", "context_length", num_ctx)
-                print(f"CI context: set model.context_length={num_ctx}")
-        elif delete_child_scalar("model", "context_length"):
-            print("CI context: removed model.context_length (Hub value below minimum; auto-detect)")
-
-# ── Main-model endpoint + provider repair (local Ollama only) ─────────────────
-# Pin model.base_url so the GUI model picker surfaces the local endpoint as the
-# "custom" provider (which injects ollama_num_ctx) instead of the generic
-# "openai-api" provider, and auto-heal a config an earlier GUI switch left on
-# "openai-api"/"openai" (no base_url -> targets api.openai.com, num_ctx dropped).
-# Gated on the local sentinel via main_base (empty for cloud) so a genuine cloud
-# provider is never rewritten. Only touch an existing model section — bootstrap-
-# from-hub.sh owns first-boot generation, so we never create a provider-less stub.
-if main_base:
-    model_start, _ = section_bounds("model")
-    if model_start is None:
-        print(
-            "CI context: no model section yet; main-model endpoint will be reconciled on next startup",
-            file=sys.stderr,
-        )
-    else:
-        cur_provider = (get_child_scalar("model", "provider") or "").strip().lower()
-        if cur_provider in ("openai-api", "openai"):
-            set_child_scalar("model", "provider", "ollama")
-            print(f"CI context: healed model.provider '{cur_provider}' -> ollama (local endpoint)")
-        if not (get_child_scalar("model", "base_url") or "").strip():
-            _qb = main_base.replace("'", "''")  # YAML single-quote escaping
-            set_child_scalar("model", "base_url", f"'{_qb}'")
-            print(f"CI context: set model.base_url={main_base} (picker shows local as 'custom')")
-        if not (get_child_scalar("model", "api_key") or "").strip():
-            set_child_scalar("model", "api_key", "'ollama'")
-            print("CI context: set model.api_key=ollama (local endpoint)")
-        # Register the local endpoint as a named provider so the GUI model picker
-        # lists it (dashboard reads providers:, not model.base_url). Keyed "ollama" —
-        # a built-in alias of the num_ctx-aware "custom" profile — so a GUI switch
-        # keeps num_ctx. Never clobbers a user's own providers entry.
-        if ensure_provider_entry("ollama", "Ollama (local)", main_base, "ollama"):
-            print("CI context: registered providers.ollama for the GUI model picker")
-
-# ── Hub-managed auxiliary providers ───────────────────────────────────────────
-# Point side-tasks (compression/title/vision/…) at the SAME endpoint as the main
-# model. Hermes' aux auto-detect chain only tries cloud providers (OpenRouter/Nous/
-# api-key) and resolves to NOTHING on a local-only appliance — so compression/title
-# silently don't run (middle turns dropped without a summary). An explicit
-# base_url+api_key per task forces the "custom" path to the local endpoint (and lets
-# the native /api/chat adapter take over when CI_HERMES_OLLAMA_NATIVE is on). Only
-# add when there is no `auxiliary:` section yet — never clobber a user's own config.
-if aux_base:
-    # Detect an existing auxiliary section in ANY form (block `auxiliary:` or inline
-    # `auxiliary: {...}` from a PyYAML re-dump) so we never append a duplicate
-    # top-level key, and never clobber a user's own auxiliary config.
-    has_aux = any(re.match(r"^auxiliary:", ln) for ln in lines)
-    if not has_aux:
-        def _yq(v: str) -> str:
-            return v.replace("'", "''")  # YAML single-quote escaping
-        block = ["auxiliary:\n"]
-        for _t in ("compression", "title_generation", "vision", "web_extract", "session_search", "skills_hub", "mcp"):
-            block.append(f"  {_t}:\n")
-            block.append(f"    base_url: '{_yq(aux_base)}'\n")
-            block.append("    api_key: 'ollama'\n")
-            if aux_model:
-                block.append(f"    model: '{_yq(aux_model)}'\n")
-        if lines and not lines[-1].endswith("\n"):
-            lines[-1] += "\n"
-        if lines and lines[-1].strip():
-            lines.append("\n")
-        lines.extend(block)
-        print(f"CI context: added auxiliary providers (side-tasks -> {aux_base})")
 
 # ── Hub-saved cloud providers (additive) ─────────────────────────────────────
 # Hub Settings → AI injects CI_CLOUD_* into .env.hub-bootstrap. Register each
@@ -593,7 +377,13 @@ new_text = "".join(lines)
 # Only write when something actually changed, so a fully-reconciled config is a
 # true no-op (no needless mtime churn on every boot).
 if new_text != text:
-    config_path.write_text(new_text, encoding="utf-8")
+    # Atomic: Hermes may be reading config.yaml in the other container right now.
+    _mode = config_path.stat().st_mode & 0o777
+    _fd, _tmp = tempfile.mkstemp(dir=str(config_path.parent), prefix=".config.yaml.")
+    with os.fdopen(_fd, "w", encoding="utf-8") as _fh:
+        _fh.write(new_text)
+    os.chmod(_tmp, _mode)
+    os.replace(_tmp, config_path)
 PY
 else
   echo "CI context: ${CONFIG_FILE} not found yet; plugin and skill config will be reconciled on next startup" >&2
