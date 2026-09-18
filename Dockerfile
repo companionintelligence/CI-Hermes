@@ -1,19 +1,21 @@
 # CI-Hermes
 # Web terminal wrapper around the official Hermes Agent image for the CI marketplace
 
-# To update: docker buildx imagetools inspect nousresearch/hermes-agent:v2026.7.30
-FROM nousresearch/hermes-agent:v2026.7.30@sha256:b869e64d6496d4763d5e4fb675b5f504cb23b0e35ec9b790481a56118602b10f
+# To update: docker buildx imagetools inspect nousresearch/hermes-agent:v2026.9.14
+# (Hermes Agent v0.21.3). The digest is the multi-arch index digest, so one line
+# pins both amd64 and arm64.
+FROM nousresearch/hermes-agent:v2026.9.14@sha256:99641e57ec762c59e54cb44aa6746b7fc68c18b3c5ddb088af54234c613d9294
 
 USER root
 
-# Install Node.js (for terminal web server) and build tools (for node-pty native addon)
-RUN apt-get update && \
-    apt-get install -y --no-install-recommends curl make g++ && \
-    curl -fsSL https://deb.nodesource.com/setup_22.x | bash - && \
-    apt-get install -y --no-install-recommends nodejs && \
-    rm -rf /var/lib/apt/lists/*
-
-# Install server dependencies
+# Node and the native-addon toolchain come from the base image. Upstream ships
+# node + npm at /usr/local/bin (Node 26 as of v2026.9.14) for its own dashboard
+# and TUI builds, and gcc/g++/make/python3 for its Python extensions — which is
+# everything node-pty's node-gyp build needs. /usr/local/bin precedes /usr/bin on
+# the image PATH, so the NodeSource Node 22 this file used to apt-install was never
+# the `node` that ran server.cjs; it only added ~100MB and a third-party install
+# script to every build. node-pty resolves to 1.1.x (node-addon-api), so it builds
+# against whichever Node major upstream ships.
 COPY package.json /app/
 RUN cd /app && npm install --omit=dev
 
@@ -56,8 +58,17 @@ RUN chmod +x /app/entrypoint.sh /app/gateway-entrypoint.sh /app/start-hermes.sh 
 # This patch routes local Ollama onto the native /api/chat API (which honors num_ctx)
 # via a drop-in client + a startup .pth shim. Inert unless CI_HERMES_OLLAMA_NATIVE=1
 # at runtime. See specs/ci/ci-hermes-ollama-native-api-plan.md and CI-Hermes#24.
-COPY patches/ollama_native_adapter.py patches/enable_ollama_native.py patches/ci-ollama-native.pth /app/patches/
+#
+# The shim wraps private upstream functions by name and degrades to stock /v1 (and
+# Ollama's 4096-token default window) if any of them is renamed — silently, by
+# design, so a bad patch can never crash startup. check_ollama_native_contract.py
+# turns that silent regression into a build failure: it parses the upstream source
+# baked into /opt/hermes and refuses the image if a hook target or one of the
+# helpers the shim imports is gone. Run it before the import so a rename is
+# reported by name rather than as "import worked, nothing happened".
+COPY patches/ollama_native_adapter.py patches/enable_ollama_native.py patches/ci-ollama-native.pth patches/check_ollama_native_contract.py /app/patches/
 RUN SP="$(/opt/hermes/.venv/bin/python -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')" && \
+    /opt/hermes/.venv/bin/python /app/patches/check_ollama_native_contract.py --root /opt/hermes && \
     install -m 0644 /app/patches/ollama_native_adapter.py "$SP/ollama_native_adapter.py" && \
     install -m 0644 /app/patches/enable_ollama_native.py  "$SP/enable_ollama_native.py" && \
     install -m 0644 /app/patches/ci-ollama-native.pth     "$SP/ci-ollama-native.pth" && \

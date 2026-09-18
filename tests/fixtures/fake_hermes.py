@@ -2,7 +2,7 @@
 """A stand-in for `hermes` in tests/hub-handout-restart.test.sh.
 
 It resolves the model and endpoint with the precedence upstream Hermes
-(nousresearch/hermes-agent v2026.7.30) applies, and records what it resolved plus
+(nousresearch/hermes-agent v2026.9.14) applies, and records what it resolved plus
 the environment it was started with. Checked against the real image's
 hermes_cli/runtime_provider.py and tui_gateway/server.py:
 
