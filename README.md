@@ -89,8 +89,9 @@ touching the Hermes terminal:
    the URL/key and run `hermes memory setup` again. On success it saves the key
    to `.env`, the URL to `companionintelligence/config.json`, and sets
    `memory.provider: companionintelligence` in `config.yaml`.
-8. Open the Hermes **`/plugins`** page and **enable the `companionintelligence` plugin** from the list.
-9. **Restart the Hermes app** from the CI marketplace. Memory is now active in both the terminal (`/terminal`) and the web chat (`/chat`).
+8. **Restart the Hermes app** from the CI marketplace. Memory is now active in both the terminal (`/terminal`) and the web chat (`/chat`); `hermes memory status` confirms it, and once it recalls something for a message you'll see `🧠 Companion Memory — recalled N memories` beside the reply.
+
+   You do **not** need to enable anything on the Hermes **`/plugins`** page. Memory providers are activated by `memory.provider` alone; that page is the general plugin loader, which will keep listing `companionintelligence` as *not enabled* — a look, not a missed step (see the [plugin README](ci-context/plugins/companionintelligence/README.md#install)).
 
 > **Tip:** While in CLI mode you can also run other admin commands such as
 > `hermes model` and `hermes doctor`. Press `Ctrl+D` from chat any time you need
