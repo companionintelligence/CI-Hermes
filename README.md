@@ -126,7 +126,7 @@ The image includes a bundled `ci-runtime` plugin under `/opt/hermes/plugins` and
 
 On startup, `/app/bootstrap-ci-context.sh` idempotently:
 
-- Enables the bundled `ci-runtime` plugin in `/opt/data/config.yaml`, so Hermes injects compact CI runtime context before LLM calls through the official `pre_llm_call` hook.
+- Enables the bundled `ci-runtime` plugin in `/opt/data/config.yaml`, so Hermes carries compact CI runtime context in every session — as a frozen system-prompt section (`## Plugin Context: ci-runtime`, rendered once per session), falling back to the per-turn `pre_llm_call` hook on a Hermes older than v0.21.
 - Adds the managed skills directory to `skills.external_dirs` in `/opt/data/config.yaml` when the config exists.
 
 To connect it to Companion Memory you have two options (see *Connect Hermes to CI Memory* above for the full walkthrough): enter the **Companion Memory URL** and **API Key** in the app's install dialog and it activates automatically on startup, or run `hermes memory setup` in the terminal and follow the instructions. Either way, generate your API key from the CI-Server settings page.

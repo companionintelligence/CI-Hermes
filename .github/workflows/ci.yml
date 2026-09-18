@@ -84,3 +84,10 @@ jobs:
       - name: Memory plugin tests
         working-directory: ci-context/plugins/companionintelligence
         run: python3 -m unittest discover -p '*_test.py' --verbose
+
+      # The runtime-context plugin: which delivery path it picks (frozen system
+      # prompt section on v0.21+, per-turn hook before) and the fallbacks between
+      # them. Stdlib-only, like the memory plugin's suite.
+      - name: Runtime-context plugin tests
+        working-directory: ci-context/plugins/ci-runtime
+        run: python3 -m unittest discover -p '*_test.py' --verbose

@@ -34,8 +34,9 @@ docker compose up --build
 npm test                 # unit (node --test) + shell suites in tests/
 npm run test:unit
 npm run test:sh          # needs python3 + PyYAML
-# memory plugin's own suite
+# the bundled plugins' own suites
 cd ci-context/plugins/companionintelligence && python3 -m unittest discover -p '*_test.py'
+cd ci-context/plugins/ci-runtime && python3 -m unittest discover -p '*_test.py'
 
 # Build for production
 docker compose build
