@@ -7,4 +7,7 @@ requires_env:
   - CI_SERVER_TOKEN
 hooks:
   - on_session_end
+  - on_session_switch
   - on_pre_compress
+  - on_memory_write
+  - on_delegation
