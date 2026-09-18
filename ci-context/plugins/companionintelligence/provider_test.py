@@ -55,6 +55,7 @@ _FLAGS = (
     "CI_MEMORY_RECALL_SYNC",
     "CI_MEMORY_TURN_ENABLED",
     "CI_MEMORY_WRITE_ENABLED",
+    "CI_MEMORY_DELEGATION_ENABLED",
     "CI_INTENTS_ENABLED",
     "CI_INTENT_TOOLS_ENABLED",
 )
@@ -97,6 +98,7 @@ class _MockClient:
         self.recall_delay = 0.0
         self.turn_calls = []
         self.write_calls = []
+        self.write_titles = []
         self.write_event = threading.Event()
         self.get_calls = []
         self.invoke_calls = []
@@ -120,6 +122,7 @@ class _MockClient:
 
     def write(self, content, source="", title="", session_id=""):
         self.write_calls.append((content, source, session_id))
+        self.write_titles.append(title)
         self.write_event.set()
         return {}
 
@@ -937,6 +940,183 @@ class QueuedRecallTests(unittest.TestCase):
         self.assertEqual(provider.prefetch("first turn"), "")
         self.assertEqual(client.recall_calls, 0)
         self.assertIsNone(provider.recall_status())
+
+
+def _initialized_provider(client, **kwargs):
+    """A provider that went through initialize() with the given kwargs (v0.21 passes
+    agent_context, hermes_home, platform ...), then had its client swapped for a mock."""
+    provider = ci.CompanionIntelligenceProvider()
+    with mock.patch.dict(os.environ, {"CI_SERVER_URL": "http://ci:8642", "CI_SERVER_TOKEN": "k"}):
+        provider.initialize("s1", **kwargs)
+    provider._client = client
+    return provider
+
+
+class AgentContextTests(unittest.TestCase):
+    """Subagent / cron / flush sessions read memory but never write to it."""
+
+    _MESSAGES = [{"role": "user", "content": "u"}, {"role": "assistant", "content": "a"}]
+
+    def setUp(self):
+        _clear_flags()
+
+    def tearDown(self):
+        _clear_flags()
+
+    def _assert_no_writes(self, provider, client):
+        provider.sync_turn("u", "a")
+        provider.on_session_end(self._MESSAGES)
+        provider.on_pre_compress(self._MESSAGES)
+        provider.on_memory_write("add", "memory", "note")
+        provider.on_delegation("task", "result")
+        if provider._sync_thread:
+            provider._sync_thread.join(timeout=5)
+        self.assertEqual(client.turn_calls, [])
+        self.assertEqual(client.write_calls, [])
+
+    def test_a_subagent_session_recalls_but_does_not_ingest(self):
+        client = _MockClient()
+        provider = _initialized_provider(client, agent_context="subagent", platform="cli")
+        self.assertEqual(provider.prefetch("who is my sister?"), "RECALL", "reads stay on")
+        self.assertEqual(provider.system_prompt_block().split("\n")[0], "PROFILE")
+        self._assert_no_writes(provider, client)
+
+    def test_cron_and_flush_sessions_do_not_ingest_either(self):
+        for context in ("cron", "flush", "CRON"):
+            client = _MockClient()
+            provider = _initialized_provider(client, agent_context=context)
+            self._assert_no_writes(provider, client)
+
+    def test_a_primary_session_ingests(self):
+        client = _MockClient()
+        provider = _initialized_provider(client, agent_context="primary")
+        provider.sync_turn("u", "a")
+        provider._sync_thread.join(timeout=5)
+        self.assertEqual(len(client.turn_calls), 1)
+
+    def test_an_older_host_that_sends_no_context_is_treated_as_primary(self):
+        client = _MockClient()
+        provider = _initialized_provider(client)
+        provider.on_memory_write("add", "memory", "note")
+        self.assertTrue(client.write_event.wait(timeout=5))
+        self.assertEqual(len(client.write_calls), 1)
+
+
+class SessionSwitchTests(unittest.TestCase):
+    def setUp(self):
+        _clear_flags()
+
+    def tearDown(self):
+        _clear_flags()
+
+    def test_later_flushes_follow_the_new_session_id(self):
+        client = _MockClient()
+        provider = _provider_with_client(client)
+        provider.on_session_switch("s2", parent_session_id="s1")
+        provider.on_session_end([{"role": "user", "content": "u"}])
+        self.assertEqual(client.turn_calls[0][1], "s2")
+        provider.on_memory_write("add", "memory", "note")
+        self.assertTrue(client.write_event.wait(timeout=5))
+        self.assertEqual(client.write_calls[0][2], "s2")
+
+    def test_an_in_flight_sync_for_the_old_session_is_not_orphaned(self):
+        client = _MockClient()
+        provider = _provider_with_client(client)
+        provider.sync_turn("u", "a")  # runs on the sync thread, tagged s1
+        provider.on_session_switch("s2")
+        self.assertEqual(client.turn_calls[0][1], "s1", "joined before the id moved")
+        self.assertEqual(provider._session_id, "s2")
+
+    def test_a_reset_forgets_the_last_recall(self):
+        client = _MockClient()
+        provider = _provider_with_client(client)
+        provider.prefetch("hello there")
+        provider.on_session_switch("s2", reset=True)
+        provider.prefetch("hello there")
+        self.assertEqual(client.recall_calls, 2, "a new conversation searches afresh")
+
+    def test_a_plain_switch_keeps_the_last_recall(self):
+        client = _MockClient()
+        provider = _provider_with_client(client)
+        provider.prefetch("hello there")
+        provider.on_session_switch("s2")
+        provider.prefetch("hello there")
+        self.assertEqual(client.recall_calls, 1)
+
+    def test_blank_or_unchanged_ids_are_ignored(self):
+        client = _MockClient()
+        provider = _provider_with_client(client)
+        provider.on_session_switch("")
+        provider.on_session_switch("s1", rewound=True)
+        self.assertEqual(provider._session_id, "s1")
+
+
+class DelegationTests(unittest.TestCase):
+    def setUp(self):
+        _clear_flags()
+
+    def tearDown(self):
+        _clear_flags()
+
+    def test_a_completed_delegation_is_written_as_a_note(self):
+        client = _MockClient()
+        provider = _provider_with_client(client)
+        provider.on_delegation("Find flights to Lisbon\nunder $400", "Found TAP 14 Oct $360", child_session_id="c1")
+        self.assertTrue(client.write_event.wait(timeout=5))
+        content, source, sid = client.write_calls[0]
+        self.assertEqual(source, "delegation")
+        self.assertEqual(sid, "s1")
+        self.assertIn("Delegated task:\nFind flights to Lisbon", content)
+        self.assertIn("Outcome:\nFound TAP 14 Oct $360", content)
+        self.assertEqual(client.write_titles[0], "Delegation: Find flights to Lisbon")
+
+    def test_the_note_is_capped_under_the_servers_fragment_limit(self):
+        client = _MockClient()
+        provider = _provider_with_client(client)
+        provider.on_delegation("t" * 5000, "r" * 20000)
+        self.assertTrue(client.write_event.wait(timeout=5))
+        content = client.write_calls[0][0]
+        self.assertLess(len(content), 10000)
+        task_part, outcome_part = content.split("\n\nOutcome:\n")
+        self.assertEqual(task_part, "Delegated task:\n" + "t" * 1500)
+        self.assertEqual(outcome_part, "r" * 6000)
+
+    def test_gated_by_the_delegation_flag(self):
+        os.environ["CI_MEMORY_DELEGATION_ENABLED"] = "false"
+        client = _MockClient()
+        _provider_with_client(client).on_delegation("t", "r")
+        self.assertFalse(client.write_event.wait(timeout=0.2))
+
+    def test_gated_by_the_write_flag(self):
+        os.environ["CI_MEMORY_WRITE_ENABLED"] = "false"
+        client = _MockClient()
+        _provider_with_client(client).on_delegation("t", "r")
+        self.assertFalse(client.write_event.wait(timeout=0.2))
+
+    def test_an_empty_task_or_result_is_not_recorded(self):
+        client = _MockClient()
+        provider = _provider_with_client(client)
+        provider.on_delegation("", "r")
+        provider.on_delegation("t", "  ")
+        self.assertFalse(client.write_event.wait(timeout=0.2))
+
+
+class UnavailableReasonTests(unittest.TestCase):
+    def test_names_what_is_missing_and_how_to_fix_it(self):
+        with mock.patch.dict(os.environ, {"CI_SERVER_URL": "", "CI_SERVER_TOKEN": ""}):
+            with mock.patch.object(ci, "_load_config", return_value={"url": "", "token": ""}):
+                reason = ci.CompanionIntelligenceProvider().unavailable_reason()
+        self.assertIn("CI_SERVER_URL and CI_SERVER_TOKEN missing", reason)
+        self.assertIn("hermes memory setup", reason)
+
+    def test_names_only_the_missing_half(self):
+        with mock.patch.object(ci, "_load_config", return_value={"url": "http://x", "token": ""}):
+            reason = ci.CompanionIntelligenceProvider().unavailable_reason()
+        self.assertIn("(CI_SERVER_TOKEN missing)", reason)
+
+    def test_empty_when_configured(self):
+        with mock.patch.object(ci, "_load_config", return_value={"url": "http://x", "token": "k"}):
+            self.assertEqual(ci.CompanionIntelligenceProvider().unavailable_reason(), "")
 
 
 class TurnGatingTests(unittest.TestCase):

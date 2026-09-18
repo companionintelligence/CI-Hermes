@@ -73,6 +73,18 @@ _RECALL_TIMEOUT = 4.0
 _RECALL_LABEL = "Companion Memory"   # provider_label on the recall indicator
 _MAX_TURN_CONTENT_CHARS = 4000   # max chars persisted per message (matches CI-OpenClaw)
 _MAX_RECALL_RESULTS = 20         # cap on L1 recall breadth (matches CI-OpenClaw)
+# A delegation note is one /api/memory/write fragment (server cap 10,000 chars):
+# enough of the task to know what was asked, enough of the outcome to be useful.
+_MAX_DELEGATION_TASK_CHARS = 1500
+_MAX_DELEGATION_RESULT_CHARS = 6000
+
+# Agent contexts whose turns are not the user's conversation. A subagent's
+# transcript is the parent's tool call, and cron / memory-flush passes are Hermes
+# housekeeping; ingesting them as "hermes conversation" turns filled the graph
+# with the agent talking to itself. Reads (profile, recall, intents) stay on for
+# all of them — a subagent asked to "email my sister" still needs to know who
+# that is. Mirrors upstream's own providers (supermemory, honcho).
+_NON_PRIMARY_CONTEXTS = frozenset({"subagent", "cron", "flush"})
 
 
 def _extract_block(resp: dict) -> str:
@@ -99,6 +111,9 @@ def _extract_block(resp: dict) -> str:
 #                                and the first turn of a session gets nothing.
 #   CI_MEMORY_TURN_ENABLED     — turn-sync ingestion (/api/memory/turn)
 #   CI_MEMORY_WRITE_ENABLED    — durable note writes (/api/memory/write)
+#   CI_MEMORY_DELEGATION_ENABLED — record completed subagent delegations as a
+#                                note (task + outcome) through the same write
+#                                endpoint; also requires CI_MEMORY_WRITE_ENABLED
 #   CI_INTENTS_ENABLED         — intent catalog (/api/agent/intents)
 #   CI_INTENT_TOOLS_ENABLED    — register catalog intents as callable tools
 #                                (POST /api/intents/:name/execute); also
@@ -505,6 +520,9 @@ class CompanionIntelligenceProvider(MemoryProvider):
         self._client: Optional[_CIClient] = None
         self._session_id = ""
         self._platform = ""
+        # Which kind of agent this session belongs to (see _NON_PRIMARY_CONTEXTS).
+        self._agent_context = ""
+        self._write_enabled = True
         self._sync_thread: Optional[threading.Thread] = None
         # Prefetch state — reset each turn by queue_prefetch (legacy queued path)
         self._prefetch_event: Optional[threading.Event] = None
@@ -529,6 +547,16 @@ class CompanionIntelligenceProvider(MemoryProvider):
     def is_available(self) -> bool:
         cfg = _load_config()
         return bool(cfg.get("url") and cfg.get("token"))
+
+    def unavailable_reason(self) -> str:
+        """Shown by the host beside its "provider unavailable" warning (v0.21+)."""
+        cfg = _load_config()
+        missing = [name for name, key in (("CI_SERVER_URL", "url"), ("CI_SERVER_TOKEN", "token"))
+                   if not cfg.get(key)]
+        if not missing:
+            return ""
+        return (f"Companion Memory is not configured ({' and '.join(missing)} missing): "
+                "run `hermes memory setup`, or set them in .env / companionintelligence/config.json.")
 
     def save_config(self, values: dict, hermes_home: str) -> None:
         config_dir = Path(hermes_home) / "companionintelligence"
@@ -733,6 +761,10 @@ class CompanionIntelligenceProvider(MemoryProvider):
         # "hermes conversation" instead of the generic "tui conversation" the
         # opencode runtime reports. Mirrors how CI-OpenClaw hardcodes "openclaw".
         self._platform = "hermes"
+        # v0.21 says which agent this is: "primary" | "subagent" | "cron" | "flush".
+        # Older hosts send nothing, which reads as primary — today's behaviour.
+        self._agent_context = str(kwargs.get("agent_context") or "").strip().lower()
+        self._write_enabled = self._agent_context not in _NON_PRIMARY_CONTEXTS
 
         url = cfg.get("url") or os.environ.get("CI_SERVER_URL", "")
         token = cfg.get("token") or os.environ.get("CI_SERVER_TOKEN", "")
@@ -743,7 +775,30 @@ class CompanionIntelligenceProvider(MemoryProvider):
             return
 
         self._client = _CIClient(url, token)
-        logger.warning("CI-Server provider ready  url=%s  session=%s", url, self._session_id)
+        logger.warning("CI-Server provider ready  url=%s  session=%s%s", url, self._session_id,
+                       "" if self._write_enabled else f"  ({self._agent_context}: recall only, no ingestion)")
+
+    def on_session_switch(self, new_session_id: str, *, parent_session_id: str = "",
+                          reset: bool = False, **kwargs) -> None:
+        """The host reassigned the session id without tearing us down (/new, /resume,
+        /branch, compression). Follow it, so the end-of-session flush, compaction
+        flushes and memory-write mirrors land in the right CI-Server session instead
+        of the one this provider was initialised with. sync_turn already receives
+        the current id per call. ``reset`` is a genuinely new conversation: forget
+        the last recall so the same first message is searched afresh."""
+        del parent_session_id, kwargs
+        new_id = str(new_session_id or "").strip()
+        if not new_id or new_id == self._session_id:
+            return
+        # Let a sync still in flight for the old session finish where it belongs.
+        if self._sync_thread and self._sync_thread.is_alive():
+            self._sync_thread.join(timeout=5.0)
+        logger.debug("CI-Server provider: session %s -> %s (reset=%s)", self._session_id, new_id, reset)
+        self._session_id = new_id
+        if reset:
+            self._last_recall_query = ""
+            self._last_recall_block = ""
+            self._last_recall_cached_count = None
 
     # ---------------------------------------------------------------------------
     # Context injection
@@ -909,7 +964,7 @@ class CompanionIntelligenceProvider(MemoryProvider):
 
     def sync_turn(self, user_content: str, assistant_content: str, *,
                   session_id: str = "") -> None:
-        if not self._client or not _feature_enabled("CI_MEMORY_TURN_ENABLED"):
+        if not self._client or not self._write_enabled or not _feature_enabled("CI_MEMORY_TURN_ENABLED"):
             return
 
         messages = [
@@ -939,7 +994,8 @@ class CompanionIntelligenceProvider(MemoryProvider):
 
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
         """Flush the full session transcript on close."""
-        if not self._client or not messages or not _feature_enabled("CI_MEMORY_TURN_ENABLED"):
+        if (not self._client or not self._write_enabled or not messages
+                or not _feature_enabled("CI_MEMORY_TURN_ENABLED")):
             return
 
         # Wait for any in-flight sync before sending the final turn
@@ -963,7 +1019,8 @@ class CompanionIntelligenceProvider(MemoryProvider):
 
     def on_pre_compress(self, messages: List[Dict[str, Any]]) -> str:
         """Flush messages that are about to be dropped from the context window."""
-        if not self._client or not messages or not _feature_enabled("CI_MEMORY_TURN_ENABLED"):
+        if (not self._client or not self._write_enabled or not messages
+                or not _feature_enabled("CI_MEMORY_TURN_ENABLED")):
             return ""
 
         serialized = [
@@ -998,7 +1055,8 @@ class CompanionIntelligenceProvider(MemoryProvider):
 
         Runs in a background thread so the agent is never blocked by the write.
         """
-        if not self._client or not content.strip() or not _feature_enabled("CI_MEMORY_WRITE_ENABLED"):
+        if (not self._client or not self._write_enabled or not content.strip()
+                or not _feature_enabled("CI_MEMORY_WRITE_ENABLED")):
             return
 
         # Skip clears — there is nothing meaningful to store.
@@ -1019,6 +1077,46 @@ class CompanionIntelligenceProvider(MemoryProvider):
                 logger.debug("CI-Server on_memory_write failed: %s", exc)
 
         t = threading.Thread(target=_run, daemon=True, name="ci-memory-write")
+        t.start()
+
+    def on_delegation(self, task: str, result: str, *, child_session_id: str = "", **kwargs) -> None:
+        """A subagent finished: keep what was asked and what came back (v0.21+ hook).
+
+        The subagent's own session is a non-primary context and is not ingested
+        (see _NON_PRIMARY_CONTEXTS), and the parent's next turn usually only
+        summarises the outcome for the user. This note is the compact record of
+        the delegation itself — one /api/memory/write fragment, source
+        "delegation", for the compaction cron to promote like any other note.
+        Parent-side only, so it never fires inside the subagent.
+        """
+        del kwargs
+        if (not self._client or not self._write_enabled
+                or not _feature_enabled("CI_MEMORY_WRITE_ENABLED")
+                or not _feature_enabled("CI_MEMORY_DELEGATION_ENABLED")):
+            return
+        task = (task or "").strip()
+        result = (result or "").strip()
+        if not task or not result:
+            return
+
+        content = (
+            "Delegated task:\n" + task[:_MAX_DELEGATION_TASK_CHARS]
+            + "\n\nOutcome:\n" + result[:_MAX_DELEGATION_RESULT_CHARS]
+        )
+        headline = task.splitlines()[0][:120]
+        title = f"Delegation: {headline}"
+        client = self._client
+        session_id = self._session_id
+        child = (child_session_id or "").strip()
+
+        def _run() -> None:
+            try:
+                client.write(content, source="delegation", title=title, session_id=session_id)
+                logger.debug("CI-Server on_delegation stored  session=%s child=%s", session_id, child)
+            except Exception as exc:
+                logger.debug("CI-Server on_delegation failed: %s", exc)
+
+        t = threading.Thread(target=_run, daemon=True, name="ci-delegation")
         t.start()
 
     # ---------------------------------------------------------------------------

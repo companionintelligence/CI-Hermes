@@ -175,8 +175,15 @@ would rather set them directly.
 `config.json` values take precedence over the environment. Capture and recall can be
 narrowed with environment variables, all enabled by default:
 `CI_MEMORY_CONTEXT_ENABLED`, `CI_MEMORY_RECALL_ENABLED`, `CI_MEMORY_TURN_ENABLED`,
-`CI_MEMORY_WRITE_ENABLED`, `CI_INTENTS_ENABLED`, `CI_INTENT_TOOLS_ENABLED`. Set any to
-`false` to disable that behaviour.
+`CI_MEMORY_WRITE_ENABLED`, `CI_MEMORY_DELEGATION_ENABLED`, `CI_INTENTS_ENABLED`,
+`CI_INTENT_TOOLS_ENABLED`. Set any to `false` to disable that behaviour.
+
+What gets written is your conversation. Subagent, cron and memory-flush sessions
+(Hermes v0.21+ says which is which) can read memory — a subagent asked to "email my
+sister" still needs to know who that is — but nothing they say is ingested as a turn.
+When a subagent finishes, the task it was given and what it came back with are kept as
+one note (source `delegation`), so the outcome survives without the subagent's whole
+transcript; `CI_MEMORY_DELEGATION_ENABLED=false` turns that note off.
 
 Recall runs against the message you just sent, bounded at four seconds so a slow
 server costs at most that and never the turn; when it finds something, Hermes v0.21+
