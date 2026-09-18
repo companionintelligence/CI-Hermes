@@ -178,6 +178,14 @@ narrowed with environment variables, all enabled by default:
 `CI_MEMORY_WRITE_ENABLED`, `CI_INTENTS_ENABLED`, `CI_INTENT_TOOLS_ENABLED`. Set any to
 `false` to disable that behaviour.
 
+Recall runs against the message you just sent, bounded at four seconds so a slow
+server costs at most that and never the turn; when it finds something, Hermes v0.21+
+shows `🧠 Companion Memory — recalled N memories` beside the reply. Hermes' own
+prefetch model is different — it queues a search for turn *N*'s message after that
+turn and hands the result to turn *N+1*, which is one turn stale and gives the first
+message of a session nothing at all. `CI_MEMORY_RECALL_SYNC=false` restores that
+model if you would rather keep recall off the reply path on a slow link.
+
 To stop the integration entirely without uninstalling, run `hermes memory off`, which
 clears `memory.provider` in `config.yaml`. That alone is enough — the `/plugins` page
 does not gate this plugin (see above). Setting every flag above to `false` also works. (`CI_SERVER_ENABLED` is **not** an

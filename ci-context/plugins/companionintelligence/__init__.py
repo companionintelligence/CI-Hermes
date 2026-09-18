@@ -5,9 +5,11 @@ and injects relevant context back into the agent at the right moments:
 
   system_prompt_block()  — L0 user profile (name, relationships, preferences)
                            fetched once at session start, stable for the session
-  prefetch()             — L1 hybrid search results relevant to the current turn
-                           queued as soon as the user message arrives, so the
-                           HTTP call overlaps with other pre-turn processing
+  prefetch()             — L1 hybrid search results for the message the user
+                           just sent, recalled live and bounded so a slow server
+                           can never hold a turn (see CI_MEMORY_RECALL_SYNC)
+  recall_status()        — what the last prefetch injected, for the recall
+                           indicator the host shows next to the reply
   get_tool_schemas()     — CI-Server's curated intent catalog exposed as callable
                            tools (read-only, appliance-local intents only)
   handle_tool_call()     — executes an intent via CI-Server's generic REST
@@ -34,6 +36,11 @@ from typing import Any, Dict, List, Optional
 
 from agent.memory_provider import MemoryProvider
 
+try:  # v0.21+: the host renders a recall indicator from this
+    from agent.memory_provider import RecallStatus
+except ImportError:  # older host — no indicator, nothing else changes
+    RecallStatus = None  # type: ignore[assignment,misc]
+
 from .intent_catalog import (
     describe_catalog_for_prompt,
     execute_path_candidates,
@@ -58,7 +65,12 @@ def _warn_catalog_unavailable(failures: list) -> None:
     )
 
 _REQUEST_TIMEOUT = 10.0   # seconds for write calls (absorb)
-_PREFETCH_TIMEOUT = 5.0   # seconds to wait for a queued prefetch result
+_PREFETCH_TIMEOUT = 5.0   # seconds to wait for a queued prefetch result (legacy path)
+# Bound on a live recall. The host abandons an external prefetch after 8s and
+# skips the provider until it returns; staying well under that keeps one slow
+# search from costing the NEXT turn's recall too.
+_RECALL_TIMEOUT = 4.0
+_RECALL_LABEL = "Companion Memory"   # provider_label on the recall indicator
 _MAX_TURN_CONTENT_CHARS = 4000   # max chars persisted per message (matches CI-OpenClaw)
 _MAX_RECALL_RESULTS = 20         # cap on L1 recall breadth (matches CI-OpenClaw)
 
@@ -81,6 +93,10 @@ def _extract_block(resp: dict) -> str:
 # env var (default on). Flag names match CI-OpenClaw:
 #   CI_MEMORY_CONTEXT_ENABLED  — L0 profile injection (/api/memory/context)
 #   CI_MEMORY_RECALL_ENABLED   — L1 per-turn recall (/api/memory/recall)
+#   CI_MEMORY_RECALL_SYNC      — recall against the message the user just sent
+#                                (default). Off = the host's queued model: the
+#                                recall for turn N is what turn N+1 receives,
+#                                and the first turn of a session gets nothing.
 #   CI_MEMORY_TURN_ENABLED     — turn-sync ingestion (/api/memory/turn)
 #   CI_MEMORY_WRITE_ENABLED    — durable note writes (/api/memory/write)
 #   CI_INTENTS_ENABLED         — intent catalog (/api/agent/intents)
@@ -490,9 +506,18 @@ class CompanionIntelligenceProvider(MemoryProvider):
         self._session_id = ""
         self._platform = ""
         self._sync_thread: Optional[threading.Thread] = None
-        # Prefetch state — reset each turn by queue_prefetch
+        # Prefetch state — reset each turn by queue_prefetch (legacy queued path)
         self._prefetch_event: Optional[threading.Event] = None
         self._prefetch_result: Optional[str] = None
+        self._prefetch_count: Optional[int] = None
+        # What the last prefetch injected, for recall_status(). A count of None
+        # means "nothing injected"; 0 means content without a discrete count.
+        self._last_recall_count: Optional[int] = None
+        # The live-recall path remembers its last answer so a retried message
+        # (an interrupted turn re-sent) does not pay for the same search twice.
+        self._last_recall_query = ""
+        self._last_recall_block = ""
+        self._last_recall_cached_count: Optional[int] = None
         # Intent tool schemas — fetched once per session on the first
         # get_tool_schemas() call, then cached (None = not fetched yet).
         self._tool_schemas: Optional[List[Dict[str, Any]]] = None
@@ -766,25 +791,47 @@ class CompanionIntelligenceProvider(MemoryProvider):
 
         return "\n\n".join(blocks)
 
-    def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
-        """Kick off an async L1 search as soon as the user message arrives.
+    def _recall_sync(self) -> bool:
+        return _feature_enabled("CI_MEMORY_RECALL_SYNC")
 
-        The HTTP call runs in a background thread so it overlaps with any other
-        pre-turn processing. prefetch() then waits for the result.
+    def _do_recall(self, query: str):
+        """One recall round-trip → ``(block, count)``; ``("", None)`` on failure."""
+        try:
+            resp = self._client.recall(query)
+        except Exception as exc:
+            logger.debug("CI-Server recall failed: %s", exc)
+            return "", None
+        block = _extract_block(resp)
+        if not block:
+            return "", None
+        count = resp.get("resultCount") if isinstance(resp, dict) else None
+        try:
+            count = int(count)
+        except (TypeError, ValueError):
+            count = 0  # an older server: content, no discrete count
+        return block, max(0, count)
+
+    def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
+        """Legacy queued recall: the host calls this after turn N with turn N's
+        message and consumes the answer at turn N+1.
+
+        With CI_MEMORY_RECALL_SYNC (the default) this is a no-op — the search
+        would be for a message the user has already had answered, and prefetch()
+        recalls for the one they are sending now. Off, it keeps the host's model:
+        the HTTP call runs in a background thread and prefetch() waits for it.
         """
         if not self._client or not _feature_enabled("CI_MEMORY_RECALL_ENABLED"):
             return
+        if self._recall_sync():
+            return
 
         self._prefetch_result = None
+        self._prefetch_count = None
         self._prefetch_event = threading.Event()
 
         def _run() -> None:
             try:
-                resp = self._client.recall(query)
-                self._prefetch_result = _extract_block(resp)
-            except Exception as exc:
-                logger.debug("CI-Server prefetch failed: %s", exc)
-                self._prefetch_result = ""
+                self._prefetch_result, self._prefetch_count = self._do_recall(query)
             finally:
                 self._prefetch_event.set()
 
@@ -792,16 +839,69 @@ class CompanionIntelligenceProvider(MemoryProvider):
         t.start()
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
-        """Return the L1 search result queued by queue_prefetch().
+        """Return the L1 context to inject for *query*, the message the user just sent.
 
-        Waits up to _PREFETCH_TIMEOUT seconds for the background request to
-        finish. Returns an empty string if the client is not ready or the
-        request timed out / failed.
+        Default (CI_MEMORY_RECALL_SYNC on): recall live against *query*, bounded by
+        _RECALL_TIMEOUT. The host's queued model hands turn N+1 the recall for
+        turn N — one turn stale, and nothing at all on the first turn of a
+        session, which is where "what's on today?" lands. A companion memory is
+        only worth its tokens when what it recalls is about the message in hand.
+        The search runs on a daemon thread and the wait is bounded, so a slow
+        server costs at most the timeout and never the turn; a search that
+        overruns is dropped, not injected late into a later turn.
+
+        Legacy (flag off): the result queue_prefetch() started for the previous
+        turn, waiting up to _PREFETCH_TIMEOUT for it.
         """
-        if not self._client or self._prefetch_event is None:
+        self._last_recall_count = None
+        if not self._client or not _feature_enabled("CI_MEMORY_RECALL_ENABLED"):
             return ""
-        self._prefetch_event.wait(timeout=_PREFETCH_TIMEOUT)
-        return self._prefetch_result or ""
+
+        if not self._recall_sync():
+            if self._prefetch_event is None:
+                return ""
+            self._prefetch_event.wait(timeout=_PREFETCH_TIMEOUT)
+            block = self._prefetch_result or ""
+            self._last_recall_count = self._prefetch_count if block else None
+            return block
+
+        query = (query or "").strip()
+        if not query:
+            return ""
+        if query == self._last_recall_query and self._last_recall_block:
+            self._last_recall_count = self._last_recall_cached_count
+            return self._last_recall_block
+
+        box: Dict[str, Any] = {}
+        done = threading.Event()
+
+        def _run() -> None:
+            try:
+                box["block"], box["count"] = self._do_recall(query)
+            finally:
+                done.set()
+
+        threading.Thread(target=_run, daemon=True, name="ci-recall").start()
+        if not done.wait(timeout=_RECALL_TIMEOUT):
+            logger.warning("CI-Server recall took over %.1fs; this turn goes without it", _RECALL_TIMEOUT)
+            return ""
+        block = box.get("block") or ""
+        if not block:
+            return ""
+        self._last_recall_query = query
+        self._last_recall_block = block
+        self._last_recall_cached_count = box.get("count")
+        self._last_recall_count = box.get("count")
+        return block
+
+    def recall_status(self):
+        """What the last prefetch injected — the host shows it beside the reply as
+        ``🧠 Companion Memory — recalled N memories``, so the user can see memory
+        was used even when the model does not say so. ``None`` when nothing was
+        injected, or on a host without the indicator."""
+        if RecallStatus is None or self._last_recall_count is None:
+            return None
+        return RecallStatus(provider_label=_RECALL_LABEL, count=self._last_recall_count)
 
     # ---------------------------------------------------------------------------
     # Turn sync — non-blocking write after each turn

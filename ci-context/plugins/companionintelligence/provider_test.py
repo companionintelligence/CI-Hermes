@@ -15,6 +15,7 @@ import os
 import sys
 import tempfile
 import threading
+import time
 import types
 import unittest
 import urllib.error
@@ -51,6 +52,7 @@ _UTF8_BOM = b"\xef\xbb\xbf"
 _FLAGS = (
     "CI_MEMORY_CONTEXT_ENABLED",
     "CI_MEMORY_RECALL_ENABLED",
+    "CI_MEMORY_RECALL_SYNC",
     "CI_MEMORY_TURN_ENABLED",
     "CI_MEMORY_WRITE_ENABLED",
     "CI_INTENTS_ENABLED",
@@ -90,6 +92,9 @@ class _MockClient:
         self._manifest = manifest
         self.context_calls = 0
         self.recall_calls = 0
+        self.recall_queries = []
+        self.recall_response = {"block": "RECALL", "resultCount": 3}
+        self.recall_delay = 0.0
         self.turn_calls = []
         self.write_calls = []
         self.write_event = threading.Event()
@@ -104,7 +109,10 @@ class _MockClient:
 
     def recall(self, query, max_results=5):
         self.recall_calls += 1
-        return {"block": "RECALL"}
+        self.recall_queries.append(query)
+        if self.recall_delay:
+            time.sleep(self.recall_delay)
+        return dict(self.recall_response)
 
     def turn(self, messages, session_id="", platform=""):
         self.turn_calls.append((messages, session_id, platform))
@@ -785,6 +793,150 @@ class RecallGatingTests(unittest.TestCase):
         provider.queue_prefetch("q")
         self.assertEqual(provider.prefetch("q"), "RECALL")  # waits for the bg thread
         self.assertEqual(client.recall_calls, 1)
+
+
+class _StubRecallStatus:
+    """Stands in for agent.memory_provider.RecallStatus, which the test stub lacks."""
+
+    def __init__(self, provider_label, count, glyph="🧠"):
+        self.provider_label, self.count, self.glyph = provider_label, count, glyph
+
+
+class LiveRecallTests(unittest.TestCase):
+    """Default path: prefetch() recalls for the message in hand, not the previous one."""
+
+    def setUp(self):
+        _clear_flags()
+        self._status_patch = mock.patch.object(ci, "RecallStatus", _StubRecallStatus)
+        self._status_patch.start()
+
+    def tearDown(self):
+        self._status_patch.stop()
+        _clear_flags()
+
+    def test_first_turn_of_a_session_gets_recall_without_a_queue(self):
+        client = _MockClient()
+        provider = _provider_with_client(client)
+        self.assertEqual(provider.prefetch("what is on today?"), "RECALL")
+        self.assertEqual(client.recall_queries, ["what is on today?"])
+
+    def test_recall_is_for_the_current_message_not_the_queued_one(self):
+        client = _MockClient()
+        provider = _provider_with_client(client)
+        provider.queue_prefetch("previous turn")   # the host queues after turn N
+        self.assertEqual(provider.prefetch("this turn"), "RECALL")
+        self.assertEqual(client.recall_queries, ["this turn"], "the queued query is never searched")
+
+    def test_queue_prefetch_is_a_no_op_so_no_wasted_round_trip(self):
+        client = _MockClient()
+        provider = _provider_with_client(client)
+        provider.queue_prefetch("q")
+        self.assertEqual(client.recall_calls, 0)
+
+    def test_the_same_message_twice_searches_once(self):
+        client = _MockClient()
+        provider = _provider_with_client(client)
+        self.assertEqual(provider.prefetch("q"), "RECALL")
+        self.assertEqual(provider.prefetch("q"), "RECALL")
+        self.assertEqual(client.recall_calls, 1)
+        self.assertEqual(provider.recall_status().count, 3, "the cached answer keeps its count")
+
+    def test_a_slow_server_costs_the_timeout_not_the_turn(self):
+        client = _MockClient()
+        client.recall_delay = 0.5
+        provider = _provider_with_client(client)
+        with mock.patch.object(ci, "_RECALL_TIMEOUT", 0.05):
+            with self.assertLogs(ci.logger, level="WARNING") as logs:
+                self.assertEqual(provider.prefetch("q"), "")
+        self.assertIsNone(provider.recall_status())
+        self.assertTrue(any("goes without it" in line for line in logs.output))
+
+    def test_recall_status_reports_the_servers_count(self):
+        client = _MockClient()
+        provider = _provider_with_client(client)
+        provider.prefetch("q")
+        status = provider.recall_status()
+        self.assertEqual((status.provider_label, status.count), ("Companion Memory", 3))
+
+    def test_recall_status_is_none_until_something_was_injected(self):
+        client = _MockClient()
+        client.recall_response = {"block": ""}
+        provider = _provider_with_client(client)
+        self.assertIsNone(provider.recall_status())
+        self.assertEqual(provider.prefetch("q"), "")
+        self.assertIsNone(provider.recall_status())
+
+    def test_recall_status_resets_between_turns(self):
+        client = _MockClient()
+        provider = _provider_with_client(client)
+        provider.prefetch("q")
+        self.assertIsNotNone(provider.recall_status())
+        client.recall_response = {"block": ""}
+        provider.prefetch("nothing known")
+        self.assertIsNone(provider.recall_status(), "must reflect only the LAST prefetch")
+
+    def test_an_older_server_without_a_count_still_gets_an_indicator(self):
+        client = _MockClient()
+        client.recall_response = {"block": "RECALL"}
+        provider = _provider_with_client(client)
+        provider.prefetch("q")
+        self.assertEqual(provider.recall_status().count, 0)
+
+    def test_a_string_count_is_tolerated(self):
+        client = _MockClient()
+        client.recall_response = {"block": "RECALL", "resultCount": "2"}
+        provider = _provider_with_client(client)
+        provider.prefetch("q")
+        self.assertEqual(provider.recall_status().count, 2)
+
+    def test_an_older_host_without_recall_status_gets_none(self):
+        client = _MockClient()
+        provider = _provider_with_client(client)
+        provider.prefetch("q")
+        with mock.patch.object(ci, "RecallStatus", None):
+            self.assertIsNone(provider.recall_status())
+
+    def test_a_failed_recall_is_empty_and_logged_at_debug(self):
+        client = _MockClient()
+        client.recall = mock.Mock(side_effect=RuntimeError("down"))
+        provider = _provider_with_client(client)
+        self.assertEqual(provider.prefetch("q"), "")
+        self.assertIsNone(provider.recall_status())
+
+    def test_a_blank_query_does_not_search(self):
+        client = _MockClient()
+        provider = _provider_with_client(client)
+        self.assertEqual(provider.prefetch("   "), "")
+        self.assertEqual(client.recall_calls, 0)
+
+
+class QueuedRecallTests(unittest.TestCase):
+    """CI_MEMORY_RECALL_SYNC=false keeps the host's queued model, unchanged."""
+
+    def setUp(self):
+        _clear_flags()
+        os.environ["CI_MEMORY_RECALL_SYNC"] = "false"
+        self._status_patch = mock.patch.object(ci, "RecallStatus", _StubRecallStatus)
+        self._status_patch.start()
+
+    def tearDown(self):
+        self._status_patch.stop()
+        _clear_flags()
+
+    def test_prefetch_returns_the_queued_turns_result(self):
+        client = _MockClient()
+        provider = _provider_with_client(client)
+        provider.queue_prefetch("previous turn")
+        self.assertEqual(provider.prefetch("this turn"), "RECALL")
+        self.assertEqual(client.recall_queries, ["previous turn"])
+        self.assertEqual(provider.recall_status().count, 3)
+
+    def test_nothing_queued_means_nothing_injected(self):
+        client = _MockClient()
+        provider = _provider_with_client(client)
+        self.assertEqual(provider.prefetch("first turn"), "")
+        self.assertEqual(client.recall_calls, 0)
+        self.assertIsNone(provider.recall_status())
 
 
 class TurnGatingTests(unittest.TestCase):
