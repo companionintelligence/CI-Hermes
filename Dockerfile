@@ -75,6 +75,23 @@ RUN SP="$(/opt/hermes/.venv/bin/python -c 'import sysconfig; print(sysconfig.get
     /opt/hermes/.venv/bin/python -c "import enable_ollama_native" && \
     echo "CI ollama-native patches installed into $SP"
 
+# CI-Hermes: the dashboard's cross-container gateway probe sends the API key. Upstream's
+# dashboard probes GATEWAY_HEALTH_URL with no credentials, so its first leg
+# (/health/detailed, Bearer-authenticated) 401s on every /api/status poll: the gateway
+# logs "API server rejected invalid API key" every ~10 s and the dashboard only ever
+# gets the bare /health body. The shim swaps the probe for one that sends
+# `Authorization: Bearer $API_SERVER_KEY`; it engages only in a process that has both
+# GATEWAY_HEALTH_URL and API_SERVER_KEY (the web container — compose passes the
+# gateway's key to it too). Same .pth mechanism and same build-time contract check as
+# the Ollama patch above.
+COPY patches/enable_gateway_health_auth.py patches/ci-gateway-health-auth.pth patches/check_gateway_health_auth_contract.py /app/patches/
+RUN SP="$(/opt/hermes/.venv/bin/python -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')" && \
+    /opt/hermes/.venv/bin/python /app/patches/check_gateway_health_auth_contract.py --root /opt/hermes && \
+    install -m 0644 /app/patches/enable_gateway_health_auth.py "$SP/enable_gateway_health_auth.py" && \
+    install -m 0644 /app/patches/ci-gateway-health-auth.pth  "$SP/ci-gateway-health-auth.pth" && \
+    /opt/hermes/.venv/bin/python -c "import enable_gateway_health_auth" && \
+    echo "CI gateway-health-auth patch installed into $SP"
+
 # Ensure hermes venv is in PATH everywhere. The agent's terminal tool spawns
 # subprocesses that may not inherit Docker ENV, so we cover all cases:
 # - ENV: for the entrypoint, Node server, and direct child processes

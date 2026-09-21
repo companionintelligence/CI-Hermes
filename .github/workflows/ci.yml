@@ -92,11 +92,14 @@ jobs:
         working-directory: ci-context/plugins/ci-runtime
         run: python3 -m unittest discover -p '*_test.py' --verbose
 
-      # The native Ollama adapter's own suite: the read-timeout default that has to
-      # cover a full prompt prefill on a Hub-pooled engine, and that an explicit
-      # timeout still wins. httpx is the adapter's one dependency, installed the
-      # same way (and with the same PEP 668 fallback) as PyYAML above.
-      - name: Native Ollama adapter tests
+      # The build-time patches' own suites: the native Ollama adapter (the
+      # read-timeout default that has to cover a full prompt prefill on a Hub-pooled
+      # engine, and that an explicit timeout still wins) and the gateway health-probe
+      # auth shim (the Bearer header, the /health/detailed → /health ladder, and the
+      # contract check that fails the image build on upstream drift). httpx is the
+      # adapter's one dependency, installed the same way (and with the same PEP 668
+      # fallback) as PyYAML above; the shim's suite is stdlib-only.
+      - name: Build-time patch tests
         working-directory: patches
         run: |
           set -euo pipefail

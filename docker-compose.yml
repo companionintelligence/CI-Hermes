@@ -13,6 +13,12 @@ services:
       GATEWAY_ALLOWED_USERS: ${GATEWAY_ALLOWED_USERS:-} # Set to your messaging user ID(s) to avoid default-deny gateway auth
       # Tells the dashboard to probe the gateway via HTTP instead of local PID detection
       GATEWAY_HEALTH_URL: http://hermes-gateway:8642
+      # The same key the gateway's API server validates (its API_SERVER_KEY below):
+      # the probe's first leg, /health/detailed, is Bearer-authenticated, and upstream's
+      # dashboard sends no credentials — every poll 401s and the gateway logs
+      # "API server rejected invalid API key". patches/enable_gateway_health_auth.py
+      # adds the header when this is set.
+      API_SERVER_KEY: ${APP_SEED:-hermes-internal-key}
       # Route local Ollama through the native /api/chat API (honors num_ctx) instead
       # of the OpenAI-compat /v1 endpoint (which ignores it). Empty = off (stock /v1).
       CI_HERMES_OLLAMA_NATIVE: ${CI_HERMES_OLLAMA_NATIVE:-}
