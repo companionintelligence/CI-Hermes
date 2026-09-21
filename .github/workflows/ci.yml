@@ -91,3 +91,17 @@ jobs:
       - name: Runtime-context plugin tests
         working-directory: ci-context/plugins/ci-runtime
         run: python3 -m unittest discover -p '*_test.py' --verbose
+
+      # The native Ollama adapter's own suite: the read-timeout default that has to
+      # cover a full prompt prefill on a Hub-pooled engine, and that an explicit
+      # timeout still wins. httpx is the adapter's one dependency, installed the
+      # same way (and with the same PEP 668 fallback) as PyYAML above.
+      - name: Native Ollama adapter tests
+        working-directory: patches
+        run: |
+          set -euo pipefail
+          if ! python3 -c "import httpx" 2>/dev/null; then
+            python3 -m pip install --quiet httpx \
+              || python3 -m pip install --quiet --break-system-packages httpx
+          fi
+          python3 -m unittest discover -p '*_test.py' --verbose
