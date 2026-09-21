@@ -129,6 +129,9 @@ describe("registerSecret: values no pattern can recognise", () => {
       HUB_MCP_API_KEY: "hub-mcp-key-0123456789",
       CI_SERVER_TOKEN: "memory-token-0123456789",
       GATEWAY_HEALTH_URL: "http://ci-hermes-gateway:8642",
+      // The gateway's API key, handed to the web container so the dashboard's
+      // health probe can authenticate (patches/enable_gateway_health_auth.py).
+      API_SERVER_KEY: "gateway-api-key-0123456789",
     });
 
     // APP_SEED is the terminal secret: an attacker holding it gets the PTY. It
@@ -139,6 +142,7 @@ describe("registerSecret: values no pattern can recognise", () => {
     assert.equal(scrubString("seed f00dcafef00dcafef00dcafef00dcafe seen"), "seed [Filtered] seen");
     assert.doesNotMatch(scrubString("hub said hub-mcp-key-0123456789"), /hub-mcp-key/);
     assert.doesNotMatch(scrubString("memory-token-0123456789 rejected"), /memory-token/);
+    assert.doesNotMatch(scrubString("Bearer gateway-api-key-0123456789"), /gateway-api-key/);
     // Not a credential: redacting it would corrupt useful diagnostics.
     assert.match(scrubString("dial http://ci-hermes-gateway:8642"), /ci-hermes-gateway:8642/);
   });
