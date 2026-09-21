@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import os
 import threading
 import time
@@ -35,6 +36,27 @@ logger = logging.getLogger("ci.ollama_native")
 # bootstrap-from-hub.sh ONLY on the Hub's Ollama path). Off → callers fall
 # through to the stock OpenAI client (today's /v1 behavior).
 FLAG_ENV = "CI_HERMES_OLLAMA_NATIVE"
+
+# Read timeout for the long native calls (/api/chat, /api/embed). httpx's read
+# timeout is the wait for the NEXT byte, and a streamed reply sends nothing until
+# the whole prompt is prefilled — so on a Hub-pooled engine it has to cover the
+# pool's queue wait plus a full-window prefill (an agent turn is ~45k tokens; Strix
+# Halo prefills at 450-600 tok/s, first byte at 70-85 s before any queueing,
+# measured 2026-09-20). Upstream's own /v1 client lifts its 120 s stream read
+# timeout to HERMES_API_TIMEOUT (1800 s) for exactly this reason whenever the
+# endpoint is local ("local providers prefill for minutes" —
+# agent/chat_completion_helpers.py, _stream_timeouts), and every Hub endpoint
+# (`ci-hub`, `*.docker.internal`) classifies as local. The native path must not be
+# stricter than that: a shorter read timeout here becomes the first watchdog to
+# fire on a slow prefill, and the retry re-sends — and re-prefills — the whole
+# prompt. Follow the same env with the same default. Upstream's stale detector
+# (900 s for local endpoints, HERMES_LOCAL_STREAM_STALE_TIMEOUT) stays the
+# effective first-byte watchdog on streamed turns; this only stops the raw socket
+# read from undercutting it. An explicit timeout — a provider's
+# request_timeout_seconds via client_kwargs, or the one Hook 2 copies from an aux
+# client — still wins; this is the default for a client built without one.
+API_TIMEOUT_ENV = "HERMES_API_TIMEOUT"
+DEFAULT_API_TIMEOUT_SECONDS = 1800.0
 
 # Cache of base_url(root) -> (is_ollama, expires_at_monotonic). Both outcomes are
 # bounded by a 1h TTL: a positive must not be pinned for the process lifetime (a
@@ -52,6 +74,17 @@ _NEG_PROBE_TTL = 60.0  # seconds
 
 def _flag_enabled() -> bool:
     return str(os.environ.get(FLAG_ENV, "")).strip().lower() in ("1", "true", "yes", "on")
+
+
+def default_read_timeout() -> float:
+    """HERMES_API_TIMEOUT when it is a positive finite number, else upstream's 1800 s."""
+    try:
+        value = float(str(os.environ.get(API_TIMEOUT_ENV, "")).strip())
+    except (TypeError, ValueError):
+        return DEFAULT_API_TIMEOUT_SECONDS
+    if not math.isfinite(value) or value <= 0:
+        return DEFAULT_API_TIMEOUT_SECONDS
+    return value
 
 
 def native_root(base_url: str) -> str:
@@ -624,10 +657,11 @@ class OllamaNativeClient:
         # Per-request default timeout. Applied both to a self-made client AND, below,
         # as the explicit per-request timeout — so an injected http_client that only
         # carries httpx's short 5s default never governs a long local-model call.
+        # The read leg follows HERMES_API_TIMEOUT (see default_read_timeout).
         self._default_timeout = (
             timeout
             if timeout is not None
-            else httpx.Timeout(connect=15.0, read=600.0, write=30.0, pool=30.0)
+            else httpx.Timeout(connect=15.0, read=default_read_timeout(), write=30.0, pool=30.0)
         )
         self._http = http_client or httpx.Client(timeout=self._default_timeout)
         # Also expose the httpx client as `_client`: the agent's socket-abort path
