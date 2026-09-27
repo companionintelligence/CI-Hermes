@@ -121,6 +121,17 @@ Two containers share a single data volume (`/opt/data`):
 
 The terminal is served at `/terminal` (the CI marketplace app entry point). The dashboard owns `/` and all other paths are proxied to it, ensuring it's protected by CI marketplace authentication.
 
+### LLM connection layer
+
+Two build-time shims in [`patches/`](patches/) sit between Hermes and its model backend, applied to the upstream image at Docker build time via `.pth` files (loaded at Python interpreter startup):
+
+- [`ollama_native_adapter.py`](patches/ollama_native_adapter.py) / [`enable_ollama_native.py`](patches/enable_ollama_native.py) — routes local Ollama through its native `/api/chat` endpoint (which honors `num_ctx`) instead of the OpenAI-compatible `/v1` endpoint (which silently ignores it and falls back to Ollama's 4096-token default).
+- [`enable_gateway_health_auth.py`](patches/enable_gateway_health_auth.py) — sends the gateway's Bearer key with the dashboard's `/health/detailed` probe, so the two-container split doesn't leave the dashboard's health check permanently unauthenticated.
+
+Each shim patches upstream by name and is deliberately best-effort — a missing hook is logged and Hermes falls back to stock behavior rather than crashing. A matching static contract check ([`check_ollama_native_contract.py`](patches/check_ollama_native_contract.py), [`check_gateway_health_auth_contract.py`](patches/check_gateway_health_auth_contract.py)) parses the upstream source with `ast` at build time and fails the image build if a base-image bump has moved what the shim hooks into — see the Dockerfile. Run `python3 -m unittest discover -p '*_test.py'` in `patches/` (needs `httpx`) to run their unit tests without a build.
+
+Separately, [`reconcile-hub-config.py`](reconcile-hub-config.py) keeps `config.yaml`'s model/endpoint settings following the Hub's inference handout on every start — ownership tracking so hand edits survive, the 64K context-window floor, and cloud-handout precedence. See its module docstring and [`tests/hub-handout-restart.test.sh`](tests/hub-handout-restart.test.sh) for the full contract.
+
 ## CI context
 
 The image includes a bundled `ci-runtime` plugin under `/opt/hermes/plugins` and a managed `ci` skill under `/app/ci-context/skills`. Both are app-owned image content, so they update with normal CI marketplace app image updates without writing managed prompt files into the user's persistent data directory.
