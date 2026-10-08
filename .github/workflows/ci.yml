@@ -8,10 +8,24 @@ name: CI
 # yet gate docker-publish.yml. Wiring a never-before-run suite into the image release
 # path is a separate change with its own risk, and it should happen once this has
 # been observed green for a while — not in the same PR that introduces it.
+# >>> ci-local:gated original triggers below, restore with `ci-local restore`
+# on:
+#   pull_request:
+#   push:
+#     branches: [master, main]
+#   workflow_dispatch:
+#   # Called by npm-publish.yml, which passes the exact ref it is about to publish so
+#   # the tested tree and the packaged tree cannot disagree.
+#   workflow_call:
+#     inputs:
+#       ref:
+#         description: >-
+#           Ref to test. Leave empty to test the ref that triggered the run.
+#         type: string
+#         required: false
+#         default: ""
+# <<< ci-local:gated
 on:
-  pull_request:
-  push:
-    branches: [master, main]
   workflow_dispatch:
   # Called by npm-publish.yml, which passes the exact ref it is about to publish so
   # the tested tree and the packaged tree cannot disagree.
