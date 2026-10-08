@@ -49,27 +49,41 @@ name: Publish memory plugin
 # trusted publishing generates provenance automatically, it would at minimum need
 # NPM_CONFIG_PROVENANCE=false. Not adopted here because it is unverified for this
 # repo's shape; the token path above is known to work.
+# >>> ci-local:gated original triggers below, restore with `ci-local restore`
+# on:
+#   # Two triggers, because one is not enough in this repo. Release tags are normally
+#   # pushed by tag-on-hermes-merge.yml using the default GITHUB_TOKEN, and GitHub
+#   # deliberately does NOT start workflows from events a GITHUB_TOKEN created — so a
+#   # bot release would fire `push: tags` for nobody and the plugin would never
+#   # publish while the image did. docker-publish.yml carries the same workflow_run
+#   # fallback for exactly this reason; omitting it here made the header's "same
+#   # trigger as docker-publish.yml" claim false in the most expensive way.
+#   workflow_run:
+#     workflows:
+#       - "Tag CI-Hermes Version On Merge"
+#     types:
+#       - completed
+#   push:
+#     tags:
+#       # Release tags are vYYYY.M.D with an optional same-day suffix (v2026.7.7.2 is
+#       # a real tag in this repo). This is a coarse filter, not validation: a glob is
+#       # not a regex, so `v1-scratch.0.0` still matches and only `--npm-version`
+#       # rejects it. It is here to stop the obvious non-release tags — bare `v[0-9]*`
+#       # would match `v1-scratch` and burn a full CI gate before the mapper ran.
+#       - "v[0-9]*.[0-9]*.[0-9]*"
+#   workflow_dispatch:
+#     inputs:
+#       tag:
+#         description: "Existing release tag to publish (for example v2026.8.1)"
+#         required: true
+#         type: string
+#       dry_run:
+#         description: "Pack and compare, but do not publish"
+#         required: false
+#         default: false
+#         type: boolean
+# <<< ci-local:gated
 on:
-  # Two triggers, because one is not enough in this repo. Release tags are normally
-  # pushed by tag-on-hermes-merge.yml using the default GITHUB_TOKEN, and GitHub
-  # deliberately does NOT start workflows from events a GITHUB_TOKEN created — so a
-  # bot release would fire `push: tags` for nobody and the plugin would never
-  # publish while the image did. docker-publish.yml carries the same workflow_run
-  # fallback for exactly this reason; omitting it here made the header's "same
-  # trigger as docker-publish.yml" claim false in the most expensive way.
-  workflow_run:
-    workflows:
-      - "Tag CI-Hermes Version On Merge"
-    types:
-      - completed
-  push:
-    tags:
-      # Release tags are vYYYY.M.D with an optional same-day suffix (v2026.7.7.2 is
-      # a real tag in this repo). This is a coarse filter, not validation: a glob is
-      # not a regex, so `v1-scratch.0.0` still matches and only `--npm-version`
-      # rejects it. It is here to stop the obvious non-release tags — bare `v[0-9]*`
-      # would match `v1-scratch` and burn a full CI gate before the mapper ran.
-      - "v[0-9]*.[0-9]*.[0-9]*"
   workflow_dispatch:
     inputs:
       tag:

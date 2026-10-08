@@ -1,35 +1,39 @@
 name: Docker Build and Push
+# >>> ci-local:gated original triggers below, restore with `ci-local restore`
+# on:
+#   # Release tags only. This was `"*"`, which meant ANY tag pushed by a human built
+#   # and pushed a real multi-arch image to GHCR and created a public GitHub Release —
+#   # including the throwaway `test-publish-1` tag this workflow's own runbook used to
+#   # tell you to push as a verification step.
+#   #
+#   # Every release tag is vYYYY.M.D with an optional same-day suffix (v2026.7.7.2).
+#   # Narrowed to three segments, matching npm-publish.yml so a release tag means the
+#   # same thing to both. Checked against all 25 tags this repo has ever had, plus the
+#   # since-deleted `v2026.5.16-1`: every one matches, so nothing that ever released is
+#   # excluded. The trailing `*` absorbs the same-day `.N` suffix.
+#   #
+#   # Still a coarse filter, not validation — a glob is not a regex, so `v1-scratch.0.0`
+#   # gets through. It only limits how much machinery a junk tag can start.
+#   #
+#   # This does not affect the bot path below. Tags pushed by the tagger workflow use
+#   # GITHUB_TOKEN, which deliberately does not trigger further workflows — which is
+#   # exactly why the workflow_run trigger exists.
+#   #
+#   # That bot path is wired ahead of itself right now: "Tag CI-Hermes Version On Merge"
+#   # is still gated to workflow_dispatch, and its only job requires a merged
+#   # pull_request, so it cannot cut a tag and this trigger cannot fire. Releases are cut
+#   # by pushing a release tag until that workflow is ungated.
+#   push:
+#     tags:
+#       - "v[0-9]*.[0-9]*.[0-9]*"
+#   workflow_run:
+#     workflows:
+#       - "Tag CI-Hermes Version On Merge"
+#     types:
+#       - completed
+# <<< ci-local:gated
 on:
-  # Release tags only. This was `"*"`, which meant ANY tag pushed by a human built
-  # and pushed a real multi-arch image to GHCR and created a public GitHub Release —
-  # including the throwaway `test-publish-1` tag this workflow's own runbook used to
-  # tell you to push as a verification step.
-  #
-  # Every release tag is vYYYY.M.D with an optional same-day suffix (v2026.7.7.2).
-  # Narrowed to three segments, matching npm-publish.yml so a release tag means the
-  # same thing to both. Checked against all 25 tags this repo has ever had, plus the
-  # since-deleted `v2026.5.16-1`: every one matches, so nothing that ever released is
-  # excluded. The trailing `*` absorbs the same-day `.N` suffix.
-  #
-  # Still a coarse filter, not validation — a glob is not a regex, so `v1-scratch.0.0`
-  # gets through. It only limits how much machinery a junk tag can start.
-  #
-  # This does not affect the bot path below. Tags pushed by the tagger workflow use
-  # GITHUB_TOKEN, which deliberately does not trigger further workflows — which is
-  # exactly why the workflow_run trigger exists.
-  #
-  # That bot path is wired ahead of itself right now: "Tag CI-Hermes Version On Merge"
-  # is still gated to workflow_dispatch, and its only job requires a merged
-  # pull_request, so it cannot cut a tag and this trigger cannot fire. Releases are cut
-  # by pushing a release tag until that workflow is ungated.
-  push:
-    tags:
-      - "v[0-9]*.[0-9]*.[0-9]*"
-  workflow_run:
-    workflows:
-      - "Tag CI-Hermes Version On Merge"
-    types:
-      - completed
+  workflow_dispatch:
 
 # One build in flight per release, and never cancel-in-progress: a cancelled build
 # leaves a tag with no image. Same key as npm-publish.yml, for the same reason —
