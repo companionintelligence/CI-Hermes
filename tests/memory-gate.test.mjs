@@ -5,6 +5,7 @@ import { createRequire } from "node:module";
 const require = createRequire(import.meta.url);
 const {
   buildStateUrl,
+  forwardAuthHeaders,
   launcherWithNext,
   requestAbsoluteUrl,
   safeHttpUrl,
@@ -170,6 +171,36 @@ describe("launcherWithNext", () => {
     const out = launcherWithNext("https://hub.example.com/start#section", "http://192.168.1.9/chat");
 
     assert.equal(out, "https://hub.example.com/start?next=http%3A%2F%2F192.168.1.9%2Fchat#section");
+  });
+});
+
+describe("forwardAuthHeaders", () => {
+  // The wrapper's /state and /skip calls are server to server, so the Hub only knows
+  // which person opened Hermes if the wrapper passes on Traefik's signed identity.
+  // Without it "Don't ask again" was filed for the whole install, and one person's
+  // Disconnect Memory brought the prompt back for everyone.
+  test("copies the signed Hub identity Traefik planted on the browser request", () => {
+    const headers = forwardAuthHeaders({
+      headers: {
+        "x-ci-hub-user": "person-a",
+        "x-ci-hub-user-timestamp": "1700000000000",
+        "x-ci-hub-user-signature": "abc",
+        host: "hermes.example.com",
+        cookie: "session=secret",
+      },
+    });
+
+    assert.deepEqual(headers, {
+      "x-ci-hub-user": "person-a",
+      "x-ci-hub-user-timestamp": "1700000000000",
+      "x-ci-hub-user-signature": "abc",
+    });
+  });
+
+  test("sends nothing extra when the request carries no identity", () => {
+    assert.deepEqual(forwardAuthHeaders({ headers: { host: "hermes.example.com" } }), {});
+    assert.deepEqual(forwardAuthHeaders({ headers: { "x-ci-hub-user": "   " } }), {});
+    assert.deepEqual(forwardAuthHeaders(undefined), {});
   });
 });
 

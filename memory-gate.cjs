@@ -115,6 +115,28 @@ function launcherWithNext(launcher, nextUrl) {
 }
 
 /**
+ * Traefik's signed Hub identity from the browser's request, to copy onto the
+ * wrapper's own calls to the Hub's memory-connect `/state` and `/skip`.
+ *
+ * Those calls are server to server, authenticated with this app's key, so
+ * without these headers the Hub cannot tell which person opened the app. It then
+ * filed "Don't ask again" on the install-wide row and answered `/state` from
+ * whichever row changed last, so one person's disconnect brought the prompt back
+ * for everyone. The Hub checks the signature against this app's forward-auth key
+ * before it trusts the name. Absent headers are left out, and the Hub falls back
+ * to the install-wide answer as before.
+ */
+function forwardAuthHeaders(req) {
+  const headers = req && req.headers ? req.headers : {};
+  const out = {};
+  for (const name of ["x-ci-hub-user", "x-ci-hub-user-timestamp", "x-ci-hub-user-signature"]) {
+    const value = headers[name];
+    if (typeof value === "string" && value.trim()) out[name] = value.trim();
+  }
+  return out;
+}
+
+/**
  * Build the Hub `/state` URL for this app, carrying the browser's own Host.
  *
  * `clientHost` is load-bearing: the wrapper calls the Hub server-to-server over
@@ -133,6 +155,7 @@ function buildStateUrl(hubBase, appUrn, clientHost) {
 
 module.exports = {
   buildStateUrl,
+  forwardAuthHeaders,
   launcherWithNext,
   requestAbsoluteUrl,
   safeHttpUrl,
