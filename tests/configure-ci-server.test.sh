@@ -3,10 +3,10 @@
 # fresh registration, credential reconcile when the install-dialog URL/key
 # change, and idempotency when nothing changed.
 #
-# The config path is resolved from CONFIG_PATHS, whose first entry is
-# ~/.hermes/config.yaml. We point HOME at a temp dir so the script reads/writes
-# an isolated config there. HERMES_HOME is set to the same dir so the (optional)
-# plugin copy step stays inside the sandbox.
+# The config path is resolved from CONFIG_PATHS: $HERMES_HOME/config.yaml first,
+# then ~/.hermes/config.yaml. Tests 1-7 point HOME and HERMES_HOME at one temp dir
+# and keep the config under .hermes/, so the second entry is the one found; the
+# later tests put it directly in $HERMES_HOME, as the image does.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -310,6 +310,31 @@ wait "${holder}"
 out="$(cat "${data_dir}/config.yaml")"
 assert_contains "the other writer's edit survives" "external_dirs:" "${out}"
 assert_contains "and so does the ci_server block" 'x-api-key: "sk-race-1"' "${out}"
+rm -rf "${data_dir}"
+
+# ─── Test 14: removing the block keeps the comments after it ────────────────
+# Blank and comment lines that close the block belong to whatever follows it.
+echo "test: removing the block keeps a comment above the next key"
+data_dir="$(mktemp -d)"
+printf 'mcp_servers:\n  hub:\n    url: "http://ci-hub:5002/api/mcp"\n\n# keep max_turns at 90\nagent:\n  max_turns: 90\n' > "${data_dir}/config.yaml"
+env -i PATH="${PATH}" HOME="${data_dir}/home" HERMES_HOME="${data_dir}" \
+  CI_SERVER_URL=http://gateway:8642 CI_SERVER_TOKEN=sk-comment-1 python3 "${SCRIPT}" >/dev/null 2>&1
+env -i PATH="${PATH}" HOME="${data_dir}/home" HERMES_HOME="${data_dir}" python3 "${SCRIPT}" >/dev/null 2>&1
+out="$(cat "${data_dir}/config.yaml")"
+assert_not_contains "block removed" "ci_server:" "${out}"
+assert_contains "comment above agent kept" "# keep max_turns at 90" "${out}"
+rm -rf "${data_dir}"
+
+# ─── Test 15: a symlinked config.yaml is written through ────────────────────
+echo "test: a symlinked config.yaml stays a symlink and its target gets the block"
+data_dir="$(mktemp -d)"
+mkdir -p "${data_dir}/real"
+printf 'model:\n  provider: ollama\n' > "${data_dir}/real/config.yaml"
+ln -s real/config.yaml "${data_dir}/config.yaml"
+env -i PATH="${PATH}" HOME="${data_dir}/home" HERMES_HOME="${data_dir}" \
+  CI_SERVER_URL=http://gateway:8642 CI_SERVER_TOKEN=sk-link-1 python3 "${SCRIPT}" >/dev/null 2>&1
+assert_eq "still a symlink" "yes" "$([[ -L "${data_dir}/config.yaml" ]] && echo yes || echo no)"
+assert_contains "target has the block" 'x-api-key: "sk-link-1"' "$(cat "${data_dir}/real/config.yaml")"
 rm -rf "${data_dir}"
 
 # ─── Summary ────────────────────────────────────────────────────────────────

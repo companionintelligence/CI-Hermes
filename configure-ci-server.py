@@ -15,7 +15,8 @@ credentials are present; you can also configure it interactively:
 
 Additionally, whenever both CI_SERVER_URL and CI_SERVER_TOKEN are set (and
 CI_SERVER_ENABLED is not "false"), this script registers CI-Server as an MCP
-server in config.yaml (for agents that use the MCP tools directly).
+server in config.yaml (for agents that use the MCP tools directly). When they
+are not, it removes the block it wrote earlier, if that block is unchanged.
 """
 
 import errno
@@ -63,11 +64,8 @@ _PLUGIN_SRC_CANDIDATES = [
 # the script waited 30 s for a file under /opt/data/.hermes that Hermes never
 # writes, and Memory's MCP server was never registered. The rest of the list
 # matches configure-hub-mcp.py.
-_HERMES_HOME_CONFIG = (
-    os.path.join(os.environ["HERMES_HOME"].strip(), "config.yaml")
-    if os.environ.get("HERMES_HOME", "").strip()
-    else None
-)
+_HERMES_HOME = os.environ.get("HERMES_HOME", "").strip()
+_HERMES_HOME_CONFIG = os.path.join(_HERMES_HOME, "config.yaml") if _HERMES_HOME else None
 
 CONFIG_PATHS = [
     *([_HERMES_HOME_CONFIG] if _HERMES_HOME_CONFIG else []),
@@ -89,9 +87,8 @@ def find_config() -> str:
 
 
 def find_hermes_home() -> Path:
-    hermes_home = os.environ.get("HERMES_HOME", "").strip()
-    if hermes_home:
-        return Path(hermes_home)
+    if _HERMES_HOME:
+        return Path(_HERMES_HOME)
     return Path(find_config()).parent
 
 
@@ -102,19 +99,23 @@ def read_config(path: str) -> str:
     return ""
 
 
-def write_config(path: str, text: str) -> None:
-    """Replace config.yaml in one step. The web and gateway containers run this at
-    the same time on one volume, and Hermes may be reading the file, so it must
-    never be seen half written."""
+def atomic_write(path: str, text: str) -> None:
+    """Replace a file in one step. The web and gateway containers run this at the
+    same time on one volume, and Hermes may be reading config.yaml, so it must
+    never be seen half written. A symlinked file is written through, as the plain
+    open() this replaced did, instead of the link being swapped for a copy."""
+    path = os.path.realpath(path)
     os.makedirs(os.path.dirname(path), exist_ok=True)
     try:
         mode = stat.S_IMODE(os.stat(path).st_mode)
     except FileNotFoundError:
         mode = 0o600
-    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".config.yaml.")
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=f".{os.path.basename(path)}.")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as f:
             f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
         os.chmod(tmp, mode)
         os.replace(tmp, path)
     except BaseException:
@@ -231,6 +232,15 @@ def _block_end(lines: list, start: int, indent: int) -> int:
     return len(lines)
 
 
+def _content_end(lines: list, start: int, end: int) -> int:
+    """`end` moved back past the blank and comment lines that close the block
+    opened at `start`. Those belong to what follows it (a comment above the next
+    key, a commented-out server), not to the block."""
+    while end - 1 > start and _is_blank_or_comment(lines[end - 1]):
+        end -= 1
+    return end
+
+
 def _find_ci_server(lines: list):
     """Return (index, indent) of the `ci_server:` mapping line, or (None, None).
     Line-anchored (not a substring scan) so a comment or string mentioning
@@ -301,10 +311,7 @@ def patch_mcp(config_text: str) -> str:
 
     # Insert right after the last content line of the section (before trailing
     # blank lines) so the block stays within mcp_servers.
-    insert_at = end
-    while insert_at - 1 > mcp_index and _is_blank_or_comment(lines[insert_at - 1]):
-        insert_at -= 1
-
+    insert_at = _content_end(lines, mcp_index, end)
     lines[insert_at:insert_at] = _ci_server_lines(child_indent)
     return "".join(lines)
 
@@ -364,11 +371,21 @@ def _key_hash(key: str) -> str:
     return hashlib.sha256(key.encode("utf-8")).hexdigest()
 
 
+def _load_state(config_path: str) -> Optional[dict]:
+    try:
+        with open(_state_path(config_path), encoding="utf-8") as f:
+            state = json.load(f)
+    except (OSError, ValueError):
+        return None
+    return state if isinstance(state, dict) else None
+
+
 def record_written_block(config_path: str) -> None:
     state = {"url": desired_mcp_url(), "keySha256": _key_hash(CI_TOKEN)}
+    if _load_state(config_path) == state:
+        return
     try:
-        with open(_state_path(config_path), "w", encoding="utf-8") as f:
-            json.dump(state, f)
+        atomic_write(_state_path(config_path), json.dumps(state))
     except OSError as exc:
         print(f"[CI-Server] WARN: could not record the MCP block's owner ({exc})")
 
@@ -404,15 +421,16 @@ def remove_written_block(config_text: str, state: dict) -> "tuple[str, bool]":
     url, key = _block_values(lines, start, end)
     if not key or url != state.get("url") or _key_hash(key) != state.get("keySha256"):
         return config_text, False
-    del lines[start:end]
+    del lines[start:_content_end(lines, start, end)]
 
     for i, line in enumerate(lines):
         match = _MCP_SERVERS_RE.match(line)
         if not match:
             continue
         section_end = _block_end(lines, i, len(match.group(1)))
-        if all(_is_blank_or_comment(l) for l in lines[i + 1:section_end]):
-            del lines[i:section_end]
+        if all(_is_blank_or_comment(rest) for rest in lines[i + 1:section_end]):
+            # Only the key: any comments under it stay, and are still valid YAML.
+            del lines[i]
         break
     return "".join(lines), True
 
@@ -423,20 +441,21 @@ def unconfigure_mcp(config_path: str) -> None:
     state_path = _state_path(config_path)
     if not os.path.exists(state_path) or not os.path.exists(config_path):
         return
-    try:
-        with open(state_path, encoding="utf-8") as f:
-            state = json.load(f)
-    except (OSError, ValueError):
-        return
+    # Read the record and drop it under the lock: a configure run in the other
+    # container may be rewriting both right now, and unlinking a record it just
+    # wrote would leave its block with no owner, so never removed.
     with ConfigLock(config_path):
+        state = _load_state(config_path)
+        if state is None:
+            return
         new_text, removed = remove_written_block(read_config(config_path), state)
         if removed:
-            write_config(config_path, new_text)
+            atomic_write(config_path, new_text)
             print("[CI-Server] No Memory credentials: removed the MCP server block this script added.")
-    try:
-        os.unlink(state_path)
-    except OSError:
-        pass
+        try:
+            os.unlink(state_path)
+        except OSError:
+            pass
 
 
 def configure_mcp(config_path: str) -> None:
@@ -450,7 +469,7 @@ def configure_mcp(config_path: str) -> None:
             new_text, changed = reconcile_mcp_block(config_text)
             if changed:
                 backup_config(config_path)
-                write_config(config_path, new_text)
+                atomic_write(config_path, new_text)
                 print(f"[CI-Server] MCP server credentials reconciled in config.yaml  (URL: {CI_URL})")
             else:
                 print("[CI-Server] MCP server already up to date.")
@@ -458,7 +477,7 @@ def configure_mcp(config_path: str) -> None:
             return
 
         backup_config(config_path)
-        write_config(config_path, patch_mcp(config_text))
+        atomic_write(config_path, patch_mcp(config_text))
         record_written_block(config_path)
         print(f"[CI-Server] MCP server registered in config.yaml  (URL: {CI_URL})")
 
