@@ -3,10 +3,10 @@
 # fresh registration, credential reconcile when the install-dialog URL/key
 # change, and idempotency when nothing changed.
 #
-# The config path is resolved from CONFIG_PATHS, whose first entry is
-# ~/.hermes/config.yaml. We point HOME at a temp dir so the script reads/writes
-# an isolated config there. HERMES_HOME is set to the same dir so the (optional)
-# plugin copy step stays inside the sandbox.
+# The config path is resolved from CONFIG_PATHS: $HERMES_HOME/config.yaml first,
+# then ~/.hermes/config.yaml. Tests 1-7 point HOME and HERMES_HOME at one temp dir
+# and keep the config under .hermes/, so the second entry is the one found; the
+# later tests put it directly in $HERMES_HOME, as the image does.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -197,6 +197,144 @@ out="$(cat "${data_dir}/${CONFIG_REL}")"
 assert_contains "re-indented url updated" 'url: "http://new-host:8642/api/mcp"' "${out}"
 assert_contains "re-indented key updated" 'x-api-key: "sk-new-key"' "${out}"
 assert_not_contains "old key gone" "sk-old-key" "${out}"
+rm -rf "${data_dir}"
+
+# ─── Test 8: config.yaml directly in $HERMES_HOME (where Hermes keeps it) ────
+# The image sets HERMES_HOME=/opt/data and Hermes writes /opt/data/config.yaml.
+# The script only looked under */.hermes/, so it timed out after 30 s and Memory's
+# MCP server was never registered. HOME points elsewhere here so only the
+# $HERMES_HOME copy can be found.
+echo "test: a config.yaml at \$HERMES_HOME/config.yaml gets the ci_server block"
+data_dir="$(mktemp -d)"
+home_dir="$(mktemp -d)"
+printf 'model:\n  provider: ollama\n' > "${data_dir}/config.yaml"
+env -i PATH="${PATH}" HOME="${home_dir}" HERMES_HOME="${data_dir}" \
+  CI_SERVER_URL=http://ci-memory:8642 CI_SERVER_TOKEN=sk-home-1 \
+  timeout 20 python3 "${SCRIPT}" >/dev/null 2>&1 || true
+out="$(cat "${data_dir}/config.yaml")"
+assert_contains "ci_server registered in \$HERMES_HOME/config.yaml" 'url: "http://ci-memory:8642/api/mcp"' "${out}"
+assert_contains "api key written" 'x-api-key: "sk-home-1"' "${out}"
+assert_eq "nothing written under HOME" "" "$(ls -A "${home_dir}")"
+rm -rf "${data_dir}" "${home_dir}"
+
+# ─── Test 9: it waits for \$HERMES_HOME/config.yaml when that is not there yet ─
+echo "test: with no config yet, the script waits for \$HERMES_HOME/config.yaml"
+data_dir="$(mktemp -d)"
+home_dir="$(mktemp -d)"
+env -i PATH="${PATH}" HOME="${home_dir}" HERMES_HOME="${data_dir}" \
+  CI_SERVER_URL=http://ci-memory:8642 CI_SERVER_TOKEN=sk-late-1 \
+  timeout 20 python3 "${SCRIPT}" >/dev/null 2>&1 &
+pid=$!
+sleep 2
+printf 'model:\n  provider: ollama\n' > "${data_dir}/config.yaml"
+wait "${pid}" || true
+out="$(cat "${data_dir}/config.yaml")"
+assert_contains "ci_server registered once config.yaml appeared" 'x-api-key: "sk-late-1"' "${out}"
+rm -rf "${data_dir}" "${home_dir}"
+
+# ─── Test 10: Disconnect removes the block this script wrote ────────────────
+# Disconnect restarts the containers without CI_SERVER_URL/CI_SERVER_TOKEN and
+# revokes the key. The block written on Connect would keep pointing Hermes at it.
+echo "test: with the credentials gone, the block this script wrote is removed"
+data_dir="$(mktemp -d)"
+printf 'model:\n  provider: ollama\nmcp_servers:\n  hub:\n    url: "http://ci-hub:5002/api/mcp"\n' > "${data_dir}/config.yaml"
+env -i PATH="${PATH}" HOME="${data_dir}/home" HERMES_HOME="${data_dir}" \
+  CI_SERVER_URL=http://gateway:8642 CI_SERVER_TOKEN=sk-connect-1 python3 "${SCRIPT}" >/dev/null 2>&1
+assert_contains "registered on connect" 'x-api-key: "sk-connect-1"' "$(cat "${data_dir}/config.yaml")"
+assert_eq "owner recorded without the key itself" "0" "$(grep -c 'sk-connect-1' "${data_dir}/.ci-server-mcp.json" || true)"
+env -i PATH="${PATH}" HOME="${data_dir}/home" HERMES_HOME="${data_dir}" python3 "${SCRIPT}" >/dev/null 2>&1
+out="$(cat "${data_dir}/config.yaml")"
+assert_not_contains "ci_server block removed" "ci_server:" "${out}"
+assert_not_contains "revoked key gone" "sk-connect-1" "${out}"
+assert_contains "the hub block stays" 'url: "http://ci-hub:5002/api/mcp"' "${out}"
+assert_contains "mcp_servers stays for the hub block" "mcp_servers:" "${out}"
+assert_eq "owner record removed" "no" "$([[ -e "${data_dir}/.ci-server-mcp.json" ]] && echo yes || echo no)"
+python3 -c 'import sys, yaml; yaml.safe_load(open(sys.argv[1]))' "${data_dir}/config.yaml" \
+  && assert_eq "still valid YAML" ok ok || assert_eq "still valid YAML" ok broken
+rm -rf "${data_dir}"
+
+# ─── Test 11: an mcp_servers section left empty goes too ─────────────────────
+echo "test: removing the only MCP server also removes the empty mcp_servers key"
+data_dir="$(mktemp -d)"
+printf 'model:\n  provider: ollama\n' > "${data_dir}/config.yaml"
+env -i PATH="${PATH}" HOME="${data_dir}/home" HERMES_HOME="${data_dir}" \
+  CI_SERVER_URL=http://gateway:8642 CI_SERVER_TOKEN=sk-connect-2 python3 "${SCRIPT}" >/dev/null 2>&1
+env -i PATH="${PATH}" HOME="${data_dir}/home" HERMES_HOME="${data_dir}" CI_SERVER_ENABLED=false \
+  CI_SERVER_URL=http://gateway:8642 CI_SERVER_TOKEN=sk-connect-2 python3 "${SCRIPT}" >/dev/null 2>&1
+out="$(cat "${data_dir}/config.yaml")"
+assert_not_contains "CI_SERVER_ENABLED=false removes it too" "ci_server:" "${out}"
+assert_not_contains "no empty mcp_servers left" "mcp_servers:" "${out}"
+assert_contains "the rest of the file stays" "provider: ollama" "${out}"
+rm -rf "${data_dir}"
+
+# ─── Test 12: a block this script didn't write, or one edited since, stays ──
+echo "test: a hand-written block, or one whose key was changed, is left alone"
+data_dir="$(mktemp -d)"
+printf 'mcp_servers:\n  ci_server:\n    url: "http://mine:8642/api/mcp"\n    headers:\n      x-api-key: "sk-mine"\n' > "${data_dir}/config.yaml"
+env -i PATH="${PATH}" HOME="${data_dir}/home" HERMES_HOME="${data_dir}" python3 "${SCRIPT}" >/dev/null 2>&1
+assert_contains "hand-written block kept" 'x-api-key: "sk-mine"' "$(cat "${data_dir}/config.yaml")"
+rm -rf "${data_dir}"
+data_dir="$(mktemp -d)"
+printf 'model:\n  provider: ollama\n' > "${data_dir}/config.yaml"
+env -i PATH="${PATH}" HOME="${data_dir}/home" HERMES_HOME="${data_dir}" \
+  CI_SERVER_URL=http://gateway:8642 CI_SERVER_TOKEN=sk-connect-3 python3 "${SCRIPT}" >/dev/null 2>&1
+sed -i 's/sk-connect-3/sk-edited-by-hand/' "${data_dir}/config.yaml"
+env -i PATH="${PATH}" HOME="${data_dir}/home" HERMES_HOME="${data_dir}" python3 "${SCRIPT}" >/dev/null 2>&1
+assert_contains "edited block kept" 'x-api-key: "sk-edited-by-hand"' "$(cat "${data_dir}/config.yaml")"
+rm -rf "${data_dir}"
+
+# ─── Test 13: the other container's locked edit is not lost ─────────────────
+# Both containers patch config.yaml at start. bootstrap-ci-context.sh and
+# reconcile-hub-config.py hold .hub-config.lock across their read-modify-write.
+# Here another writer holds it, reads the file, waits and writes its edit back.
+# Unlocked, this script would add its block in between and lose it.
+echo "test: the block is added after another locked writer is done, not lost under it"
+data_dir="$(mktemp -d)"
+printf 'model:\n  provider: ollama\n' > "${data_dir}/config.yaml"
+python3 - "${data_dir}/config.yaml" <<'PY' &
+import fcntl, os, sys, time
+path = sys.argv[1]
+lock = open(os.path.join(os.path.dirname(path), ".hub-config.lock"), "a+")
+fcntl.flock(lock, fcntl.LOCK_EX)
+text = open(path).read()
+open(path + ".held", "w").close()
+time.sleep(2)
+open(path, "w").write(text + "skills:\n  external_dirs:\n    - /app/ci-context/skills\n")
+fcntl.flock(lock, fcntl.LOCK_UN)
+PY
+holder=$!
+for _ in $(seq 1 50); do [[ -e "${data_dir}/config.yaml.held" ]] && break; sleep 0.1; done
+env -i PATH="${PATH}" HOME="${data_dir}/home" HERMES_HOME="${data_dir}" \
+  CI_SERVER_URL=http://gateway:8642 CI_SERVER_TOKEN=sk-race-1 timeout 20 python3 "${SCRIPT}" >/dev/null 2>&1 || true
+wait "${holder}"
+out="$(cat "${data_dir}/config.yaml")"
+assert_contains "the other writer's edit survives" "external_dirs:" "${out}"
+assert_contains "and so does the ci_server block" 'x-api-key: "sk-race-1"' "${out}"
+rm -rf "${data_dir}"
+
+# ─── Test 14: removing the block keeps the comments after it ────────────────
+# Blank and comment lines that close the block belong to whatever follows it.
+echo "test: removing the block keeps a comment above the next key"
+data_dir="$(mktemp -d)"
+printf 'mcp_servers:\n  hub:\n    url: "http://ci-hub:5002/api/mcp"\n\n# keep max_turns at 90\nagent:\n  max_turns: 90\n' > "${data_dir}/config.yaml"
+env -i PATH="${PATH}" HOME="${data_dir}/home" HERMES_HOME="${data_dir}" \
+  CI_SERVER_URL=http://gateway:8642 CI_SERVER_TOKEN=sk-comment-1 python3 "${SCRIPT}" >/dev/null 2>&1
+env -i PATH="${PATH}" HOME="${data_dir}/home" HERMES_HOME="${data_dir}" python3 "${SCRIPT}" >/dev/null 2>&1
+out="$(cat "${data_dir}/config.yaml")"
+assert_not_contains "block removed" "ci_server:" "${out}"
+assert_contains "comment above agent kept" "# keep max_turns at 90" "${out}"
+rm -rf "${data_dir}"
+
+# ─── Test 15: a symlinked config.yaml is written through ────────────────────
+echo "test: a symlinked config.yaml stays a symlink and its target gets the block"
+data_dir="$(mktemp -d)"
+mkdir -p "${data_dir}/real"
+printf 'model:\n  provider: ollama\n' > "${data_dir}/real/config.yaml"
+ln -s real/config.yaml "${data_dir}/config.yaml"
+env -i PATH="${PATH}" HOME="${data_dir}/home" HERMES_HOME="${data_dir}" \
+  CI_SERVER_URL=http://gateway:8642 CI_SERVER_TOKEN=sk-link-1 python3 "${SCRIPT}" >/dev/null 2>&1
+assert_eq "still a symlink" "yes" "$([[ -L "${data_dir}/config.yaml" ]] && echo yes || echo no)"
+assert_contains "target has the block" 'x-api-key: "sk-link-1"' "$(cat "${data_dir}/real/config.yaml")"
 rm -rf "${data_dir}"
 
 # ─── Summary ────────────────────────────────────────────────────────────────
