@@ -694,6 +694,53 @@ done
 
 unset CI_HERMES_OLLAMA_NATIVE
 
+# ─── Test 27: a slow first handout still arrives ────────────────────────────────
+# A Hub's first handout after it starts can take 10 s (it probes Ollama addresses
+# that may not answer, 3 s each). With --max-time 5 both tries timed out and Hermes
+# started with no model and no config.yaml. This Hub answers after 6 s.
+slow_hub() {  # $1 delay seconds, $2 file to write the port to
+  python3 -c '
+import http.server, sys, time
+delay = float(sys.argv[1])
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        time.sleep(delay)
+        body = b"HERMES_DEFAULT_MODEL=qwen3.5:9b\nHERMES_OPENAI_API_KEY=ollama\n"
+        self.send_response(200)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+    def log_message(self, *a):
+        pass
+s = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+open(sys.argv[2], "w").write(str(s.server_address[1]))
+s.serve_forever()
+' "$1" "$2" &
+}
+
+if command -v python3 >/dev/null 2>&1 && command -v curl >/dev/null 2>&1; then
+  echo "test: a handout that takes 6 s to arrive is still written"
+  data_dir="$(mktemp -d)"
+  port_file="$(mktemp)"
+  : > "${port_file}"
+  slow_hub 6 "${port_file}"
+  hub_pid=$!
+  for _ in $(seq 1 50); do [[ -s "${port_file}" ]] && break; sleep 0.1; done
+  HERMES_HOME="${data_dir}" CI_HUB_URL="http://127.0.0.1:$(cat "${port_file}")" "${SCRIPT}" >/dev/null 2>&1 || true
+  assert_contains "handout written" "HERMES_DEFAULT_MODEL=qwen3.5:9b" "$(cat "${data_dir}/.env.hub-bootstrap" 2>/dev/null || true)"
+
+  echo "test: HUB_BOOTSTRAP_TIMEOUT still bounds the wait"
+  rm -f "${data_dir}/.env.hub-bootstrap"
+  start=$(date +%s)
+  HERMES_HOME="${data_dir}" HUB_BOOTSTRAP_TIMEOUT=1 CI_HUB_URL="http://127.0.0.1:$(cat "${port_file}")" "${SCRIPT}" >/dev/null 2>&1 || true
+  took=$(( $(date +%s) - start ))
+  assert_eq "no handout when the Hub is slower than the limit" "no" "$([[ -f "${data_dir}/.env.hub-bootstrap" ]] && echo yes || echo no)"
+  assert_eq "gave up within the limit (2 tries of 1 s plus 2 s delay)" "yes" "$([[ ${took} -le 6 ]] && echo yes || echo no)"
+  kill "${hub_pid}" 2>/dev/null || true
+  wait "${hub_pid}" 2>/dev/null || true
+  rm -rf "${data_dir}" "${port_file}"
+fi
+
 # ─── Summary ────────────────────────────────────────────────────────────────
 echo
 echo "Results: ${PASS} passed, ${FAIL} failed"

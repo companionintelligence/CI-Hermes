@@ -13,6 +13,7 @@
 #                    Falls back to HUB_URL when Hub injects MCP env at install time.
 #   HUB_APP_SLUG     App slug to bootstrap as     (default: hermes-agent)
 #   HERMES_HOME      Hermes data dir              (default: /opt/data)
+#   HUB_BOOTSTRAP_TIMEOUT    Seconds to wait for each handout request (default: 20)
 #   BOOTSTRAP_FIXTURE_FILE   For tests: read body from this file instead of curling
 #
 # Outputs:
@@ -45,7 +46,11 @@ fetch_bootstrap() {
     return 0
   fi
   url="${CI_HUB_URL}/api/inference/apps/${HUB_APP_SLUG}/credentials.env"
-  curl --silent --show-error --fail --max-time 5 --retry 1 --retry-delay 2 "${url}"
+  # The Hub's first handout after it starts can take 10 s or more: it probes Ollama
+  # addresses that may not answer, 3 s each, before it replies. At 5 s per try both
+  # tries ran out, and Hermes started with no model and no config.yaml. 20 s covers
+  # that slow first answer; an unreachable Hub costs at most about 42 s of startup.
+  curl --silent --show-error --fail --max-time "${HUB_BOOTSTRAP_TIMEOUT:-20}" --retry 1 --retry-delay 2 "${url}"
 }
 
 translate_keys() {
