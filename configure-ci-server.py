@@ -18,13 +18,23 @@ CI_SERVER_ENABLED is not "false"), this script registers CI-Server as an MCP
 server in config.yaml (for agents that use the MCP tools directly).
 """
 
+import errno
+import hashlib
+import json
 import os
 import re
 import shutil
+import stat
 import sys
+import tempfile
 import time
 from pathlib import Path
 from typing import Optional
+
+try:
+    import fcntl
+except ImportError:  # not on Windows; the containers are Linux
+    fcntl = None
 
 # ---------------------------------------------------------------------------
 # Env
@@ -93,9 +103,64 @@ def read_config(path: str) -> str:
 
 
 def write_config(path: str, text: str) -> None:
+    """Replace config.yaml in one step. The web and gateway containers run this at
+    the same time on one volume, and Hermes may be reading the file, so it must
+    never be seen half written."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w") as f:
-        f.write(text)
+    try:
+        mode = stat.S_IMODE(os.stat(path).st_mode)
+    except FileNotFoundError:
+        mode = 0o600
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".config.yaml.")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+class ConfigLock:
+    """The lock reconcile-hub-config.py and bootstrap-ci-context.sh hold around
+    their own read-modify-write of config.yaml. Both containers patch the file at
+    start, so without it one can write back a copy it read before the other added
+    its block, and the block is gone."""
+
+    def __init__(self, config_path: str, timeout: float = 30.0):
+        self.path = os.path.join(os.path.dirname(config_path), ".hub-config.lock")
+        self.timeout = timeout
+        self.fh = None
+
+    def __enter__(self):
+        if fcntl is None:
+            return self
+        try:
+            self.fh = open(self.path, "a+")
+        except OSError as exc:
+            print(f"[CI-Server] WARN: could not open {self.path} ({exc}); continuing unlocked")
+            return self
+        deadline = time.monotonic() + self.timeout
+        while True:
+            try:
+                fcntl.flock(self.fh, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return self
+            except OSError as exc:
+                if exc.errno not in (errno.EAGAIN, errno.EACCES) or time.monotonic() > deadline:
+                    print(f"[CI-Server] WARN: could not lock {self.path} ({exc}); continuing unlocked")
+                    return self
+                time.sleep(0.1)
+
+    def __exit__(self, *exc):
+        if self.fh is not None:
+            try:
+                fcntl.flock(self.fh, fcntl.LOCK_UN)
+            finally:
+                self.fh.close()
 
 
 def backup_config(path: str) -> None:
@@ -277,25 +342,125 @@ def reconcile_mcp_block(config_text: str) -> "tuple[str, bool]":
     return "".join(lines), changed
 
 
-def configure_mcp(config_path: str) -> None:
-    config_text = read_config(config_path)
+# ---------------------------------------------------------------------------
+# Ownership: which ci_server block this script wrote
+# ---------------------------------------------------------------------------
+#
+# Memory's Connect hands the containers CI_SERVER_URL and CI_SERVER_TOKEN and
+# this script writes the ci_server block from them. Disconnect revokes the key
+# and restarts the containers without them. The block it wrote would then point
+# Hermes at a revoked key on every start, so it is removed. A block someone wrote
+# by hand is left alone: only a block whose url and key are still the ones this
+# script last wrote (recorded, the key as a hash, next to config.yaml) is ours.
 
-    # Reconcile credentials on every run rather than skipping when the block
-    # already exists: the URL/key entered in the install dialog can change, and a
-    # skip-if-exists would otherwise leave the MCP tools pointed at stale creds.
-    if has_ci_mcp_server(config_text):
-        new_text, changed = reconcile_mcp_block(config_text)
-        if changed:
-            backup_config(config_path)
-            write_config(config_path, new_text)
-            print(f"[CI-Server] MCP server credentials reconciled in config.yaml  (URL: {CI_URL})")
-        else:
-            print("[CI-Server] MCP server already up to date.")
+STATE_FILE = ".ci-server-mcp.json"
+
+
+def _state_path(config_path: str) -> str:
+    return os.path.join(os.path.dirname(config_path), STATE_FILE)
+
+
+def _key_hash(key: str) -> str:
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()
+
+
+def record_written_block(config_path: str) -> None:
+    state = {"url": desired_mcp_url(), "keySha256": _key_hash(CI_TOKEN)}
+    try:
+        with open(_state_path(config_path), "w", encoding="utf-8") as f:
+            json.dump(state, f)
+    except OSError as exc:
+        print(f"[CI-Server] WARN: could not record the MCP block's owner ({exc})")
+
+
+def _unquote(value: str) -> str:
+    value = value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        return value[1:-1]
+    return value
+
+
+def _block_values(lines: list, start: int, end: int) -> "tuple[str, str]":
+    url = key = ""
+    for line in lines[start + 1:end]:
+        m_url = re.match(r"^\s*url:\s*(.*?)\s*$", line)
+        if m_url:
+            url = _unquote(m_url.group(1))
+        m_key = re.match(r"^\s*x-api-key:\s*(.*?)\s*$", line)
+        if m_key:
+            key = _unquote(m_key.group(1))
+    return url, key
+
+
+def remove_written_block(config_text: str, state: dict) -> "tuple[str, bool]":
+    """Drop the ci_server block if it is still the one recorded in `state`.
+    Returns (new_text, removed). An mcp_servers section left with nothing in it
+    goes too, since an empty key reads as null and not as an empty mapping."""
+    lines = config_text.splitlines(keepends=True)
+    start, indent = _find_ci_server(lines)
+    if start is None:
+        return config_text, False
+    end = _block_end(lines, start, indent)
+    url, key = _block_values(lines, start, end)
+    if not key or url != state.get("url") or _key_hash(key) != state.get("keySha256"):
+        return config_text, False
+    del lines[start:end]
+
+    for i, line in enumerate(lines):
+        match = _MCP_SERVERS_RE.match(line)
+        if not match:
+            continue
+        section_end = _block_end(lines, i, len(match.group(1)))
+        if all(_is_blank_or_comment(l) for l in lines[i + 1:section_end]):
+            del lines[i:section_end]
+        break
+    return "".join(lines), True
+
+
+def unconfigure_mcp(config_path: str) -> None:
+    """Credentials are gone (Memory disconnected or switched off): remove the
+    ci_server block this script wrote, if it is still there unchanged."""
+    state_path = _state_path(config_path)
+    if not os.path.exists(state_path) or not os.path.exists(config_path):
         return
+    try:
+        with open(state_path, encoding="utf-8") as f:
+            state = json.load(f)
+    except (OSError, ValueError):
+        return
+    with ConfigLock(config_path):
+        new_text, removed = remove_written_block(read_config(config_path), state)
+        if removed:
+            write_config(config_path, new_text)
+            print("[CI-Server] No Memory credentials: removed the MCP server block this script added.")
+    try:
+        os.unlink(state_path)
+    except OSError:
+        pass
 
-    backup_config(config_path)
-    write_config(config_path, patch_mcp(config_text))
-    print(f"[CI-Server] MCP server registered in config.yaml  (URL: {CI_URL})")
+
+def configure_mcp(config_path: str) -> None:
+    with ConfigLock(config_path):
+        config_text = read_config(config_path)
+
+        # Reconcile credentials on every run rather than skipping when the block
+        # already exists: the URL/key entered in the install dialog can change, and a
+        # skip-if-exists would otherwise leave the MCP tools pointed at stale creds.
+        if has_ci_mcp_server(config_text):
+            new_text, changed = reconcile_mcp_block(config_text)
+            if changed:
+                backup_config(config_path)
+                write_config(config_path, new_text)
+                print(f"[CI-Server] MCP server credentials reconciled in config.yaml  (URL: {CI_URL})")
+            else:
+                print("[CI-Server] MCP server already up to date.")
+            record_written_block(config_path)
+            return
+
+        backup_config(config_path)
+        write_config(config_path, patch_mcp(config_text))
+        record_written_block(config_path)
+        print(f"[CI-Server] MCP server registered in config.yaml  (URL: {CI_URL})")
 
 
 # ---------------------------------------------------------------------------
@@ -332,10 +497,12 @@ def main() -> None:
 
         configure_mcp(config_path)
         print("[CI-Server] MCP configuration complete.")
-    elif CI_ENABLED and (CI_URL or CI_TOKEN):
-        # Only warn on a partial/incomplete config (one of URL/token present).
-        # With no credentials at all, MCP simply isn't requested — stay quiet.
-        print("[CI-Server] Incomplete config — set both CI_SERVER_URL and CI_SERVER_TOKEN to enable MCP; skipped.")
+    else:
+        if CI_ENABLED and (CI_URL or CI_TOKEN):
+            # Only warn on a partial/incomplete config (one of URL/token present).
+            # With no credentials at all, MCP simply isn't requested — stay quiet.
+            print("[CI-Server] Incomplete config — set both CI_SERVER_URL and CI_SERVER_TOKEN to enable MCP; skipped.")
+        unconfigure_mcp(find_config())
 
 
 if __name__ == "__main__":
