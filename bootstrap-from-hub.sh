@@ -13,7 +13,7 @@
 #                    Falls back to HUB_URL when Hub injects MCP env at install time.
 #   HUB_APP_SLUG     App slug to bootstrap as     (default: hermes-agent)
 #   HERMES_HOME      Hermes data dir              (default: /opt/data)
-#   HUB_BOOTSTRAP_TIMEOUT    Seconds to wait for each handout request (default: 20)
+#   HUB_BOOTSTRAP_TIMEOUT    Whole seconds to wait for each handout request (default: 20)
 #   BOOTSTRAP_FIXTURE_FILE   For tests: read body from this file instead of curling
 #
 # Outputs:
@@ -48,9 +48,27 @@ fetch_bootstrap() {
   url="${CI_HUB_URL}/api/inference/apps/${HUB_APP_SLUG}/credentials.env"
   # The Hub's first handout after it starts can take 10 s or more: it probes Ollama
   # addresses that may not answer, 3 s each, before it replies. At 5 s per try both
-  # tries ran out, and Hermes started with no model and no config.yaml. 20 s covers
-  # that slow first answer; an unreachable Hub costs at most about 42 s of startup.
-  curl --silent --show-error --fail --max-time "${HUB_BOOTSTRAP_TIMEOUT:-20}" --retry 1 --retry-delay 2 "${url}"
+  # tries ran out and Hermes started with no model and no config.yaml. 20 s covers
+  # that slow first answer. Connecting gets 5 s of it, so a Hub that never accepts
+  # the connection costs about 12 s of startup and one that accepts and then stalls
+  # about 42 s.
+  max_time="$(handout_timeout)"
+  curl --silent --show-error --fail --connect-timeout 5 --max-time "${max_time}" \
+    --retry 1 --retry-delay 2 "${url}"
+}
+
+handout_timeout() {
+  # HUB_BOOTSTRAP_TIMEOUT as curl --max-time. curl reads 0 as "no limit", so a Hub
+  # that stalls would hang the container start. It exits at once on a non-number,
+  # so every handout would be skipped. Either value falls back to 20 s.
+  t="${HUB_BOOTSTRAP_TIMEOUT:-}"
+  case "${t}" in
+    '') echo 20; return 0 ;;
+    *[!0-9]*) ;;
+    *) if [ "${t}" -gt 0 ] 2>/dev/null; then echo "${t}"; return 0; fi ;;
+  esac
+  log "WARN: HUB_BOOTSTRAP_TIMEOUT=${t} is not a positive whole number of seconds; using 20" >&2
+  echo 20
 }
 
 translate_keys() {

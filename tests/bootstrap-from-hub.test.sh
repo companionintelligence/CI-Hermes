@@ -1,7 +1,7 @@
 #!/bin/bash
 # Tests for bootstrap-from-hub.sh.
-# Uses BOOTSTRAP_FIXTURE_FILE to bypass the real curl, so this works in CI
-# without standing up an HTTP server.
+# Most tests use BOOTSTRAP_FIXTURE_FILE to bypass the real curl. Test 27 needs the
+# real request timing, so it runs a local python3 HTTP server instead.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -722,10 +722,10 @@ if command -v python3 >/dev/null 2>&1 && command -v curl >/dev/null 2>&1; then
   echo "test: a handout that takes 6 s to arrive is still written"
   data_dir="$(mktemp -d)"
   port_file="$(mktemp)"
-  : > "${port_file}"
   slow_hub 6 "${port_file}"
   hub_pid=$!
   for _ in $(seq 1 50); do [[ -s "${port_file}" ]] && break; sleep 0.1; done
+  assert_eq "test Hub started" "yes" "$([[ -s "${port_file}" ]] && echo yes || echo no)"
   HERMES_HOME="${data_dir}" CI_HUB_URL="http://127.0.0.1:$(cat "${port_file}")" "${SCRIPT}" >/dev/null 2>&1 || true
   assert_contains "handout written" "HERMES_DEFAULT_MODEL=qwen3.5:9b" "$(cat "${data_dir}/.env.hub-bootstrap" 2>/dev/null || true)"
 
@@ -735,11 +735,27 @@ if command -v python3 >/dev/null 2>&1 && command -v curl >/dev/null 2>&1; then
   HERMES_HOME="${data_dir}" HUB_BOOTSTRAP_TIMEOUT=1 CI_HUB_URL="http://127.0.0.1:$(cat "${port_file}")" "${SCRIPT}" >/dev/null 2>&1 || true
   took=$(( $(date +%s) - start ))
   assert_eq "no handout when the Hub is slower than the limit" "no" "$([[ -f "${data_dir}/.env.hub-bootstrap" ]] && echo yes || echo no)"
+  # 2 tries of 1 s plus the 2 s delay is 4 s. The lower bound proves both tries
+  # waited; a request that failed at once would also leave no handout.
+  assert_eq "waited for both tries (at least 3 s)" "yes" "$([[ ${took} -ge 3 ]] && echo yes || echo no)"
   assert_eq "gave up within the limit (2 tries of 1 s plus 2 s delay)" "yes" "$([[ ${took} -le 6 ]] && echo yes || echo no)"
   kill "${hub_pid}" 2>/dev/null || true
   wait "${hub_pid}" 2>/dev/null || true
   rm -rf "${data_dir}" "${port_file}"
+else
+  echo "test: SKIPPED slow-handout tests (need python3 and curl)" >&2
 fi
+
+echo "test: HUB_BOOTSTRAP_TIMEOUT=0 or a non-number falls back to 20 s"
+# curl reads --max-time 0 as no limit and exits at once on a non-number.
+data_dir="$(mktemp -d)"
+for bad in 0 abc 1.5 -3; do
+  out="$(HERMES_HOME="${data_dir}" HUB_BOOTSTRAP_TIMEOUT="${bad}" CI_HUB_URL="http://127.0.0.1:1" "${SCRIPT}" 2>&1 || true)"
+  assert_contains "HUB_BOOTSTRAP_TIMEOUT=${bad} is refused" "HUB_BOOTSTRAP_TIMEOUT=${bad} is not a positive whole number of seconds; using 20" "${out}"
+done
+out="$(HERMES_HOME="${data_dir}" HUB_BOOTSTRAP_TIMEOUT=7 CI_HUB_URL="http://127.0.0.1:1" "${SCRIPT}" 2>&1 || true)"
+assert_not_contains "HUB_BOOTSTRAP_TIMEOUT=7 is accepted" "not a positive whole number" "${out}"
+rm -rf "${data_dir}"
 
 # ─── Summary ────────────────────────────────────────────────────────────────
 echo
