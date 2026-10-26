@@ -48,8 +48,21 @@ _PLUGIN_SRC_CANDIDATES = [
     _SCRIPT_DIR / "ci-context" / "plugins" / "companionintelligence",
 ]
 
+# Hermes reads $HERMES_HOME/config.yaml, and the image sets HERMES_HOME=/opt/data,
+# so /opt/data/config.yaml is the file that matters there. Without it in this list
+# the script waited 30 s for a file under /opt/data/.hermes that Hermes never
+# writes, and Memory's MCP server was never registered. The rest of the list
+# matches configure-hub-mcp.py.
+_HERMES_HOME_CONFIG = (
+    os.path.join(os.environ["HERMES_HOME"].strip(), "config.yaml")
+    if os.environ.get("HERMES_HOME", "").strip()
+    else None
+)
+
 CONFIG_PATHS = [
+    *([_HERMES_HOME_CONFIG] if _HERMES_HOME_CONFIG else []),
     os.path.expanduser("~/.hermes/config.yaml"),
+    "/opt/data/config.yaml",
     "/opt/data/.hermes/config.yaml",
     "/home/node/.hermes/config.yaml",
     "/root/.hermes/config.yaml",
@@ -60,7 +73,7 @@ def find_config() -> str:
     for path in CONFIG_PATHS:
         if os.path.exists(path):
             return path
-    preferred = "/opt/data/.hermes/config.yaml"
+    preferred = _HERMES_HOME_CONFIG or "/opt/data/config.yaml"
     os.makedirs(os.path.dirname(preferred), exist_ok=True)
     return preferred
 

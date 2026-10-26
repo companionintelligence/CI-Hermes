@@ -199,6 +199,39 @@ assert_contains "re-indented key updated" 'x-api-key: "sk-new-key"' "${out}"
 assert_not_contains "old key gone" "sk-old-key" "${out}"
 rm -rf "${data_dir}"
 
+# ─── Test 8: config.yaml directly in $HERMES_HOME (where Hermes keeps it) ────
+# The image sets HERMES_HOME=/opt/data and Hermes writes /opt/data/config.yaml.
+# The script only looked under */.hermes/, so it timed out after 30 s and Memory's
+# MCP server was never registered. HOME points elsewhere here so only the
+# $HERMES_HOME copy can be found.
+echo "test: a config.yaml at \$HERMES_HOME/config.yaml gets the ci_server block"
+data_dir="$(mktemp -d)"
+home_dir="$(mktemp -d)"
+printf 'model:\n  provider: ollama\n' > "${data_dir}/config.yaml"
+env -i PATH="${PATH}" HOME="${home_dir}" HERMES_HOME="${data_dir}" \
+  CI_SERVER_URL=http://ci-memory:8642 CI_SERVER_TOKEN=sk-home-1 \
+  timeout 20 python3 "${SCRIPT}" >/dev/null 2>&1 || true
+out="$(cat "${data_dir}/config.yaml")"
+assert_contains "ci_server registered in \$HERMES_HOME/config.yaml" 'url: "http://ci-memory:8642/api/mcp"' "${out}"
+assert_contains "api key written" 'x-api-key: "sk-home-1"' "${out}"
+assert_eq "nothing written under HOME" "" "$(ls -A "${home_dir}")"
+rm -rf "${data_dir}" "${home_dir}"
+
+# ─── Test 9: it waits for \$HERMES_HOME/config.yaml when that is not there yet ─
+echo "test: with no config yet, the script waits for \$HERMES_HOME/config.yaml"
+data_dir="$(mktemp -d)"
+home_dir="$(mktemp -d)"
+env -i PATH="${PATH}" HOME="${home_dir}" HERMES_HOME="${data_dir}" \
+  CI_SERVER_URL=http://ci-memory:8642 CI_SERVER_TOKEN=sk-late-1 \
+  timeout 20 python3 "${SCRIPT}" >/dev/null 2>&1 &
+pid=$!
+sleep 2
+printf 'model:\n  provider: ollama\n' > "${data_dir}/config.yaml"
+wait "${pid}" || true
+out="$(cat "${data_dir}/config.yaml")"
+assert_contains "ci_server registered once config.yaml appeared" 'x-api-key: "sk-late-1"' "${out}"
+rm -rf "${data_dir}" "${home_dir}"
+
 # ─── Summary ────────────────────────────────────────────────────────────────
 echo
 echo "Results: ${PASS} passed, ${FAIL} failed"
