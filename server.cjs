@@ -761,7 +761,7 @@ async function maybeServeMemoryGate(req, res, requestPath) {
     const stateUrl = memoryGate.buildStateUrl(hubBase, appUrn, req.headers.host);
 
     const resp = await fetch(stateUrl, {
-      headers: mcpAuthHeaders(),
+      headers: { ...mcpAuthHeaders(), ...memoryGate.forwardAuthHeaders(req) },
       signal: AbortSignal.timeout(4000),
     });
     if (!resp.ok) return false;
@@ -821,9 +821,11 @@ async function handleMemoryAction(req, res, requestPath) {
   const hubBase = hubInternalBase();
   if (appUrn && hubBase) {
     try {
+      // Whose choice this is: without the person's identity the Hub records the
+      // skip for the whole install (see memoryGate.forwardAuthHeaders).
       await fetch(`${hubBase}/api/memory-connect/apps/${encodeURIComponent(appUrn)}/skip`, {
         method: "POST",
-        headers: mcpAuthHeaders(),
+        headers: { ...mcpAuthHeaders(), ...memoryGate.forwardAuthHeaders(req) },
         signal: AbortSignal.timeout(4000),
       });
     } catch {
