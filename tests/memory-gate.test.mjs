@@ -177,8 +177,8 @@ describe("launcherWithNext", () => {
 describe("forwardAuthHeaders", () => {
   // The wrapper's /state and /skip calls are server to server, so the Hub only knows
   // which person opened Hermes if the wrapper passes on Traefik's signed identity.
-  // Without it "Don't ask again" was filed for the whole install, and one person's
-  // Disconnect Memory brought the prompt back for everyone.
+  // Without it "Don't ask again" was filed for the whole install. One person's
+  // Disconnect Memory then brought the prompt back for everyone.
   test("copies the signed Hub identity Traefik planted on the browser request", () => {
     const headers = forwardAuthHeaders({
       headers: {

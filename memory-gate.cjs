@@ -123,8 +123,10 @@ function launcherWithNext(launcher, nextUrl) {
  * filed "Don't ask again" on the install-wide row and answered `/state` from
  * whichever row changed last, so one person's disconnect brought the prompt back
  * for everyone. The Hub checks the signature against this app's forward-auth key
- * before it trusts the name. Absent headers are left out, and the Hub falls back
- * to the install-wide answer as before.
+ * before it trusts the name. When the headers are absent or don't verify, the Hub
+ * answers from the app's newest row, whoever it belongs to, as it did before. A
+ * "Don't ask again" filed install-wide before this change is not read for a
+ * person the Hub can name, so each of them is asked once more.
  */
 function forwardAuthHeaders(req) {
   const headers = req && req.headers ? req.headers : {};
