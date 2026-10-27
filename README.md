@@ -228,6 +228,27 @@ store's **Share crash reports** toggle, `CI_TELEMETRY=off` or
 See [docs/operations/error-reporting.md](docs/operations/error-reporting.md) for
 the privacy posture and the full redaction rules.
 
+<!-- companion-hub-readme-deep-review -->
+
+## Integration flow
+
+| Step | Service | What it provides |
+|---|---|---|
+| 1 | Companion Memory | Persistent memory API and the user-scoped API key |
+| 2 | Hermes | Agent runtime, memory provider, and callable CI intents |
+| 3 | Companion Hub (optional) | Platform tools through Hub MCP and configured inference |
+
+```mermaid
+flowchart LR
+  User --> Hermes[Hermes agent]
+  Hermes --> Memory[Companion Memory API]
+  Hermes --> Intents[CI intent catalog]
+  Hermes --> MCP[Companion Hub MCP]
+  MCP --> Tools[Installed Hub tools and apps]
+```
+
+The standalone memory provider can run without Hub MCP; Hub tools and Hub inference are optional integrations. Keep each service URL and credential in its own configuration and use the troubleshooting/error-reporting sections when a connection fails.
+
 ## License
 
 MIT
