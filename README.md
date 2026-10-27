@@ -4,7 +4,7 @@
 
 <p align="center"><strong>Web terminal and official Hermes dashboard for running Hermes Agent on the Companion Intelligence (CI) marketplace.</strong></p>
 
-<p align="center"><a href="https://hub.ci.computer/store/hermes">Website</a> · <a href="#license">License</a></p>
+<p align="center"><a href="https://hub.ci.computer/store/hermes">Website</a> · <a href="#license">License</a> · <a href="https://docs.ci.computer/docs/reference/open-source-systems">Systems map</a></p>
 
 
 
