@@ -1,9 +1,12 @@
 <img width="512" height="512" alt="logo" src="https://github.com/user-attachments/assets/85774db5-bd25-4b82-88b2-05d0a58c0b28" />
 
-# Hermes - Companion Memory Edition
+<h1 align="center">Hermes - Companion Memory Edition</h1>
+
+<p align="center"><strong>Web terminal and official Hermes dashboard for running Hermes Agent on the Companion Intelligence (CI) marketplace.</strong></p>
+
+<p align="center"><a href="https://hub.ci.computer/store/hermes">Website</a> · <a href="#license">License</a></p>
 
 
-> Web terminal and [official Hermes dashboard](https://hermes-agent.nousresearch.com/docs/user-guide/features/web-dashboard) for running [Hermes Agent](https://hermes-agent.nousresearch.com) on the Companion Intelligence (CI) marketplace.
 
 <img width="225" height="224" alt="logo-alt" src="https://github.com/user-attachments/assets/b4c0ae9d-9efc-43a1-986c-e829fd22add2" />
 
