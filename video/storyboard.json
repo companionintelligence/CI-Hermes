@@ -1,0 +1,265 @@
+{
+  "$schema": "https://raw.githubusercontent.com/companionintelligence/CI-Common/main/packages/video-kit/schema/storyboard.schema.json",
+  "app": {
+    "id": "ci-hermes",
+    "name": "Hermes",
+    "repo": "companionintelligence/CI-Hermes",
+    "marketplaceId": "ci-hermes",
+    "website": "ci.computer"
+  },
+  "meta": {
+    "fps": 30,
+    "transitionSeconds": 0.5,
+    "pacing": "fit",
+    "pacingTail": 0.15
+  },
+  "formats": [
+    "landscape"
+  ],
+  "chapters": {
+    "install": "Open it",
+    "memory": "Memory",
+    "tools": "Tools"
+  },
+  "media": {
+    "music": "assets/media/ci-campaign-bed-110.mp3",
+    "musicLufs": -22
+  },
+  "scenes": [
+    {
+      "id": "agent-memory-question",
+      "kind": "feature",
+      "seconds": 7.0,
+      "title": "Where does an agent keep what it learns about you?",
+      "caption": "That is a choice. Here it is yours.",
+      "narration": "An agent that remembers you has to keep that memory somewhere. With Hermes on Companion Hub, that somewhere is hardware you own.",
+      "items": [
+        {
+          "label": "Agent",
+          "value": "Hermes"
+        },
+        {
+          "label": "Installed from",
+          "value": "the Hub market"
+        },
+        {
+          "label": "Memory kept on",
+          "value": "your hardware"
+        }
+      ],
+      "reveal": "paced"
+    },
+    {
+      "id": "open",
+      "kind": "intro",
+      "seconds": 4.5,
+      "title": "Hermes",
+      "caption": "The Hermes agent, with Companion Memory built in.",
+      "narration": "This is Hermes, the Companion Memory edition.",
+      "mark": "./assets/app-icon.png",
+      "reveal": "paced",
+      "transition": "hold"
+    },
+    {
+      "id": "terminal",
+      "kind": "screen",
+      "chapter": "install",
+      "seconds": 8,
+      "caption": "Opens straight into chat. Ctrl+D drops to the shell.",
+      "narration": "Open it from the Hub and it drops you into chat. Press Control D when you want the shell for commands like hermes model.",
+      "shots": [
+        {
+          "id": "hermes-terminal",
+          "url": "<your-host>.companionintelligence.com/terminal",
+          "alt": "The Hermes web terminal as installed from the Hub market: a welcome banner explaining that Ctrl+D leaves chat for the shell, and an empty prompt.",
+          "motion": "push-in",
+          "focus": {
+            "landscape": {
+              "x": 0.19,
+              "y": 0,
+              "w": 0.62,
+              "h": 0.62
+            }
+          }
+        }
+      ]
+    },
+    {
+      "id": "model-follows-hub",
+      "kind": "feature",
+      "seconds": 8.0,
+      "title": "The model comes from your Hub",
+      "caption": "Local first. A cloud key sits beside it, never in front.",
+      "narration": "The model follows your Hub's inference settings. Add a cloud key in the Hub and it appears alongside the local model. It does not replace it.",
+      "items": [
+        {
+          "label": "Model",
+          "value": "follows your Hub"
+        },
+        {
+          "label": "Cloud keys",
+          "value": "added alongside"
+        },
+        {
+          "label": "Local backend",
+          "value": "stays the default"
+        }
+      ],
+      "reveal": "paced",
+      "chapter": "memory"
+    },
+    {
+      "id": "connect-memory",
+      "kind": "feature",
+      "seconds": 9.0,
+      "title": "Connect Companion Memory",
+      "caption": "Active after the first restart.",
+      "narration": "Memory is its own app. Install Companion Memory, create an A P I key in its settings, and paste it into the Hermes install dialog.",
+      "items": [
+        {
+          "label": "1",
+          "value": "Install Companion Memory"
+        },
+        {
+          "label": "2",
+          "value": "Settings, API Keys, create"
+        },
+        {
+          "label": "3",
+          "value": "Paste into the Hermes install dialog"
+        }
+      ],
+      "reveal": "paced",
+      "chapter": "memory"
+    },
+    {
+      "id": "recall",
+      "kind": "feature",
+      "seconds": 8.0,
+      "title": "It says when it remembered",
+      "caption": "Recall shows up beside the reply.",
+      "narration": "Once Hermes recalls something for a message, it tells you. You see a line beside the reply saying how many memories it used.",
+      "items": [
+        {
+          "label": "Provider",
+          "value": "Companion Memory"
+        },
+        {
+          "label": "Shown beside the reply",
+          "value": "recalled N memories"
+        },
+        {
+          "label": "Check it with",
+          "value": "hermes memory status"
+        }
+      ],
+      "reveal": "paced",
+      "chapter": "memory"
+    },
+    {
+      "id": "intents-as-tools",
+      "kind": "feature",
+      "seconds": 9.0,
+      "title": "Read-only intents become tools",
+      "caption": "The server refuses the rest on its own.",
+      "narration": "With memory connected, Hermes can call Companion's read-only intents as tools. Destructive or external ones are never registered, and the server refuses them anyway.",
+      "items": [
+        {
+          "label": "Callable",
+          "value": "read-only, on your appliance"
+        },
+        {
+          "label": "Destructive or external",
+          "value": "never registered"
+        },
+        {
+          "label": "If one is tried",
+          "value": "the server says no"
+        }
+      ],
+      "reveal": "paced",
+      "chapter": "tools"
+    },
+    {
+      "id": "hub-tools",
+      "kind": "feature",
+      "seconds": 8.0,
+      "title": "Hub tools are optional",
+      "caption": "Separate from memory. Off unless you want them.",
+      "narration": "Hub tools are a separate, optional connection. Memory works without them. Turn them on and Hermes can reach the platform and the apps you have installed.",
+      "items": [
+        {
+          "label": "Memory",
+          "value": "works without Hub tools"
+        },
+        {
+          "label": "Hub MCP",
+          "value": "optional"
+        },
+        {
+          "label": "Reaches",
+          "value": "installed Hub apps"
+        }
+      ],
+      "reveal": "paced",
+      "chapter": "tools"
+    },
+    {
+      "id": "recap",
+      "kind": "feature",
+      "seconds": 8.0,
+      "title": "What stays yours",
+      "caption": "One agent, one memory, both on your machine.",
+      "narration": "The agent runs in its own sandbox on your Hub, the memory is on your hardware, and the source is public.",
+      "items": [
+        {
+          "label": "Runs on",
+          "value": "your Hub"
+        },
+        {
+          "label": "Sandbox",
+          "value": "its own container"
+        },
+        {
+          "label": "Memory",
+          "value": "Companion Memory"
+        },
+        {
+          "label": "Source",
+          "value": "public, PolyForm Noncommercial"
+        }
+      ],
+      "reveal": "paced"
+    },
+    {
+      "id": "close",
+      "kind": "outro",
+      "seconds": 5,
+      "cta": "Install Hermes from the Hub market.",
+      "url": "hub.ci.computer/store/hermes",
+      "narration": "Hermes, from Companion Intelligence. UnCloud your life.",
+      "mark": "brand:logo.full"
+    }
+  ],
+  "deliverables": [
+    {
+      "id": "mobile",
+      "kind": "short",
+      "name": "Hermes, vertical",
+      "formats": [
+        "portrait"
+      ],
+      "scenes": [
+        "agent-memory-question",
+        "open",
+        "connect-memory",
+        "recall",
+        "intents-as-tools",
+        "close"
+      ],
+      "meta": {
+        "pacingTail": 0.1
+      }
+    }
+  ]
+}
