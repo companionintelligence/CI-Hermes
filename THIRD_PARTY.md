@@ -17,6 +17,9 @@ package manager's own `licenses` command.
 2. [`node-pty`](https://github.com/microsoft/node-pty) `1.1.0` — runtime
 3. [`ws`](https://github.com/websockets/ws) `8.21.3` — runtime
 
+## Upstream runtime (not an npm dependency)
+
+- [`NousResearch/hermes-agent`](https://github.com/NousResearch/hermes-agent) — MIT, Copyright Nous Research. Used as the base Docker image (`nousresearch/hermes-agent`); remains under its own license, not relicensed here.
 
 ---
 

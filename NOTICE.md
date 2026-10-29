@@ -14,7 +14,15 @@ licence (MIT, Apache-2.0, ISC, BSD or similar).
 
 Except as noted above, the contents of this repository are
 Copyright © LifeScope INC, DBA Companion Intelligence (<https://ci.computer>),
-licensed under the terms in [LICENSE](LICENSE) / [LICENSE.md](LICENSE.md).
+licensed under the [PolyForm Noncommercial License 1.0.0](LICENSE) (see also the [License FAQ](docs/License-FAQ.md)).
+
+Required Notice: Copyright LifeScope INC, DBA Companion Intelligence (https://ci.computer)
+
+## Upstream Hermes Agent
+
+This repository layers a wrapper on the upstream [Hermes Agent](https://github.com/NousResearch/hermes-agent)
+by Nous Research (image `nousresearch/hermes-agent`). Upstream remains under its own license (MIT, Copyright Nous Research);
+the PolyForm Noncommercial license above covers only the first-party code in this repository, not upstream.
 
 ---
 
