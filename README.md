@@ -1,23 +1,25 @@
+<p align="center">
 <img align="center" width="512" height="512" alt="logo" src="https://github.com/user-attachments/assets/85774db5-bd25-4b82-88b2-05d0a58c0b28" />
+  
+<img align="center" width="225" height="224" alt="logo-alt" src="https://github.com/user-attachments/assets/b4c0ae9d-9efc-43a1-986c-e829fd22add2" />
+</p>
 
 <h1 align="center">Hermes - Companion Memory Edition</h1>
 
-<p align="center"><strong>Web terminal and official Hermes dashboard for running Hermes Agent on the Companion Intelligence (CI) marketplace.</strong></p>
+<strong>Web terminal and official Hermes dashboard for running Hermes Agent on the Companion Intelligence (CI) marketplace.</strong>
+
+<a href="https://hub.ci.computer/store/hermes">Website</a> · <a href="#license">License</a> · <a href="https://docs.ci.computer/docs/reference/open-source-systems">Systems map</a> · <a href="ci-context/plugins/companionintelligence/README.md">Documentation</a>
+
+
+<a href="https://hub.ci.computer/store/hermes"><img src="https://img.shields.io/badge/Install%20Hermes%20in%20Hub-Install%20Hermes%20in%20Hub-0a6358?style=for-the-badge&logo=docker&logoColor=white" alt="Install Hermes in Hub" height="30"></a>
+ 
+
+## [Designed to run with Companion Memory](https://hub.ci.computer/store/ci-memory)
 
 [![release](https://img.shields.io/github/v/release/companionintelligence/CI-Hermes?style=flat-square&color=0a6358&label=release)](https://github.com/companionintelligence/CI-Hermes/releases/latest)
 [![platform](https://img.shields.io/badge/platform-Docker%20%C2%B7%20Companion%20Hub-0a6358?style=flat-square)](https://github.com/companionintelligence/CI-Hermes)
 [![License](https://img.shields.io/badge/license-MIT-2b7a3d?style=flat-square)](LICENSE)
 [![Discord](https://img.shields.io/badge/chat-Discord-5865F2?style=flat-square&logo=discord&logoColor=white)](https://discord.com/invite/yQp9hwpzAa)
-
-<p align="center"><a href="https://hub.ci.computer/store/hermes">Website</a> · <a href="#license">License</a> · <a href="https://docs.ci.computer/docs/reference/open-source-systems">Systems map</a> · <a href="ci-context/plugins/companionintelligence/README.md">Documentation</a></p>
-
-<p align="center">
-  <a href="https://hub.ci.computer/store/hermes"><img src="https://img.shields.io/badge/Install%20Hermes%20in%20Hub-Install%20Hermes%20in%20Hub-0a6358?style=for-the-badge&logo=docker&logoColor=white" alt="Install Hermes in Hub" height="30"></a>
-</p>
-
-<img align="center" width="225" height="224" alt="logo-alt" src="https://github.com/user-attachments/assets/b4c0ae9d-9efc-43a1-986c-e829fd22add2" />
-
-## [Designed to run with Companion Memory](https://hub.ci.computer/store/ci-memory)
 
 ### Connect Hermes to CI Memory
 
