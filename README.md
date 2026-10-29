@@ -18,7 +18,7 @@
 
 [![release](https://img.shields.io/github/v/release/companionintelligence/CI-Hermes?style=flat-square&color=0a6358&label=release)](https://github.com/companionintelligence/CI-Hermes/releases/latest)
 [![platform](https://img.shields.io/badge/platform-Docker%20%C2%B7%20Companion%20Hub-0a6358?style=flat-square)](https://github.com/companionintelligence/CI-Hermes)
-[![License](https://img.shields.io/badge/license-MIT-2b7a3d?style=flat-square)](LICENSE)
+[![License](https://img.shields.io/badge/license-PolyForm%20NC%201.0.0-2b7a3d?style=flat-square)](LICENSE)
 [![Discord](https://img.shields.io/badge/chat-Discord-5865F2?style=flat-square&logo=discord&logoColor=white)](https://discord.com/invite/yQp9hwpzAa)
 
 ### Connect Hermes to CI Memory
@@ -289,4 +289,6 @@ The standalone memory provider can run without Hub MCP; Hub tools and Hub infere
 
 ## License
 
-MIT
+Companion Hermes is free and public under the [PolyForm Noncommercial License 1.0.0](LICENSE). See the [License FAQ](docs/License-FAQ.md) for common questions.
+
+The upstream [Hermes Agent](https://github.com/NousResearch/hermes-agent) that this wrapper builds on is a separate project, licensed by Nous Research under the MIT License; that license continues to apply to upstream code. See [NOTICE.md](NOTICE.md).

@@ -242,4 +242,4 @@ delete it after extracting; nothing depends on it.
 
 ## License
 
-MIT
+[PolyForm Noncommercial License 1.0.0](../../../LICENSE).
