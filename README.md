@@ -1,9 +1,19 @@
 <img width="512" height="512" alt="logo" src="https://github.com/user-attachments/assets/85774db5-bd25-4b82-88b2-05d0a58c0b28" />
 
-# Hermes - Companion Memory Edition
+<h1 align="center">Hermes - Companion Memory Edition</h1>
 
+<p align="center"><strong>Web terminal and official Hermes dashboard for running Hermes Agent on the Companion Intelligence (CI) marketplace.</strong></p>
 
-> Web terminal and [official Hermes dashboard](https://hermes-agent.nousresearch.com/docs/user-guide/features/web-dashboard) for running [Hermes Agent](https://hermes-agent.nousresearch.com) on the Companion Intelligence (CI) marketplace.
+[![release](https://img.shields.io/github/v/release/companionintelligence/CI-Hermes?style=flat-square&color=0a6358&label=release)](https://github.com/companionintelligence/CI-Hermes/releases/latest)
+[![platform](https://img.shields.io/badge/platform-Docker%20%C2%B7%20Companion%20Hub-0a6358?style=flat-square)](https://github.com/companionintelligence/CI-Hermes)
+[![License](https://img.shields.io/badge/license-MIT-2b7a3d?style=flat-square)](LICENSE)
+[![Discord](https://img.shields.io/badge/chat-Discord-5865F2?style=flat-square&logo=discord&logoColor=white)](https://discord.com/invite/yQp9hwpzAa)
+
+<p align="center"><a href="https://hub.ci.computer/store/hermes">Website</a> · <a href="#license">License</a> · <a href="https://docs.ci.computer/docs/reference/open-source-systems">Systems map</a> · <a href="ci-context/plugins/companionintelligence/README.md">Documentation</a></p>
+
+<p align="center">
+  <a href="https://hub.ci.computer/store/hermes"><img src="https://img.shields.io/badge/Install%20Hermes%20in%20Hub-Install%20Hermes%20in%20Hub-0a6358?style=for-the-badge&logo=docker&logoColor=white" alt="Install Hermes in Hub" height="30"></a>
+</p>
 
 <img width="225" height="224" alt="logo-alt" src="https://github.com/user-attachments/assets/b4c0ae9d-9efc-43a1-986c-e829fd22add2" />
 
@@ -97,9 +107,18 @@ touching the Hermes terminal:
 > `hermes model` and `hermes doctor`. Press `Ctrl+D` from chat any time you need
 > the shell.
 
-
-
 ⚠️ WARNING: Running this on systems other than the CI marketplace is likely very insecure. This configuration is only secure when running behind the CI app proxy.
+
+
+## Features
+
+| Feature | What it provides |
+|---|---|
+| **Hermes runtime** | Run the upstream agent runtime and its web terminal as a Hub app. |
+| **Memory provider** | Install a versioned provider for Companion Memory search and writes. |
+| **CI intent tools** | Expose selected Companion Intelligence intents to Hermes. |
+| **Optional Hub tools** | Connect to Hub MCP separately for platform and installed-app tools. |
+
 
 ## What is this?
 
@@ -111,6 +130,19 @@ This repo builds the CI marketplace wrapper image for Hermes Agent. It does not 
 - A separate gateway container using the same wrapper image with a CI gateway entrypoint that launches Hermes in `gateway run` mode for messaging platform integrations
 - Sandboxing so Hermes runs in its own environment that can't mess up other CI apps
 - CI-specific runtime context and a `ci` skill, wired through Hermes' supported plugin/skills surfaces so the agent understands its containerized CI environment
+
+
+## How it fits together
+
+Hub installs and proxies the containerized Hermes runtime; the CI provider connects Hermes to Memory, while Hub MCP remains a separate optional platform-tools connection.
+
+```mermaid
+flowchart LR
+  Hub[Companion Hub install and proxy] --> Hermes[Hermes runtime]
+  Hermes --> Provider[CI memory provider]
+  Provider --> Memory[Companion Memory API]
+  Hermes -. optional .-> MCP[Hub MCP tools]
+```
 
 ## Architecture
 
@@ -231,6 +263,27 @@ store's **Share crash reports** toggle, `CI_TELEMETRY=off` or
 
 See [docs/operations/error-reporting.md](docs/operations/error-reporting.md) for
 the privacy posture and the full redaction rules.
+
+<!-- companion-hub-readme-deep-review -->
+
+## Integration flow
+
+| Step | Service | What it provides |
+|---|---|---|
+| 1 | Companion Memory | Persistent memory API and the user-scoped API key |
+| 2 | Hermes | Agent runtime, memory provider, and callable CI intents |
+| 3 | Companion Hub (optional) | Platform tools through Hub MCP and configured inference |
+
+```mermaid
+flowchart LR
+  User --> Hermes[Hermes agent]
+  Hermes --> Memory[Companion Memory API]
+  Hermes --> Intents[CI intent catalog]
+  Hermes --> MCP[Companion Hub MCP]
+  MCP --> Tools[Installed Hub tools and apps]
+```
+
+The standalone memory provider can run without Hub MCP; Hub tools and Hub inference are optional integrations. Keep each service URL and credential in its own configuration and use the troubleshooting/error-reporting sections when a connection fails.
 
 ## License
 
