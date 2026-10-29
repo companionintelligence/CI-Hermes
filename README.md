@@ -1,4 +1,4 @@
-<img width="512" height="512" alt="logo" src="https://github.com/user-attachments/assets/85774db5-bd25-4b82-88b2-05d0a58c0b28" />
+<img align="center" width="512" height="512" alt="logo" src="https://github.com/user-attachments/assets/85774db5-bd25-4b82-88b2-05d0a58c0b28" />
 
 <h1 align="center">Hermes - Companion Memory Edition</h1>
 
@@ -15,7 +15,7 @@
   <a href="https://hub.ci.computer/store/hermes"><img src="https://img.shields.io/badge/Install%20Hermes%20in%20Hub-Install%20Hermes%20in%20Hub-0a6358?style=for-the-badge&logo=docker&logoColor=white" alt="Install Hermes in Hub" height="30"></a>
 </p>
 
-<img width="225" height="224" alt="logo-alt" src="https://github.com/user-attachments/assets/b4c0ae9d-9efc-43a1-986c-e829fd22add2" />
+<img align="center" width="225" height="224" alt="logo-alt" src="https://github.com/user-attachments/assets/b4c0ae9d-9efc-43a1-986c-e829fd22add2" />
 
 ## [Designed to run with Companion Memory](https://hub.ci.computer/store/ci-memory)
 
