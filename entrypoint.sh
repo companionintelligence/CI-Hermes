@@ -11,7 +11,7 @@ source "${CI_HERMES_VENV:-/opt/hermes/.venv}/bin/activate"
 # Pull inference config from the Hub first: it writes .env.hub-bootstrap and makes
 # config.yaml follow the handout (generating it on first boot) before the MCP
 # configurators run.
-"${APP_DIR}/bootstrap-from-hub.sh" || true
+"${APP_DIR}/bootstrap-from-hub.sh" --retry-in-background || true
 
 "${APP_DIR}/bootstrap-ci-context.sh"
 

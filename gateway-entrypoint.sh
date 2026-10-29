@@ -9,7 +9,7 @@ APP_DIR="${CI_HERMES_APP_DIR:-/app}"
 source "${CI_HERMES_VENV:-/opt/hermes/.venv}/bin/activate"
 
 # Hub bootstrap first — config.yaml must exist before MCP configurators run.
-"${APP_DIR}/bootstrap-from-hub.sh" || true
+"${APP_DIR}/bootstrap-from-hub.sh" --retry-in-background || true
 
 "${APP_DIR}/bootstrap-ci-context.sh"
 

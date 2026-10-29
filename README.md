@@ -202,6 +202,13 @@ resolves for `provider: ollama`) and `auxiliary.*` side-task routing.
   whose window is under 64,000 tokens, the previous Hub model is kept; either way the
   problem is logged as an `ERROR` and printed at the top of the web terminal
   (`/opt/data/.hub-inference-warning`).
+- **A Hub that isn't up yet is asked again.** Right after a reboot Hermes can start
+  before the Hub listens. Both containers then keep the last handout and ask again
+  every 30 s (`HUB_BOOTSTRAP_RETRY_INTERVAL`) until the Hub answers once. The answer
+  is applied as at start. The model and the Hub's own endpoint reach the running
+  processes through `config.yaml`; a cloud endpoint travels in env and reaches them
+  at their next start. An HTTP error or an empty answer ends the asking. Terminal
+  sessions fetch on their own each time they open.
 - **A cloud handout does not displace the Hub endpoint.** The Hub hands out a cloud
   provider when its local inference is down as the app starts; CI-Hermes logs it and
   stays on the local endpoint rather than moving conversations to a paid provider.
