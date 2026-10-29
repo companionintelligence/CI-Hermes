@@ -757,6 +757,147 @@ out="$(HERMES_HOME="${data_dir}" HUB_BOOTSTRAP_TIMEOUT=7 CI_HUB_URL="http://127.
 assert_not_contains "HUB_BOOTSTRAP_TIMEOUT=7 is accepted" "not a positive whole number" "${out}"
 rm -rf "${data_dir}"
 
+# ─── Test 29: --retry-in-background keeps asking a Hub that isn't up yet ──────
+# Right after a reboot the app can start before the Hub listens. The entrypoints pass
+# --retry-in-background: the start-up run keeps the last handout and returns at once.
+# A background loop then asks again every HUB_BOOTSTRAP_RETRY_INTERVAL seconds until
+# the Hub answers once. A missing fixture file is a Hub that can't be reached.
+stop_loop() {  # $1 log file: stop the loop it names along with its sleep
+  local pid
+  pid="$(sed -n 's/.*until it answers (pid \([0-9]*\)).*/\1/p' "$1" | head -1)"
+  [[ -n "${pid}" ]] || return 0
+  pkill -P "${pid}" 2>/dev/null || true
+  kill "${pid}" 2>/dev/null || true
+}
+
+wait_for() {  # $1 seconds, then a command that must succeed
+  local tries=$(( $1 * 10 ))
+  shift
+  for ((i = 0; i < tries; i++)); do
+    "$@" && return 0
+    sleep 0.1
+  done
+  return 1
+}
+
+echo "test: --retry-in-background applies the handout once the Hub answers, then stops"
+data_dir="$(mktemp -d)"
+fixture_file="${data_dir}/hub-not-up-yet.env"
+log_file="$(mktemp)"
+printf 'HERMES_OPENAI_BASE_URL=http://old-host:11434/v1\nHERMES_OPENAI_API_KEY=ollama\nHERMES_DEFAULT_MODEL=old-model\n' > "${data_dir}/.env.hub-bootstrap"
+started="$(date +%s)"
+rc=0
+HERMES_HOME="${data_dir}" BOOTSTRAP_FIXTURE_FILE="${fixture_file}" HUB_BOOTSTRAP_RETRY_INTERVAL=1 \
+  "${SCRIPT}" --retry-in-background > "${log_file}" 2>&1 || rc=$?
+elapsed=$(( $(date +%s) - started ))
+assert_eq "start-up run exits 0 while the Hub is down" "0" "${rc}"
+if (( elapsed < 3 )); then
+  echo "  ✓ start-up run returns without waiting for the Hub (${elapsed} s)"; PASS=$((PASS + 1))
+else
+  echo "  ✗ start-up run took ${elapsed} s"; FAIL=$((FAIL + 1))
+fi
+assert_contains "says it will ask again" "asking the Hub again every 1 s until it answers" "$(cat "${log_file}")"
+assert_contains "keeps the last handout meanwhile" "HERMES_DEFAULT_MODEL=old-model" "$(cat "${data_dir}/.env.hub-bootstrap")"
+
+sleep 2.5
+assert_contains "still on the last handout while the Hub stays down" "HERMES_DEFAULT_MODEL=old-model" "$(cat "${data_dir}/.env.hub-bootstrap")"
+
+printf 'HERMES_OPENAI_BASE_URL=http://new-host:11434/v1\nHERMES_OPENAI_API_KEY=ollama\nHERMES_DEFAULT_MODEL=qwen3.5:9b\nHERMES_NUM_CTX=65536\n' > "${fixture_file}"
+wait_for 10 grep -q 'qwen3.5:9b' "${data_dir}/.env.hub-bootstrap" || true
+assert_contains "applies the handout once the Hub answers" "HERMES_DEFAULT_MODEL=qwen3.5:9b" "$(cat "${data_dir}/.env.hub-bootstrap")"
+assert_contains "logs that the Hub answered" "the Hub answered; applying its handout" "$(cat "${log_file}")"
+if python3 -c "import yaml" 2>/dev/null; then
+  wait_for 10 grep -q 'qwen3.5:9b' "${data_dir}/config.yaml" || true
+  assert_contains "config.yaml follows the late handout" "qwen3.5:9b" "$(cat "${data_dir}/config.yaml" 2>/dev/null)"
+fi
+wait_for 10 grep -q 'CI context:' "${log_file}" || true
+assert_contains "runs the rest of start-up too" "CI context:" "$(cat "${log_file}")"
+assert_not_contains "a local endpoint needs no restart" "use them from their next start" "$(cat "${log_file}")"
+
+# One answer is enough: a later change is left to the next start.
+printf 'HERMES_OPENAI_BASE_URL=http://new-host:11434/v1\nHERMES_OPENAI_API_KEY=ollama\nHERMES_DEFAULT_MODEL=later-model\n' > "${fixture_file}"
+sleep 2.5
+assert_not_contains "stops asking after the first answer" "later-model" "$(cat "${data_dir}/.env.hub-bootstrap")"
+assert_eq "applied once" "1" "$(grep -c 'the Hub answered' "${log_file}")"
+stop_loop "${log_file}"
+rm -rf "${data_dir}" "${log_file}"
+
+echo "test: a late cloud handout says the running processes keep their endpoint"
+data_dir="$(mktemp -d)"
+fixture_file="${data_dir}/hub-not-up-yet.env"
+log_file="$(mktemp)"
+HERMES_HOME="${data_dir}" BOOTSTRAP_FIXTURE_FILE="${fixture_file}" HUB_BOOTSTRAP_RETRY_INTERVAL=1 \
+  "${SCRIPT}" --retry-in-background > "${log_file}" 2>&1 || true
+printf 'HERMES_OPENAI_BASE_URL=https://api.example.com/v1\nHERMES_OPENAI_API_KEY=sk-cloud\nHERMES_DEFAULT_MODEL=gpt-4o\n' > "${fixture_file}"
+wait_for 10 grep -q 'use them from their next start' "${log_file}" || true
+assert_contains "warns that env-carried settings wait for a restart" "the dashboard and gateway use them from their next start" "$(cat "${log_file}")"
+stop_loop "${log_file}"
+rm -rf "${data_dir}" "${log_file}"
+
+echo "test: an empty answer ends the asking"
+data_dir="$(mktemp -d)"
+fixture_file="${data_dir}/hub-not-up-yet.env"
+log_file="$(mktemp)"
+HERMES_HOME="${data_dir}" BOOTSTRAP_FIXTURE_FILE="${fixture_file}" HUB_BOOTSTRAP_RETRY_INTERVAL=1 \
+  "${SCRIPT}" --retry-in-background > "${log_file}" 2>&1 || true
+: > "${fixture_file}"
+wait_for 10 grep -q 'answered with an empty handout' "${log_file}" || true
+assert_contains "stops on an empty handout" "the Hub answered with an empty handout; keeping the last one" "$(cat "${log_file}")"
+stop_loop "${log_file}"
+rm -rf "${data_dir}" "${log_file}"
+
+if command -v python3 >/dev/null 2>&1 && command -v curl >/dev/null 2>&1; then
+  echo "test: a Hub that answers with an error ends the asking"
+  data_dir="$(mktemp -d)"
+  log_file="$(mktemp)"
+  port="$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1]); s.close()')"
+  HERMES_HOME="${data_dir}" CI_HUB_URL="http://127.0.0.1:${port}" HUB_BOOTSTRAP_RETRY_INTERVAL=1 HUB_BOOTSTRAP_TIMEOUT=2 \
+    "${SCRIPT}" --retry-in-background > "${log_file}" 2>&1 || true
+  # The Hub comes up, but this one doesn't know the app (an older Hub, a wrong slug).
+  python3 -c '
+import http.server, sys
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(404); self.send_header("Content-Length", "0"); self.end_headers()
+    def log_message(self, *a): pass
+http.server.ThreadingHTTPServer(("127.0.0.1", int(sys.argv[1])), H).serve_forever()
+' "${port}" &
+  hub_pid=$!
+  wait_for 15 grep -q 'answered with an error' "${log_file}" || true
+  assert_contains "stops on an HTTP error" "the Hub answered with an error; keeping the last handout until the next start" "$(cat "${log_file}")"
+  kill "${hub_pid}" 2>/dev/null || true
+  stop_loop "${log_file}"
+  rm -rf "${data_dir}" "${log_file}"
+fi
+
+echo "test: without --retry-in-background nothing asks again"
+data_dir="$(mktemp -d)"
+fixture_file="${data_dir}/hub-not-up-yet.env"
+log_file="$(mktemp)"
+HERMES_HOME="${data_dir}" BOOTSTRAP_FIXTURE_FILE="${fixture_file}" HUB_BOOTSTRAP_RETRY_INTERVAL=1 \
+  "${SCRIPT}" > "${log_file}" 2>&1 || true
+printf 'HERMES_DEFAULT_MODEL=qwen3.5:9b\nHERMES_OPENAI_API_KEY=ollama\n' > "${fixture_file}"
+sleep 2.5
+assert_not_contains "a terminal session's run doesn't loop" "asking the Hub again" "$(cat "${log_file}")"
+if [[ -e "${data_dir}/.env.hub-bootstrap" ]]; then
+  echo "  ✗ wrote a handout nobody asked for again"; FAIL=$((FAIL + 1))
+else
+  echo "  ✓ no handout written after the start-up run"; PASS=$((PASS + 1))
+fi
+rm -rf "${data_dir}" "${log_file}"
+
+echo "test: HUB_BOOTSTRAP_RETRY_INTERVAL=0 or a non-number falls back to 30 s"
+for bad in 0 abc; do
+  data_dir="$(mktemp -d)"
+  log_file="$(mktemp)"
+  HERMES_HOME="${data_dir}" BOOTSTRAP_FIXTURE_FILE="${data_dir}/missing.env" HUB_BOOTSTRAP_RETRY_INTERVAL="${bad}" \
+    "${SCRIPT}" --retry-in-background > "${log_file}" 2>&1 || true
+  assert_contains "HUB_BOOTSTRAP_RETRY_INTERVAL=${bad} is refused" "HUB_BOOTSTRAP_RETRY_INTERVAL=${bad} is not a positive whole number of seconds; using 30" "$(cat "${log_file}")"
+  assert_contains "and the loop waits 30 s" "asking the Hub again every 30 s until it answers" "$(cat "${log_file}")"
+  stop_loop "${log_file}"
+  rm -rf "${data_dir}" "${log_file}"
+done
+
 # ─── Summary ────────────────────────────────────────────────────────────────
 echo
 echo "Results: ${PASS} passed, ${FAIL} failed"

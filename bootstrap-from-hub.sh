@@ -6,6 +6,14 @@
 # and exits 0 so container start still succeeds — Hermes will fall back to
 # its own setup wizard for credentials.
 #
+# --retry-in-background (the two container entrypoints): when the Hub can't be
+# reached, keep the last handout as above and also ask again every
+# HUB_BOOTSTRAP_RETRY_INTERVAL seconds from a background loop until the Hub answers
+# once. A Hub still starting after a reboot is the usual case. The answer is applied
+# as at start (this script, then bootstrap-ci-context.sh). config.yaml carries the
+# model and the Hub's own endpoint into the running processes. Terminal sessions
+# don't pass it: each one fetches again anyway.
+#
 # POSIX sh — no bashisms. Runs in any /bin/sh including dash.
 #
 # Inputs:
@@ -14,6 +22,7 @@
 #   HUB_APP_SLUG     App slug to bootstrap as     (default: hermes-agent)
 #   HERMES_HOME      Hermes data dir              (default: /opt/data)
 #   HUB_BOOTSTRAP_TIMEOUT    Whole seconds to wait for each handout request (default: 20)
+#   HUB_BOOTSTRAP_RETRY_INTERVAL  Whole seconds between tries with --retry-in-background (default: 30)
 #   BOOTSTRAP_FIXTURE_FILE   For tests: read body from this file instead of curling
 #
 # Outputs:
@@ -42,8 +51,9 @@ log() {
 
 fetch_bootstrap() {
   if [ -n "${BOOTSTRAP_FIXTURE_FILE:-}" ]; then
+    # A missing fixture is a Hub that can't be reached.
     cat "${BOOTSTRAP_FIXTURE_FILE}"
-    return 0
+    return
   fi
   url="${CI_HUB_URL}/api/inference/apps/${HUB_APP_SLUG}/credentials.env"
   # The Hub's first handout after it starts can take 10 s or more: it probes Ollama
@@ -57,18 +67,76 @@ fetch_bootstrap() {
     --retry 1 --retry-delay 2 "${url}"
 }
 
+positive_seconds() {
+  # $1: variable name, $2: default. Its value as whole seconds, or the default with
+  # a warning for 0 or a non-number.
+  eval "t=\"\${$1:-}\""
+  case "${t}" in
+    '') echo "$2"; return 0 ;;
+    *[!0-9]*) ;;
+    *) if [ "${t}" -gt 0 ] 2>/dev/null; then echo "${t}"; return 0; fi ;;
+  esac
+  log "WARN: $1=${t} is not a positive whole number of seconds; using $2" >&2
+  echo "$2"
+}
+
 handout_timeout() {
   # HUB_BOOTSTRAP_TIMEOUT as curl --max-time. curl reads 0 as "no limit", so a Hub
   # that stalls would hang the container start. It exits at once on a non-number,
   # so every handout would be skipped. Either value falls back to 20 s.
-  t="${HUB_BOOTSTRAP_TIMEOUT:-}"
-  case "${t}" in
-    '') echo 20; return 0 ;;
-    *[!0-9]*) ;;
-    *) if [ "${t}" -gt 0 ] 2>/dev/null; then echo "${t}"; return 0; fi ;;
-  esac
-  log "WARN: HUB_BOOTSTRAP_TIMEOUT=${t} is not a positive whole number of seconds; using 20" >&2
-  echo 20
+  positive_seconds HUB_BOOTSTRAP_TIMEOUT 20
+}
+
+retry_in_background() {
+  # The loop keeps this script's stdout and stderr, which the entrypoints hand to the
+  # container log. A caller that captures or pipes the output would wait for the loop
+  # to end, so only the entrypoints pass --retry-in-background. Each container runs
+  # its own loop, as each runs its own start-up: both write the shared files with an
+  # atomic rename.
+  interval="$(positive_seconds HUB_BOOTSTRAP_RETRY_INTERVAL 30)"
+  # What the processes about to start load from the env file, to tell later whether
+  # the answer changed anything only env carries.
+  started_env=""
+  if [ -f "${OUT_ENV}" ]; then
+    started_env="$(env_carried < "${OUT_ENV}")"
+  fi
+  (
+    set +e
+    while :; do
+      sleep "${interval}"
+      body="$(fetch_bootstrap)"
+      rc=$?
+      if [ "${rc}" -eq 22 ]; then
+        # curl --fail: the Hub is up and refused (a 404 from an older Hub, a 401).
+        # Asking again won't change that.
+        log "WARN: the Hub answered with an error; keeping the last handout until the next start"
+        exit 0
+      fi
+      if [ "${rc}" -ne 0 ]; then
+        continue
+      fi
+      if [ -z "${body}" ]; then
+        log "WARN: the Hub answered with an empty handout; keeping the last one"
+        exit 0
+      fi
+      log "the Hub answered; applying its handout"
+      if ! apply_handout "${body}"; then
+        exit 0
+      fi
+      "${SCRIPT_DIR}/bootstrap-ci-context.sh" || log "ERROR: bootstrap-ci-context.sh failed after the late handout"
+      if [ "$(env_carried < "${OUT_ENV}")" != "${started_env}" ]; then
+        log "WARN: the handout changed settings that travel in env (a cloud endpoint or key); the dashboard and gateway use them from their next start"
+      fi
+      exit 0
+    done
+  ) </dev/null &
+  log "asking the Hub again every ${interval} s until it answers (pid $!)"
+}
+
+env_carried() {
+  # stdin: env lines. The ones hub-env.sh exports that config.yaml can't carry: a
+  # cloud provider's endpoint and key.
+  grep -E '^(CUSTOM_BASE_URL|CUSTOM_API_KEY|OPENAI_BASE_URL|OPENAI_API_BASE|OPENAI_API_KEY)=' | sort || true
 }
 
 translate_keys() {
@@ -205,6 +273,11 @@ normalize_env_value() {
 }
 
 main() {
+  retry=0
+  if [ "${1:-}" = "--retry-in-background" ]; then
+    retry=1
+  fi
+
   if [ ! -d "${DATA_DIR}" ]; then
     log "WARN: ${DATA_DIR} does not exist; skipping"
     exit 0
@@ -232,8 +305,18 @@ main() {
       fi
       reconcile_config
     fi
+    if [ "${retry}" = 1 ]; then
+      retry_in_background
+    fi
     exit 0
   fi
+
+  apply_handout "${body}" || true
+}
+
+apply_handout() {
+  # $1: the handout body, as the Hub sent it.
+  body="$1"
 
   # Detect the Hub's own endpoint (api_key sentinel "ollama") vs a cloud provider:
   # only a cloud provider's endpoint travels in env.
@@ -241,11 +324,14 @@ main() {
 
   # Temp files live beside the output so the final mv is an atomic rename: the web
   # and gateway containers share this directory and start together.
-  tmp="$(mktemp "${OUT_ENV}.XXXXXX")"
+  if ! tmp="$(mktemp "${OUT_ENV}.XXXXXX")"; then
+    log "ERROR: cannot write beside ${OUT_ENV}; keeping the last handout"
+    return 1
+  fi
   if ! printf '%s\n' "${body}" | translate_keys "${is_local_ollama}" | sanitize_env "${is_local_ollama}" > "${tmp}"; then
     rm -f "${tmp}"
     log "ERROR: translate_keys failed"
-    exit 0
+    return 1
   fi
 
   gateway_ip="$(detect_docker_gateway_ip || true)"
@@ -261,7 +347,11 @@ main() {
   fi
 
   chmod 600 "${tmp}" 2>/dev/null || true
-  mv "${tmp}" "${OUT_ENV}"
+  if ! mv "${tmp}" "${OUT_ENV}"; then
+    rm -f "${tmp}"
+    log "ERROR: could not replace ${OUT_ENV}; keeping the last handout"
+    return 1
+  fi
   log "wrote ${OUT_ENV} ($(wc -l < "${OUT_ENV}" | tr -d ' ') lines)"
 
   reconcile_config
