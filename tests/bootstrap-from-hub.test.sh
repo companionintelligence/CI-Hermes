@@ -25,7 +25,9 @@ assert_eq() {
 
 assert_contains() {
   local label="$1" needle="$2" haystack="$3"
-  if echo "${haystack}" | grep -qF "${needle}"; then
+  # A here-string, not echo | grep -q: under pipefail grep -q exiting on the first
+  # match can kill echo with SIGPIPE and turn a match into a miss.
+  if grep -qF -- "${needle}" <<< "${haystack}"; then
     echo "  ✓ ${label}"
     PASS=$((PASS + 1))
   else
@@ -38,7 +40,9 @@ assert_contains() {
 
 assert_not_contains() {
   local label="$1" needle="$2" haystack="$3"
-  if echo "${haystack}" | grep -qF "${needle}"; then
+  # A here-string, not echo | grep -q: under pipefail grep -q exiting on the first
+  # match can kill echo with SIGPIPE and turn a match into a miss.
+  if grep -qF -- "${needle}" <<< "${haystack}"; then
     echo "  ✗ ${label}"
     echo "    expected to NOT contain: ${needle}"
     echo "    in:                      ${haystack}"
@@ -869,6 +873,28 @@ assert_contains "stops on an empty handout" "the Hub answered with an empty hand
 stop_loop "${log_file}"
 rm -rf "${data_dir}" "${log_file}"
 
+# Root reads a mode 000 file anyway, so there is nothing to test as root.
+if [[ "$(id -u)" != "0" ]]; then
+  echo "test: an env file the container can't read still starts the asking"
+  # An older image wrote it as root with mode 600; the container now runs as a user.
+  data_dir="$(mktemp -d)"
+  fixture_file="${data_dir}/hub-not-up-yet.env"
+  log_file="$(mktemp)"
+  printf 'HERMES_DEFAULT_MODEL=old-model\n' > "${data_dir}/.env.hub-bootstrap"
+  chmod 000 "${data_dir}/.env.hub-bootstrap"
+  rc=0
+  HERMES_HOME="${data_dir}" BOOTSTRAP_FIXTURE_FILE="${fixture_file}" HUB_BOOTSTRAP_RETRY_INTERVAL=1 \
+    "${SCRIPT}" --retry-in-background > "${log_file}" 2>&1 || rc=$?
+  assert_eq "start-up run exits 0 with an unreadable env file" "0" "${rc}"
+  assert_contains "still says it will ask again" "asking the Hub again every 1 s until it answers" "$(cat "${log_file}")"
+  put_fixture "${fixture_file}" $'HERMES_OPENAI_BASE_URL=http://new-host:11434/v1\nHERMES_OPENAI_API_KEY=ollama\nHERMES_DEFAULT_MODEL=qwen3.5:9b\n'
+  wait_for 10 grep -q 'qwen3.5:9b' "${data_dir}/.env.hub-bootstrap" 2>/dev/null || true
+  assert_contains "the late handout replaces it" "HERMES_DEFAULT_MODEL=qwen3.5:9b" "$(cat "${data_dir}/.env.hub-bootstrap" 2>/dev/null || true)"
+  stop_loop "${log_file}"
+  chmod 600 "${data_dir}/.env.hub-bootstrap" 2>/dev/null || true
+  rm -rf "${data_dir}" "${log_file}"
+fi
+
 status_hub() {  # $1 port, $2 file holding the HTTP status to answer with
   python3 -c '
 import http.server, sys
@@ -927,6 +953,39 @@ if command -v python3 >/dev/null 2>&1 && command -v curl >/dev/null 2>&1; then
   wait "${hub_pid}" 2>/dev/null || true
   stop_loop "${log_file}"
   rm -rf "${data_dir}" "${log_file}"
+
+  echo "test: a Hub that settles just before the status check is asked again"
+  # 503 to the first four requests: both start-up tries and both tries of the first
+  # loop round. The status check after them is the first to get a 200.
+  data_dir="$(mktemp -d)"
+  log_file="$(mktemp)"
+  port_file="$(mktemp)"
+  python3 -c '
+import http.server, sys
+seen = [0]
+class H(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        seen[0] += 1
+        code = 503 if seen[0] <= 4 else 200
+        body = b"HERMES_DEFAULT_MODEL=qwen3.5:9b\nHERMES_OPENAI_API_KEY=ollama\n" if code == 200 else b""
+        self.send_response(code); self.send_header("Content-Length", str(len(body))); self.end_headers()
+        self.wfile.write(body)
+    def log_message(self, *a): pass
+s = http.server.HTTPServer(("127.0.0.1", 0), H)
+open(sys.argv[1], "w").write(str(s.server_address[1]))
+s.serve_forever()
+' "${port_file}" &
+  hub_pid=$!
+  wait_for 5 test -s "${port_file}" || true
+  HERMES_HOME="${data_dir}" CI_HUB_URL="http://127.0.0.1:$(cat "${port_file}")" HUB_BOOTSTRAP_RETRY_INTERVAL=1 HUB_BOOTSTRAP_TIMEOUT=2 \
+    "${SCRIPT}" --retry-in-background > "${log_file}" 2>&1 || true
+  wait_for 15 grep -q 'qwen3.5:9b' "${data_dir}/.env.hub-bootstrap" 2>/dev/null || true
+  assert_not_contains "a 200 to the status check doesn't end the asking" "answered with an error" "$(cat "${log_file}")"
+  assert_contains "applies the handout on the next try" "HERMES_DEFAULT_MODEL=qwen3.5:9b" "$(cat "${data_dir}/.env.hub-bootstrap" 2>/dev/null || true)"
+  kill "${hub_pid}" 2>/dev/null || true
+  wait "${hub_pid}" 2>/dev/null || true
+  stop_loop "${log_file}"
+  rm -rf "${data_dir}" "${log_file}" "${port_file}"
 fi
 
 echo "test: without --retry-in-background nothing asks again"

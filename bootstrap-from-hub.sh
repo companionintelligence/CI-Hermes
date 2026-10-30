@@ -100,8 +100,10 @@ retry_in_background() {
   interval="$(positive_seconds HUB_BOOTSTRAP_RETRY_INTERVAL 30)"
   # What the processes about to start load from the env file, to tell later whether
   # the answer changed anything only env carries.
+  # -r, not -f: under set -e an unreadable file (one an older image wrote as root)
+  # would end the script here, before the loop starts.
   started_env=""
-  if [ -f "${OUT_ENV}" ]; then
+  if [ -r "${OUT_ENV}" ]; then
     started_env="$(env_carried < "${OUT_ENV}")"
   fi
   (
@@ -115,11 +117,14 @@ retry_in_background() {
       rc=$?
       if [ "${rc}" -eq 22 ]; then
         # curl --fail: the Hub is up and answered with an error. A 5xx, 408 or 429 is
-        # a Hub still settling (curl's own --retry counts them as transient), so keep
-        # asking. Anything else (a 404 from an older Hub, a 401, a 403) won't change.
+        # a Hub still settling (curl's own --retry counts 408, 429, 500, 502, 503 and
+        # 504 as transient; a proxy in front of a restarting Hub can answer other
+        # 5xx), so keep asking. Anything else (a 404 from an older Hub, a 401, a
+        # 403) won't change. A 2xx means the Hub settled between the two requests:
+        # the next try gets the handout.
         status="$(hub_status)"
         case "${status}" in
-          5??|408|429|000) continue ;;
+          2??|5??|408|429|000) continue ;;
         esac
         log "WARN: the Hub answered with an error (HTTP ${status}); keeping the last handout until the next start"
         exit 0
@@ -148,7 +153,7 @@ retry_in_background() {
 hub_status() {
   # The HTTP status a handout request gets now, or 000 when none arrived. Asked only
   # after curl --fail reported an HTTP error, to tell a refusal from a Hub still
-  # settling.
+  # settling. It is a second request, so the Hub may have moved on (to a 200) since.
   curl --silent --output /dev/null --write-out '%{http_code}' --connect-timeout 5 \
     --max-time "$(handout_timeout 2>/dev/null)" \
     "${CI_HUB_URL}/api/inference/apps/${HUB_APP_SLUG}/credentials.env" || true
@@ -275,6 +280,17 @@ yaml_single_quote() {
   printf "%s" "$1" | sed "s/'/''/g"
 }
 
+install_env_file() {
+  # $1: a temp file beside OUT_ENV. Renames it over OUT_ENV (atomic: the web and
+  # gateway containers share the directory); on failure removes it and returns 1.
+  chmod 600 "$1" 2>/dev/null || true
+  if mv "$1" "${OUT_ENV}"; then
+    return 0
+  fi
+  rm -f "$1"
+  return 1
+}
+
 normalize_env_value() {
   # Strip CR from CRLF files and one matching pair of surrounding quotes.
   value="$1"
@@ -316,20 +332,13 @@ main() {
       # A failed write here must not end the script under set -e: the loop below
       # still has to start.
       if tmp="$(mktemp "${OUT_ENV}.XXXXXX")"; then
-        if sanitize_env "$(is_local_env < "${OUT_ENV}")" < "${OUT_ENV}" > "${tmp}"; then
-          if cmp -s "${tmp}" "${OUT_ENV}"; then
-            rm -f "${tmp}"
-          else
-            chmod 600 "${tmp}" 2>/dev/null || true
-            if mv "${tmp}" "${OUT_ENV}"; then
-              log "removed config-owned overrides from the existing ${OUT_ENV}"
-            else
-              rm -f "${tmp}"
-              log "ERROR: could not replace ${OUT_ENV}; keeping it as it is"
-            fi
-          fi
-        else
+        if ! sanitize_env "$(is_local_env < "${OUT_ENV}")" < "${OUT_ENV}" > "${tmp}" \
+          || cmp -s "${tmp}" "${OUT_ENV}"; then
           rm -f "${tmp}"
+        elif install_env_file "${tmp}"; then
+          log "removed config-owned overrides from the existing ${OUT_ENV}"
+        else
+          log "ERROR: could not replace ${OUT_ENV}; keeping it as it is"
         fi
       else
         log "ERROR: cannot write beside ${OUT_ENV}; keeping it as it is"
@@ -380,9 +389,7 @@ apply_handout() {
     fi
   fi
 
-  chmod 600 "${tmp}" 2>/dev/null || true
-  if ! mv "${tmp}" "${OUT_ENV}"; then
-    rm -f "${tmp}"
+  if ! install_env_file "${tmp}"; then
     log "ERROR: could not replace ${OUT_ENV}; keeping the last handout"
     return 1
   fi
