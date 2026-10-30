@@ -133,6 +133,13 @@ jobs:
     name: Publish to npm
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # Trusted publishing (npm OIDC): the package's trusted-publisher setting names this
+    # repo + workflow, and npm mints a short-lived publish credential from the job's
+    # OIDC token. There is no NPM_TOKEN. The package disallows bypass-2FA tokens, which
+    # is why a stored token could only ever fail with E404.
+    permissions:
+      contents: read
+      id-token: write
     steps:
       - name: Checkout the tag being published
         uses: actions/checkout@v4
@@ -152,24 +159,9 @@ jobs:
           node-version: "22"
           registry-url: "https://registry.npmjs.org"
 
-      - name: Require the NPM_TOKEN secret
-        # Skipped for an explicit dry run: dry_run packs and compares without
-        # publishing, so demanding a publish credential would block the one check
-        # worth running BEFORE the token exists. Both forms are matched because a
-        # boolean input arrives as a string over the API.
-        if: >-
-          github.event_name != 'workflow_dispatch'
-          || !(inputs.dry_run == true || inputs.dry_run == 'true')
-        # Fail here with an actionable message rather than later with a raw npm E401,
-        # after the whole CI gate and the pack have run.
-        env:
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: |
-          set -euo pipefail
-          if [[ -z "${NPM_TOKEN}" ]]; then
-            echo "::error::NPM_TOKEN is not set. See the header of this workflow for how to create it (Packages and scopes -> @companionintelligence -> Read and write; NOT the Organizations permission)."
-            exit 1
-          fi
+      - name: Use an npm CLI that supports trusted publishing
+        # Trusted publishing needs npm >= 11.5.1; Node 22 ships an older one.
+        run: npm install -g npm@^11.5.1 && npm --version
 
       - name: Resolve the release tag and version
         id: version
@@ -362,7 +354,6 @@ jobs:
       - name: Publish
         if: steps.decide.outputs.publish == 'true' && steps.version.outputs.dry_run == 'false'
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
           VERSION: ${{ steps.version.outputs.version }}
         run: |
           set -euo pipefail
