@@ -241,8 +241,10 @@ resolves for `provider: ollama`) and `auxiliary.*` side-task routing.
   every 30 s (`HUB_BOOTSTRAP_RETRY_INTERVAL`) until the Hub answers once. The answer
   is applied as at start. The model and the Hub's own endpoint reach the running
   processes through `config.yaml`; a cloud endpoint travels in env and reaches them
-  at their next start. An HTTP error or an empty answer ends the asking. Terminal
-  sessions fetch on their own each time they open.
+  at their next start. An empty answer ends the asking. So does an HTTP error that
+  asking again won't change (a 404 from an older Hub, a 401 or 403). A 5xx,
+  408 or 429 is a Hub still settling and is asked again. Terminal sessions fetch on
+  their own each time they open.
 - **A cloud handout does not displace the Hub endpoint.** The Hub hands out a cloud
   provider when its local inference is down as the app starts; CI-Hermes logs it and
   stays on the local endpoint rather than moving conversations to a paid provider.

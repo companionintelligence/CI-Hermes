@@ -45,6 +45,10 @@ OUT_ENV="${DATA_DIR}/.env.hub-bootstrap"
 SCRIPT_DIR="$(CDPATH='' cd -- "$(dirname -- "$0")" && pwd)"
 RECONCILER="${SCRIPT_DIR}/reconcile-hub-config.py"
 
+# The OpenAI-SDK endpoint and key aliases. For the Hub's own endpoint config.yaml owns
+# them (sanitize_env drops them); for a cloud provider they travel in env.
+ENDPOINT_ENV_KEYS='CUSTOM_BASE_URL|CUSTOM_API_KEY|OPENAI_BASE_URL|OPENAI_API_BASE|OPENAI_API_KEY'
+
 log() {
   echo "[hub-bootstrap] $*"
 }
@@ -104,12 +108,20 @@ retry_in_background() {
     set +e
     while :; do
       sleep "${interval}"
-      body="$(fetch_bootstrap)"
+      # The start-up run already logged why the Hub couldn't be reached; repeating
+      # curl's error (and any HUB_BOOTSTRAP_TIMEOUT warning) on every try only fills
+      # the container log while the Hub stays down.
+      body="$(fetch_bootstrap 2>/dev/null)"
       rc=$?
       if [ "${rc}" -eq 22 ]; then
-        # curl --fail: the Hub is up and refused (a 404 from an older Hub, a 401).
-        # Asking again won't change that.
-        log "WARN: the Hub answered with an error; keeping the last handout until the next start"
+        # curl --fail: the Hub is up and answered with an error. A 5xx, 408 or 429 is
+        # a Hub still settling (curl's own --retry counts them as transient), so keep
+        # asking. Anything else (a 404 from an older Hub, a 401, a 403) won't change.
+        status="$(hub_status)"
+        case "${status}" in
+          5??|408|429|000) continue ;;
+        esac
+        log "WARN: the Hub answered with an error (HTTP ${status}); keeping the last handout until the next start"
         exit 0
       fi
       if [ "${rc}" -ne 0 ]; then
@@ -133,10 +145,20 @@ retry_in_background() {
   log "asking the Hub again every ${interval} s until it answers (pid $!)"
 }
 
+hub_status() {
+  # The HTTP status a handout request gets now, or 000 when none arrived. Asked only
+  # after curl --fail reported an HTTP error, to tell a refusal from a Hub still
+  # settling.
+  curl --silent --output /dev/null --write-out '%{http_code}' --connect-timeout 5 \
+    --max-time "$(handout_timeout 2>/dev/null)" \
+    "${CI_HUB_URL}/api/inference/apps/${HUB_APP_SLUG}/credentials.env" || true
+}
+
 env_carried() {
   # stdin: env lines. The ones hub-env.sh exports that config.yaml can't carry: a
-  # cloud provider's endpoint and key.
-  grep -E '^(CUSTOM_BASE_URL|CUSTOM_API_KEY|OPENAI_BASE_URL|OPENAI_API_BASE|OPENAI_API_KEY)=' | sort || true
+  # cloud provider's endpoint and key plus the Hub's cloud-fallback keys
+  # (ANTHROPIC_API_KEY, GOOGLE_API_KEY, GEMINI_API_KEY).
+  grep -E "^(${ENDPOINT_ENV_KEYS}|ANTHROPIC_[A-Za-z0-9_]*|GEMINI_[A-Za-z0-9_]*|GOOGLE_[A-Za-z0-9_]*)=" | sort || true
 }
 
 translate_keys() {
@@ -190,9 +212,9 @@ sanitize_env() {
   # directly, or an env file an older image wrote (the Hub-unreachable path reuses
   # it). Mirrors HUB_ENV_CONFIG_OWNED_KEYS / HUB_ENV_LOCAL_ENDPOINT_KEYS in
   # hub-env.sh, which applies the same rule again when the file is loaded.
-  awk -v is_local="${1:-0}" '
+  awk -v is_local="${1:-0}" -v endpoint_re="^(${ENDPOINT_ENV_KEYS})=" '
     /^(HERMES_INFERENCE_MODEL|HERMES_MODEL|OPENAI_MODEL)=/ { next }
-    is_local == "1" && /^(CUSTOM_BASE_URL|CUSTOM_API_KEY|OPENAI_BASE_URL|OPENAI_API_BASE|OPENAI_API_KEY)=/ { next }
+    is_local == "1" && $0 ~ endpoint_re { next }
     { print }
   '
 }
@@ -291,17 +313,26 @@ main() {
     # carries the env overrides this version no longer exports, and its config.yaml
     # may never have been reconciled at all.
     if [ -f "${OUT_ENV}" ]; then
-      tmp="$(mktemp "${OUT_ENV}.XXXXXX")"
-      if sanitize_env "$(is_local_env < "${OUT_ENV}")" < "${OUT_ENV}" > "${tmp}"; then
-        if cmp -s "${tmp}" "${OUT_ENV}"; then
-          rm -f "${tmp}"
+      # A failed write here must not end the script under set -e: the loop below
+      # still has to start.
+      if tmp="$(mktemp "${OUT_ENV}.XXXXXX")"; then
+        if sanitize_env "$(is_local_env < "${OUT_ENV}")" < "${OUT_ENV}" > "${tmp}"; then
+          if cmp -s "${tmp}" "${OUT_ENV}"; then
+            rm -f "${tmp}"
+          else
+            chmod 600 "${tmp}" 2>/dev/null || true
+            if mv "${tmp}" "${OUT_ENV}"; then
+              log "removed config-owned overrides from the existing ${OUT_ENV}"
+            else
+              rm -f "${tmp}"
+              log "ERROR: could not replace ${OUT_ENV}; keeping it as it is"
+            fi
+          fi
         else
-          chmod 600 "${tmp}" 2>/dev/null || true
-          mv "${tmp}" "${OUT_ENV}"
-          log "removed config-owned overrides from the existing ${OUT_ENV}"
+          rm -f "${tmp}"
         fi
       else
-        rm -f "${tmp}"
+        log "ERROR: cannot write beside ${OUT_ENV}; keeping it as it is"
       fi
       reconcile_config
     fi
@@ -334,14 +365,17 @@ apply_handout() {
     return 1
   fi
 
+  # main calls this as `apply_handout ... || true`, which turns set -e off in here:
+  # every step that can fail is checked by hand.
   gateway_ip="$(detect_docker_gateway_ip || true)"
   if [ -n "${gateway_ip}" ]; then
-    tmp2="$(mktemp "${OUT_ENV}.XXXXXX")"
-    if rewrite_host_docker_internal "${tmp}" "${gateway_ip}" > "${tmp2}"; then
-      mv "${tmp2}" "${tmp}"
+    tmp2=""
+    if tmp2="$(mktemp "${OUT_ENV}.XXXXXX")" \
+      && rewrite_host_docker_internal "${tmp}" "${gateway_ip}" > "${tmp2}" \
+      && mv "${tmp2}" "${tmp}"; then
       log "normalized host.docker.internal -> ${gateway_ip}"
     else
-      rm -f "${tmp2}"
+      [ -z "${tmp2}" ] || rm -f "${tmp2}"
       log "WARN: failed to normalize host.docker.internal values"
     fi
   fi
