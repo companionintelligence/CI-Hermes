@@ -498,6 +498,13 @@ function writeProxyUpgradeResponse(socket, proxyRes) {
 }
 
 function writeUpgradeFailureResponse(socket, statusCode, message) {
+  if (!socket.writable) {
+    socket.destroy();
+    return;
+  }
+  socket.on("error", () => {
+    socket.destroy();
+  });
   const status = Number(statusCode) || 502;
   const text = String(message || "WebSocket upgrade failed.");
   const body = `${text}\n`;
