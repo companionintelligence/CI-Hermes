@@ -1,7 +1,5 @@
 <p align="center">
-<img align="center" width="512" height="512" alt="logo" src="https://github.com/user-attachments/assets/85774db5-bd25-4b82-88b2-05d0a58c0b28" />
-  
-<img align="center" width="225" height="224" alt="logo-alt" src="https://github.com/user-attachments/assets/b4c0ae9d-9efc-43a1-986c-e829fd22add2" />
+<img src="https://raw.githubusercontent.com/companionintelligence/.github/main/profile/assets/icons/companion-hermes.png" width="96" height="96" alt="Companion Hermes icon">
 </p>
 
 <h1 align="center">Hermes - Companion Memory Edition</h1>
