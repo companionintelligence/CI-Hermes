@@ -101,7 +101,7 @@ assert_contains "--json says ok" '"ok": true' "${json}"
 
 echo "a renamed hook target fails the build"
 make_good_tree "${TMP}/renamed"
-sed -i 's/def create_openai_client/def create_openai_client_v2/' "${TMP}/renamed/agent/agent_runtime_helpers.py"
+sed -i.bak 's/def create_openai_client/def create_openai_client_v2/' "${TMP}/renamed/agent/agent_runtime_helpers.py" && rm -f "${TMP}/renamed/agent/agent_runtime_helpers.py.bak"
 rc=0; out="$(python3 "${SCRIPT}" --root "${TMP}/renamed" 2>&1)" || rc=$?
 assert_eq "exit 1" "1" "${rc}"
 assert_contains "names the missing function" '`create_openai_client` is no longer bound' "${out}"
@@ -109,8 +109,8 @@ assert_contains "explains the consequence" "silently fall back to /v1" "${out}"
 
 echo "a dropped positional parameter fails the build"
 make_good_tree "${TMP}/param"
-sed -i 's/def create_openai_client(agent, client_kwargs: dict, \*, reason: str, shared: bool)/def create_openai_client(agent, *, reason: str, shared: bool)/' \
-  "${TMP}/param/agent/agent_runtime_helpers.py"
+sed -i.bak 's/def create_openai_client(agent, client_kwargs: dict, \*, reason: str, shared: bool)/def create_openai_client(agent, *, reason: str, shared: bool)/' \
+  "${TMP}/param/agent/agent_runtime_helpers.py" && rm -f "${TMP}/param/agent/agent_runtime_helpers.py.bak"
 rc=0; out="$(python3 "${SCRIPT}" --root "${TMP}/param" 2>&1)" || rc=$?
 assert_eq "exit 1" "1" "${rc}"
 assert_contains "names the lost parameter" "lost parameter(s) ['client_kwargs']" "${out}"

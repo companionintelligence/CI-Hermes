@@ -278,7 +278,7 @@ data_dir="$(mktemp -d)"
 printf 'model:\n  provider: ollama\n' > "${data_dir}/config.yaml"
 env -i PATH="${PATH}" HOME="${data_dir}/home" HERMES_HOME="${data_dir}" \
   CI_SERVER_URL=http://gateway:8642 CI_SERVER_TOKEN=sk-connect-3 python3 "${SCRIPT}" >/dev/null 2>&1
-sed -i 's/sk-connect-3/sk-edited-by-hand/' "${data_dir}/config.yaml"
+sed -i.bak 's/sk-connect-3/sk-edited-by-hand/' "${data_dir}/config.yaml" && rm -f "${data_dir}/config.yaml.bak"
 env -i PATH="${PATH}" HOME="${data_dir}/home" HERMES_HOME="${data_dir}" python3 "${SCRIPT}" >/dev/null 2>&1
 assert_contains "edited block kept" 'x-api-key: "sk-edited-by-hand"' "$(cat "${data_dir}/config.yaml")"
 rm -rf "${data_dir}"
