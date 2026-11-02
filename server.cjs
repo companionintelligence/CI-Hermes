@@ -12,6 +12,7 @@ const path = require("path");
 const crypto = require("crypto");
 const memoryGate = require("./memory-gate.cjs");
 const hubEnv = require("./hub-env.cjs");
+const { writeUpgradeFailureResponse } = require("./upgrade-response.cjs");
 const pty = require("/app/node_modules/node-pty");
 const WebSocket = require("/app/node_modules/ws");
 
@@ -495,26 +496,6 @@ function writeProxyUpgradeResponse(socket, proxyRes) {
   }
 
   socket.write("\r\n");
-}
-
-function writeUpgradeFailureResponse(socket, statusCode, message) {
-  if (!socket.writable) {
-    socket.destroy();
-    return;
-  }
-  socket.on("error", () => {
-    socket.destroy();
-  });
-  const status = Number(statusCode) || 502;
-  const text = String(message || "WebSocket upgrade failed.");
-  const body = `${text}\n`;
-  socket.write(`HTTP/1.1 ${status} Bad Gateway\r\n`);
-  socket.write("Content-Type: text/plain; charset=utf-8\r\n");
-  socket.write(`Content-Length: ${Buffer.byteLength(body, "utf8")}\r\n`);
-  socket.write("Connection: close\r\n");
-  socket.write("Cache-Control: no-store\r\n");
-  socket.write("\r\n");
-  socket.end(body);
 }
 
 function proxyDashboardUpgrade(req, socket, head) {
