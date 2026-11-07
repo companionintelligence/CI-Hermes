@@ -162,6 +162,8 @@ Two build-time shims in [`patches/`](patches/) sit between Hermes and its model 
 
 Each shim patches upstream by name and is deliberately best-effort — a missing hook is logged and Hermes falls back to stock behavior rather than crashing. A matching static contract check ([`check_ollama_native_contract.py`](patches/check_ollama_native_contract.py), [`check_gateway_health_auth_contract.py`](patches/check_gateway_health_auth_contract.py)) parses the upstream source with `ast` at build time and fails the image build if a base-image bump has moved what the shim hooks into — see the Dockerfile. Run `python3 -m unittest discover -p '*_test.py'` in `patches/` (needs `httpx`) to run their unit tests without a build.
 
+A third shim, [`enable_gateway_lock_guard.py`](patches/enable_gateway_lock_guard.py), keeps the web container from deleting the gateway's `gateway.pid` and `gateway.lock` while the gateway, in its own container, holds the lock. Without it `hermes cron list` in the web terminal says the gateway isn't running after the first `hermes cron run` or dashboard status check. [`check_gateway_lock_guard_contract.py`](patches/check_gateway_lock_guard_contract.py) checks its hooks at build time the same way.
+
 Separately, [`reconcile-hub-config.py`](reconcile-hub-config.py) keeps `config.yaml`'s model/endpoint settings following the Hub's inference handout on every start — ownership tracking so hand edits survive, the 64K context-window floor, and cloud-handout precedence. See its module docstring and [`tests/hub-handout-restart.test.sh`](tests/hub-handout-restart.test.sh) for the full contract.
 
 ## CI context
