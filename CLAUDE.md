@@ -57,6 +57,10 @@ Docker build and fails it on upstream drift:
 - `enable_gateway_health_auth.py` — sends the gateway's Bearer key with the
   dashboard's `/health/detailed` probe. Checked by
   `check_gateway_health_auth_contract.py`.
+- `enable_gateway_lock_guard.py` keeps the web container from deleting the
+  gateway's `gateway.pid` and `gateway.lock` while the gateway (in its own
+  container) holds the lock, so `hermes cron list` stops saying the gateway
+  isn't running. Checked by `check_gateway_lock_guard_contract.py`.
 
 `reconcile-hub-config.py` is the separate piece that keeps `config.yaml`'s
 model/endpoint settings following the Hub's inference handout (ownership
