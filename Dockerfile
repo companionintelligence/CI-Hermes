@@ -99,13 +99,20 @@ RUN SP="$(/opt/hermes/.venv/bin/python -c 'import sysconfig; print(sysconfig.get
 # the lock. From then on `hermes cron list` in the web terminal warns that the gateway
 # isn't running and says to install one. The shim skips that cleanup while the lock is
 # held; it engages only where GATEWAY_HEALTH_URL is set (the web container). Same .pth
-# mechanism and same build-time contract check as the patches above.
+# mechanism and same build-time contract check as the patches above. The last check
+# imports the real gateway.status the way the web container does and fails the build if
+# it comes out unwrapped. HERMES_HOME points at a throwaway folder because that import
+# creates Hermes's data folders, which must not land in the image's /opt/data.
 COPY patches/enable_gateway_lock_guard.py patches/ci-gateway-lock-guard.pth patches/check_gateway_lock_guard_contract.py /app/patches/
 RUN SP="$(/opt/hermes/.venv/bin/python -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')" && \
     /opt/hermes/.venv/bin/python /app/patches/check_gateway_lock_guard_contract.py --root /opt/hermes && \
     install -m 0644 /app/patches/enable_gateway_lock_guard.py "$SP/enable_gateway_lock_guard.py" && \
     install -m 0644 /app/patches/ci-gateway-lock-guard.pth  "$SP/ci-gateway-lock-guard.pth" && \
     /opt/hermes/.venv/bin/python -c "import enable_gateway_lock_guard" && \
+    CHECK_HOME="$(mktemp -d)" && \
+    (cd /tmp && HERMES_HOME="$CHECK_HOME" GATEWAY_HEALTH_URL=http://build-check /opt/hermes/.venv/bin/python -c \
+      "import sys, gateway.status as s; sys.exit(0 if getattr(s._cleanup_invalid_pid_path, '_ci_gateway_lock_guard', False) else 'CI gateway-lock-guard: gateway.status is not wrapped in the web container')") && \
+    rm -rf "$CHECK_HOME" && \
     echo "CI gateway-lock-guard patch installed into $SP"
 
 # Ensure hermes venv is in PATH everywhere. The agent's terminal tool spawns
