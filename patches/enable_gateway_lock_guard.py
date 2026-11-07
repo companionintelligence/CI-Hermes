@@ -10,8 +10,8 @@ dashboard, the web terminal and any ``hermes`` command typed there run in the we
 container. Both share ``/opt/data``, so the web container sees the gateway's identity
 files and can probe its flock, but not its process: the PID in the record belongs to the
 gateway's PID namespace. Upstream's unscoped ``get_running_pid()`` (used by
-``hermes cron run``, ``hermes cron status`` and the dashboard) finds the lock held, fails
-to match the record against a live gateway in *this* namespace, and runs its
+``hermes cron run``, ``hermes cron status`` and the dashboard) finds the lock held and fails
+to match the record against a live gateway in *this* namespace. It then runs its
 poison-file housekeeping: it unlinks both files. The gateway keeps running and keeps
 firing jobs, holding a lock on a deleted file, but from then on every liveness check
 in the web container answers "not running": ``hermes cron list`` warns "Gateway is not
@@ -45,17 +45,24 @@ TARGET_NAME = "_cleanup_invalid_pid_path"
 
 _META_PATH_LOCK = threading.Lock()
 
+# The dashboard polls every second, so a failing probe is reported once per process at
+# WARNING (visible, unlike DEBUG) and quietly after that.
+_probe_failure_reported = False
+
 
 def _make_guard(module, orig):
     def _cleanup_invalid_pid_path(pid_path, *, cleanup_stale):
         """Upstream's cleanup, except while the runtime lock is held: then the record names a
-        gateway this process cannot see (another PID namespace), not a dead one."""
+        gateway this process cannot see (another PID namespace), not a dead one. Nothing on
+        disk changes in that case, so the running-PID cache is left as it is."""
+        global _probe_failure_reported
         try:
             if cleanup_stale and module.is_gateway_runtime_lock_active(module._get_gateway_lock_path(pid_path)):
-                module._clear_running_pid_cache()
                 return None
         except Exception as exc:  # unknown state: fall back to upstream's behaviour
-            logger.debug("CI gateway-lock-guard: lock probe failed (%s); upstream cleanup runs", exc)
+            log = logger.debug if _probe_failure_reported else logger.warning
+            _probe_failure_reported = True
+            log("CI gateway-lock-guard: lock probe failed (%s); upstream cleanup runs", exc)
         return orig(pid_path, cleanup_stale=cleanup_stale)
 
     _cleanup_invalid_pid_path._ci_gateway_lock_guard = True  # type: ignore[attr-defined]

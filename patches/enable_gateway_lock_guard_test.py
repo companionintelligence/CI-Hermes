@@ -80,7 +80,10 @@ class _HeldLock:
             sys.stdin.read()
         """)
         self.proc = subprocess.Popen([sys.executable, "-c", code], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
-        assert self.proc.stdout.readline().strip() == "held"
+        # Not an assert: ``python -O`` would strip the readline and the test would race the child.
+        if self.proc.stdout.readline().strip() != "held":
+            self.__exit__()
+            raise RuntimeError("lock-holding child did not take the lock")
         return self
 
     def __exit__(self, *exc):
@@ -111,7 +114,7 @@ class GuardTest(unittest.TestCase):
             self.assertTrue(self.pid.exists())
             self.assertTrue(self.lock.exists())
             self.assertTrue(self.mod.is_gateway_runtime_lock_active(self.lock))
-        self.assertEqual(self.mod.cache_clears, 1)
+        self.assertEqual(self.mod.cache_clears, 0, "nothing changed on disk, so the cache stays")
 
     def test_still_removes_stale_files_once_the_lock_is_free(self):
         self.mod._cleanup_invalid_pid_path(self.pid, cleanup_stale=True)
@@ -124,10 +127,14 @@ class GuardTest(unittest.TestCase):
         self.assertTrue(self.pid.exists())
         self.assertEqual(self.mod.cache_clears, 0)
 
-    def test_a_failing_probe_falls_back_to_upstream(self):
+    def test_a_failing_probe_falls_back_to_upstream_and_warns_once(self):
         self.mod.is_gateway_runtime_lock_active = mock.Mock(side_effect=RuntimeError("boom"))
-        self.mod._cleanup_invalid_pid_path(self.pid, cleanup_stale=True)
+        with mock.patch.object(shim, "_probe_failure_reported", False), \
+                self.assertLogs(shim.logger, level="DEBUG") as logs:
+            self.mod._cleanup_invalid_pid_path(self.pid, cleanup_stale=True)
+            self.mod._cleanup_invalid_pid_path(self.pid, cleanup_stale=True)
         self.assertFalse(self.pid.exists())
+        self.assertEqual([r.levelname for r in logs.records], ["WARNING", "DEBUG"])
 
     def test_wraps_once(self):
         wrapped = self.mod._cleanup_invalid_pid_path
@@ -148,6 +155,53 @@ class EnabledTest(unittest.TestCase):
             self.assertFalse(shim.enabled())
 
 
+class InstallTest(unittest.TestCase):
+    """The path the image runs: the .pth calls install() and a later ``import gateway.status``
+    goes through the meta-path finder, which wraps the freshly loaded module."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        (root / "gateway").mkdir()
+        (root / "gateway" / "__init__.py").write_text("")
+        (root / "gateway" / "status.py").write_text(textwrap.dedent("""
+            def _get_gateway_lock_path(pid_path=None): return pid_path.with_name("gateway.lock")
+            def is_gateway_runtime_lock_active(lock_path=None): return True
+            def _cleanup_invalid_pid_path(pid_path, *, cleanup_stale): raise AssertionError("unlinked")
+        """))
+        saved_modules = {name: sys.modules.pop(name) for name in ("gateway", "gateway.status") if name in sys.modules}
+        saved_meta_path = list(sys.meta_path)
+        sys.path.insert(0, str(root))
+        shim._patched.discard(shim.TARGET_MODULE)
+
+        def restore():
+            sys.path.remove(str(root))
+            sys.meta_path[:] = saved_meta_path
+            for name in ("gateway", "gateway.status"):
+                sys.modules.pop(name, None)
+            sys.modules.update(saved_modules)
+            shim._patched.discard(shim.TARGET_MODULE)
+        self.addCleanup(restore)
+
+    def test_import_after_install_is_wrapped(self):
+        with mock.patch.dict(os.environ, {shim.URL_ENV: "http://ci-hermes-gateway:8642"}):
+            shim.install()
+        import gateway.status as status  # noqa: E402
+
+        self.assertTrue(getattr(status._cleanup_invalid_pid_path, "_ci_gateway_lock_guard", False))
+        status._cleanup_invalid_pid_path(Path("/nonexistent/gateway.pid"), cleanup_stale=True)
+
+    def test_without_the_url_nothing_is_installed(self):
+        env = {k: v for k, v in os.environ.items() if k != shim.URL_ENV}
+        with mock.patch.dict(os.environ, env, clear=True):
+            shim.install()
+        self.assertFalse(any(isinstance(f, shim._PostImportPatcher) for f in sys.meta_path))
+        import gateway.status as status  # noqa: E402
+
+        self.assertFalse(getattr(status._cleanup_invalid_pid_path, "_ci_gateway_lock_guard", False))
+
+
 class ContractTest(unittest.TestCase):
     STATUS = textwrap.dedent("""
         def _get_gateway_lock_path(pid_path=None): ...
@@ -164,7 +218,9 @@ class ContractTest(unittest.TestCase):
     """)
 
     def _tree(self, status=STATUS, cron=CRON):
-        root = Path(tempfile.mkdtemp())
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
         (root / "gateway").mkdir()
         (root / "hermes_cli").mkdir()
         (root / "gateway" / "status.py").write_text(status)
@@ -188,6 +244,27 @@ class ContractTest(unittest.TestCase):
         status = self.STATUS.replace("    _cleanup_invalid_pid_path(pid_path, cleanup_stale=cleanup_stale)", "    return None")
         problems = contract.check(self._tree(status=status))
         self.assertTrue(any("no longer calls" in p for p in problems), problems)
+
+    def test_reports_a_caller_that_calls_it_through_an_attribute(self):
+        status = self.STATUS.replace("    _cleanup_invalid_pid_path(pid_path", "    helpers._cleanup_invalid_pid_path(pid_path")
+        problems = contract.check(self._tree(status=status))
+        self.assertTrue(any("by bare name" in p for p in problems), problems)
+
+    def test_reports_a_missing_helper(self):
+        problems = contract.check(self._tree(status=self.STATUS.replace("def is_gateway_runtime_lock_active",
+                                                                        "def is_lock_active")))
+        self.assertTrue(any("is_gateway_runtime_lock_active" in p for p in problems), problems)
+
+    def test_reports_a_helper_that_lost_its_parameter(self):
+        status = self.STATUS.replace("def _get_gateway_lock_path(pid_path=None)", "def _get_gateway_lock_path()")
+        problems = contract.check(self._tree(status=status))
+        self.assertTrue(any("_get_gateway_lock_path` signature changed" in p for p in problems), problems)
+
+    def test_reports_a_helper_that_grew_a_required_parameter(self):
+        status = self.STATUS.replace("def is_gateway_runtime_lock_active(lock_path=None)",
+                                     "def is_gateway_runtime_lock_active(lock_path, *, strict)")
+        problems = contract.check(self._tree(status=status))
+        self.assertTrue(any("is_gateway_runtime_lock_active` signature changed" in p for p in problems), problems)
 
     def test_reports_cron_liveness_without_the_lock_probe(self):
         problems = contract.check(self._tree(cron="def _builtin_gateway_liveness():\n    return None\n"))

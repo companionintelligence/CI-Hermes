@@ -37,7 +37,7 @@ npm run test:sh          # needs python3 + PyYAML
 # the bundled plugins' own suites
 cd ci-context/plugins/companionintelligence && python3 -m unittest discover -p '*_test.py'
 cd ci-context/plugins/ci-runtime && python3 -m unittest discover -p '*_test.py'
-# the build-time patches' own suite (ollama native adapter + gateway health-auth shim; needs httpx)
+# the build-time patches' own suite (ollama native adapter, gateway health-auth and lock-guard shims; needs httpx)
 cd patches && python3 -m unittest discover -p '*_test.py'
 
 # Build for production
@@ -46,9 +46,10 @@ docker compose build
 
 ## LLM connection layer
 
-Hermes talks to inference through two build-time shims layered on the upstream
-image (`patches/`), each with a static AST contract check that runs in the
-Docker build and fails it on upstream drift:
+Three build-time shims are layered on the upstream image (`patches/`): the
+first is how Hermes talks to inference, the other two fix how the web container
+sees the gateway. Each has a static AST contract check that runs in the Docker
+build and fails it on upstream drift:
 
 - `ollama_native_adapter.py` / `enable_ollama_native.py` — routes local Ollama
   through native `/api/chat` (honors `num_ctx`) instead of the OpenAI-compat

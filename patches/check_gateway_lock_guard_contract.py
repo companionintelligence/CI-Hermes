@@ -4,17 +4,18 @@
 The shim wraps ``gateway.status._cleanup_invalid_pid_path`` so the web container stops
 deleting the gateway's ``gateway.pid`` and ``gateway.lock`` while the gateway (in its own
 container) holds the lock. The wrap is best-effort by design: a renamed target is logged
-and upstream's cleanup runs, and the first ``hermes cron run`` or dashboard poll in the web
-container deletes the files again. ``hermes cron list`` then warns that the gateway isn't
+and upstream's cleanup runs. The first ``hermes cron run`` or dashboard poll in the web
+container then deletes the files again. ``hermes cron list`` then warns that the gateway isn't
 running when it is. This script catches that at build time.
 
 It is a STATIC check: files are parsed with ``ast`` and nothing is imported. It verifies:
 
   * ``gateway/status.py`` defines ``_cleanup_invalid_pid_path(pid_path, *, cleanup_stale)``,
-    ``_get_gateway_lock_path``, ``is_gateway_runtime_lock_active`` and
-    ``_clear_running_pid_cache`` at module level (the wrapper calls all four);
-  * ``get_running_pid`` in that file still calls ``_cleanup_invalid_pid_path`` by name, so
-    swapping the module attribute reaches it;
+    ``_get_gateway_lock_path`` and ``is_gateway_runtime_lock_active`` at module level, and
+    each helper still takes the one positional argument the wrapper passes (a helper that
+    drops it raises TypeError inside the wrapper, which then falls back to deleting);
+  * ``get_running_pid`` in that file still calls ``_cleanup_invalid_pid_path`` as a bare
+    name, so swapping the module attribute reaches it;
   * ``hermes_cli/cron.py``'s ``_builtin_gateway_liveness`` still asks
     ``is_gateway_runtime_lock_active``, the answer the kept lock gives ``hermes cron list``.
 
@@ -34,7 +35,8 @@ from typing import Dict, List, Optional
 
 STATUS_MODULE = "gateway/status.py"
 TARGET = "_cleanup_invalid_pid_path"
-HELPERS = ("_get_gateway_lock_path", "is_gateway_runtime_lock_active", "_clear_running_pid_cache")
+# Helpers the wrapper calls as ``helper(one_positional_arg)``.
+HELPERS = ("_get_gateway_lock_path", "is_gateway_runtime_lock_active")
 CALLER = "get_running_pid"
 CRON_MODULE = "hermes_cli/cron.py"
 CRON_LIVENESS = "_builtin_gateway_liveness"
@@ -45,13 +47,29 @@ def _module_functions(tree: ast.Module) -> Dict[str, ast.AST]:
     return {node.name: node for node in tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))}
 
 
-def _calls_name(fn: ast.AST, name: str) -> bool:
+def _calls_name(fn: ast.AST, name: str, *, bare_only: bool = False) -> bool:
+    """True when ``fn`` calls ``name``. ``bare_only`` rejects ``obj.name(...)``: only a bare global
+    lookup is guaranteed to reach a function swapped on the module."""
     for node in ast.walk(fn):
         if isinstance(node, ast.Call):
             f = node.func
-            if (isinstance(f, ast.Name) and f.id == name) or (isinstance(f, ast.Attribute) and f.attr == name):
+            if isinstance(f, ast.Name) and f.id == name:
+                return True
+            if not bare_only and isinstance(f, ast.Attribute) and f.attr == name:
                 return True
     return False
+
+
+def _accepts_one_positional(fn: ast.AST) -> bool:
+    """True when ``fn(x)`` binds: some positional slot (or ``*args``) takes the argument and no
+    other parameter is left without a default."""
+    args = fn.args
+    positional = args.posonlyargs + args.args
+    if not positional and args.vararg is None:
+        return False
+    required_positional = len(positional) - len(args.defaults)
+    required_keyword = sum(1 for default in args.kw_defaults if default is None)
+    return required_positional <= 1 and required_keyword == 0
 
 
 def check(root: Path) -> List[str]:
@@ -83,13 +101,17 @@ def check(root: Path) -> List[str]:
                 problems.append(f"{STATUS_MODULE}: `{TARGET}` signature changed to ({', '.join(positional)}, *, "
                                 f"{', '.join(keyword_only)}); the wrapper expects (pid_path, *, cleanup_stale)")
         for helper in HELPERS:
-            if helper not in fns:
+            fn = fns.get(helper)
+            if fn is None:
                 problems.append(f"{STATUS_MODULE}: `{helper}` is no longer a module-level function")
+            elif not _accepts_one_positional(fn):
+                problems.append(f"{STATUS_MODULE}: `{helper}` signature changed; the wrapper calls it "
+                                f"with one positional argument")
         caller = fns.get(CALLER)
         if caller is None:
             problems.append(f"{STATUS_MODULE}: `{CALLER}` is no longer a module-level function")
-        elif not _calls_name(caller, TARGET):
-            problems.append(f"{STATUS_MODULE}: `{CALLER}` no longer calls `{TARGET}`")
+        elif not _calls_name(caller, TARGET, bare_only=True):
+            problems.append(f"{STATUS_MODULE}: `{CALLER}` no longer calls `{TARGET}` by bare name")
 
     tree = _parse(CRON_MODULE)
     if tree is not None:
