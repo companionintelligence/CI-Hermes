@@ -37,7 +37,7 @@ npm run test:sh          # needs python3 + PyYAML
 # the bundled plugins' own suites
 cd ci-context/plugins/companionintelligence && python3 -m unittest discover -p '*_test.py'
 cd ci-context/plugins/ci-runtime && python3 -m unittest discover -p '*_test.py'
-# the build-time patches' own suite (ollama native adapter + gateway health-auth shim; needs httpx)
+# the build-time patches' own suite (ollama native adapter, gateway health-auth and lock-guard shims; needs httpx)
 cd patches && python3 -m unittest discover -p '*_test.py'
 
 # Build for production
@@ -46,9 +46,10 @@ docker compose build
 
 ## LLM connection layer
 
-Hermes talks to inference through two build-time shims layered on the upstream
-image (`patches/`), each with a static AST contract check that runs in the
-Docker build and fails it on upstream drift:
+Three build-time shims are layered on the upstream image (`patches/`): the
+first is how Hermes talks to inference, the other two fix how the web container
+sees the gateway. Each has a static AST contract check that runs in the Docker
+build and fails it on upstream drift:
 
 - `ollama_native_adapter.py` / `enable_ollama_native.py` — routes local Ollama
   through native `/api/chat` (honors `num_ctx`) instead of the OpenAI-compat
@@ -57,6 +58,10 @@ Docker build and fails it on upstream drift:
 - `enable_gateway_health_auth.py` — sends the gateway's Bearer key with the
   dashboard's `/health/detailed` probe. Checked by
   `check_gateway_health_auth_contract.py`.
+- `enable_gateway_lock_guard.py` keeps the web container from deleting the
+  gateway's `gateway.pid` and `gateway.lock` while the gateway (in its own
+  container) holds the lock, so `hermes cron list` stops saying the gateway
+  isn't running. Checked by `check_gateway_lock_guard_contract.py`.
 
 `reconcile-hub-config.py` is the separate piece that keeps `config.yaml`'s
 model/endpoint settings following the Hub's inference handout (ownership
