@@ -74,5 +74,33 @@ class ClientDefaultTimeoutTest(unittest.TestCase):
             client.close()
 
 
+class FinishReasonTest(unittest.TestCase):
+    """A response Ollama cut off (done_reason "length") stays "length" after a tool call,
+    as on Ollama's own /v1, so Hermes retries it instead of running the call."""
+
+    TOOL_CALL = {"function": {"name": "look_up", "arguments": {"query": "x"}}}
+
+    def test_stream_length_after_tool_call(self):
+        tool_idx = {"n": 0}
+        streamed = adapter.translate_stream_line({"message": {"tool_calls": [self.TOOL_CALL]}}, "m", tool_idx)
+        self.assertEqual(streamed[0].choices[0].delta.tool_calls[0].function.name, "look_up")
+        terminal = adapter.translate_stream_line(
+            {"done": True, "done_reason": "length", "prompt_eval_count": 4096}, "m", tool_idx
+        )
+        self.assertEqual(terminal[-1].choices[0].finish_reason, "length")
+
+    def test_response_length_with_tool_call(self):
+        resp = adapter.translate_ollama_response(
+            {"message": {"role": "assistant", "tool_calls": [self.TOOL_CALL]}, "done_reason": "length"}, model="m"
+        )
+        self.assertEqual(resp.choices[0].finish_reason, "length")
+
+    def test_stop_with_tool_call_is_still_tool_calls(self):
+        resp = adapter.translate_ollama_response(
+            {"message": {"role": "assistant", "tool_calls": [self.TOOL_CALL]}, "done_reason": "stop"}, model="m"
+        )
+        self.assertEqual(resp.choices[0].finish_reason, "tool_calls")
+
+
 if __name__ == "__main__":
     unittest.main()

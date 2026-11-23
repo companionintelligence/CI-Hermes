@@ -425,11 +425,13 @@ def _usage_from(payload: Dict[str, Any]) -> SimpleNamespace:
 
 
 def _map_finish_reason(done_reason: Any, has_tool_calls: bool) -> str:
-    if has_tool_calls:
-        return "tool_calls"
     dr = str(done_reason or "stop")
+    # A length stop after a tool call is still a cut-off response: Ollama's own /v1
+    # only turns "stop" into "tool_calls", so Hermes's truncation recovery sees it.
     if dr == "length":
         return "length"
+    if has_tool_calls:
+        return "tool_calls"
     return "stop"
 
 
